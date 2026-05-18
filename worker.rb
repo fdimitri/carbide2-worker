@@ -41,10 +41,11 @@ end
 # TerminalInstance — owns one PTY, broadcasts output to subscribed sockets
 # ---------------------------------------------------------------------------
 class TerminalInstance
-  attr_reader :terminal_id, :master, :slave, :pid, :clients, :cols, :rows
+  attr_reader :terminal_id, :project_id, :master, :slave, :pid, :clients, :cols, :rows
 
-  def initialize(terminal_id, cols: 80, rows: 24, cmd: '/bin/bash')
+  def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash')
     @terminal_id = terminal_id
+    @project_id  = project_id
     @clients     = []
     @cols        = cols
     @rows        = rows
@@ -95,6 +96,15 @@ class TerminalInstance
 
   def remove_client(ws)
     @clients.delete(ws)
+  end
+
+  def to_list_entry
+    {
+      id: @terminal_id,
+      status: 'active',
+      cols: @cols,
+      rows: @rows
+    }
   end
 end
 
@@ -153,6 +163,7 @@ end
 # ---------------------------------------------------------------------------
 TERMINALS  = {}  # terminal_id (int) => TerminalInstance
 CHAT_ROOMS = {}  # room_id (string)  => ChatRoom
+SESSIONS_BY_PROJECT = {}  # project_id => [Session, ...]
 
 # ---------------------------------------------------------------------------
 # Per-connection session state
@@ -202,15 +213,24 @@ end
 
 def handle_term(session, cmd, payload)
   case cmd
+  when 'create'
+    # Create new terminal in current project
+    terminal_id = (TERMINALS.keys.map(&:to_i).max || 0) + 1
+    term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24)
+    TERMINALS[terminal_id] = term
+    send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
+    broadcast_terminals_to_project(session.project_id)
+
   when 'join'
     tid  = payload['terminal_id'].to_i
-    cols = payload['cols']&.to_i || 80
-    rows = payload['rows']&.to_i || 24
-    # Create PTY lazily — Rails only creates the DB record, not the process
-    term = TERMINALS[tid] ||= TerminalInstance.new(tid, cols: cols, rows: rows)
-    term.add_client(session.ws)
-    session.terminals << tid unless session.terminals.include?(tid)
-    send_msg(session.ws, 'term', 'joined', { terminal_id: tid })
+    term = TERMINALS[tid]
+    if term && term.project_id == session.project_id
+      term.add_client(session.ws)
+      session.terminals << tid unless session.terminals.include?(tid)
+      send_msg(session.ws, 'term', 'joined', { terminal_id: tid })
+    else
+      send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} not found or access denied" })
+    end
 
   when 'input'
     tid  = payload['terminal_id'].to_i
@@ -249,12 +269,25 @@ def handle_chat(session, cmd, payload)
   end
 end
 
+def get_project_terminals(project_id)
+  TERMINALS.values.select { |t| t.project_id == project_id }.map(&:to_list_entry)
+end
+
+def broadcast_terminals_to_project(project_id)
+  clients = (SESSIONS_BY_PROJECT[project_id] || []).map(&:ws)
+  terminals = get_project_terminals(project_id)
+  broadcast(clients, 'term', 'list', { project_id: project_id, terminals: terminals })
+end
+
 # ---------------------------------------------------------------------------
 # HTTP API endpoint for Rails to create terminal instances
 # Used by POST /api/projects/:id/terminals
 # ---------------------------------------------------------------------------
-def create_terminal(terminal_id, cols: 80, rows: 24)
-  TERMINALS[terminal_id] ||= TerminalInstance.new(terminal_id, cols: cols, rows: rows)
+def create_terminal(terminal_id, project_id:, cols: 80, rows: 24)
+  term = TerminalInstance.new(terminal_id, project_id: project_id, cols: cols, rows: rows)
+  TERMINALS[terminal_id] = term
+  broadcast_terminals_to_project(project_id)
+  terminal_id
 end
 
 # ---------------------------------------------------------------------------
@@ -276,10 +309,20 @@ EM.run do
       payload = validate_token(token)
       if payload
         session = Session.new(ws, payload)
+        
+        # Track session by project for terminal broadcasts
+        SESSIONS_BY_PROJECT[session.project_id] ||= []
+        SESSIONS_BY_PROJECT[session.project_id] << session
+        
         send_msg(ws, 'system', 'connected', {
           user_id:    session.user_id,
           project_id: session.project_id
         })
+        
+        # Send initial terminal list
+        terminals = get_project_terminals(session.project_id)
+        send_msg(ws, 'term', 'list', { project_id: session.project_id, terminals: terminals })
+        
         puts "Client connected: user=#{session.user_id} project=#{session.project_id}"
       else
         send_msg(ws, 'system', 'error', { message: 'invalid or missing token' })
@@ -299,6 +342,12 @@ EM.run do
     ws.onclose do
       if session
         puts "Client disconnected: user=#{session.user_id}"
+        
+        # Remove session from project tracking
+        if SESSIONS_BY_PROJECT[session.project_id]
+          SESSIONS_BY_PROJECT[session.project_id].delete(session)
+        end
+        
         session.cleanup
         session = nil
       end
