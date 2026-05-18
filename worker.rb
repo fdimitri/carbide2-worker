@@ -30,7 +30,11 @@ end
 
 def broadcast(clients, cs, cmd, payload = {})
   msg = { cs: cs, cmd: cmd, payload: payload }.to_json
-  clients.each { |ws| ws.send(msg) rescue nil }
+  clients.each do |ws|
+    ws.send(msg)
+  rescue => e
+    puts "[broadcast] send failed: #{e.class} #{e.message}"
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -51,24 +55,38 @@ class TerminalInstance
 
   def start_reader
     Thread.new do
+      puts "[PTY:#{@terminal_id}] reader thread started, reading from master"
       loop do
         data = @master.readpartial(4096)
-        broadcast(@clients, 'term', 'output', { terminal_id: @terminal_id, data: data })
+        puts "[PTY:#{@terminal_id}] read #{data.bytes.size} bytes: #{data.inspect[0..50]}"
+        # Marshal back to EM reactor thread for thread-safe ws.send
+        EM.next_tick do
+          broadcast(@clients, 'term', 'output', { terminal_id: @terminal_id, data: data })
+        end
       end
-    rescue EOFError, Errno::EIO
-      broadcast(@clients, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
+    rescue EOFError, Errno::EIO => e
+      puts "[PTY:#{@terminal_id}] reader EOF: #{e.class}"
+      EM.next_tick do
+        broadcast(@clients, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
+      end
+    rescue => e
+      puts "[PTY:#{@terminal_id}] reader error: #{e.class} #{e.message}"
     end
   end
 
   def write_input(data)
-    @master.write(data)
+    puts "[PTY:#{@terminal_id}] writing #{data.bytes.size} bytes: #{data.inspect[0..50]}"
+    @slave.write(data)
+  rescue Errno::EIO, Errno::EPIPE, IOError => e
+    puts "[PTY:#{@terminal_id}] write failed: #{e.class} #{e.message}"
   end
 
   def apply_winsize(rows, cols)
     @rows = rows.to_i
     @cols = cols.to_i
+    require 'io/console'
+    # Set terminal size via ioctl on slave so shell knows dimensions
     @slave.winsize = [@rows, @cols] if @slave.respond_to?(:winsize=)
-    Process.kill('SIGWINCH', @pid) rescue nil
   end
 
   def add_client(ws)
@@ -186,11 +204,10 @@ def handle_term(session, cmd, payload)
   case cmd
   when 'join'
     tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    unless term
-      send_msg(session.ws, 'term', 'error', { message: "terminal #{tid} not found" })
-      return
-    end
+    cols = payload['cols']&.to_i || 80
+    rows = payload['rows']&.to_i || 24
+    # Create PTY lazily — Rails only creates the DB record, not the process
+    term = TERMINALS[tid] ||= TerminalInstance.new(tid, cols: cols, rows: rows)
     term.add_client(session.ws)
     session.terminals << tid unless session.terminals.include?(tid)
     send_msg(session.ws, 'term', 'joined', { terminal_id: tid })
@@ -271,7 +288,12 @@ EM.run do
     end
 
     ws.onmessage do |msg|
-      route(session, msg) if session
+      begin
+        route(session, msg) if session
+      rescue => e
+        puts "[route] error: #{e.class} #{e.message}\n#{e.backtrace.first(3).join("\n")}"
+        send_msg(ws, 'system', 'error', { message: e.message })
+      end
     end
 
     ws.onclose do
