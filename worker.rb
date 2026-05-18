@@ -8,6 +8,9 @@ require 'jwt'
 require 'pty'
 require 'io/console'
 require 'uri'
+require_relative 'terminal_instance'
+require_relative 'chat_room'
+require_relative 'session'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
@@ -38,157 +41,11 @@ def broadcast(clients, cs, cmd, payload = {})
 end
 
 # ---------------------------------------------------------------------------
-# TerminalInstance — owns one PTY, broadcasts output to subscribed sockets
-# ---------------------------------------------------------------------------
-class TerminalInstance
-  attr_reader :terminal_id, :project_id, :master, :slave, :pid, :clients, :cols, :rows
-
-  def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash')
-    @terminal_id = terminal_id
-    @project_id  = project_id
-    @clients     = []
-    @cols        = cols
-    @rows        = rows
-    @master, @slave, @pid = PTY.spawn(cmd)
-    apply_winsize(@rows, @cols)
-    start_reader
-  end
-
-  def start_reader
-    Thread.new do
-      puts "[PTY:#{@terminal_id}] reader thread started, reading from master"
-      loop do
-        data = @master.readpartial(4096)
-        puts "[PTY:#{@terminal_id}] read #{data.bytes.size} bytes: #{data.inspect[0..50]}"
-        # Marshal back to EM reactor thread for thread-safe ws.send
-        EM.next_tick do
-          broadcast(@clients, 'term', 'output', { terminal_id: @terminal_id, data: data })
-        end
-      end
-    rescue EOFError, Errno::EIO => e
-      puts "[PTY:#{@terminal_id}] reader EOF: #{e.class}"
-      EM.next_tick do
-        broadcast(@clients, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
-      end
-    rescue => e
-      puts "[PTY:#{@terminal_id}] reader error: #{e.class} #{e.message}"
-    end
-  end
-
-  def write_input(data)
-    puts "[PTY:#{@terminal_id}] writing #{data.bytes.size} bytes: #{data.inspect[0..50]}"
-    @slave.write(data)
-  rescue Errno::EIO, Errno::EPIPE, IOError => e
-    puts "[PTY:#{@terminal_id}] write failed: #{e.class} #{e.message}"
-  end
-
-  def apply_winsize(rows, cols)
-    @rows = rows.to_i
-    @cols = cols.to_i
-    require 'io/console'
-    # Set terminal size via ioctl on slave so shell knows dimensions
-    @slave.winsize = [@rows, @cols] if @slave.respond_to?(:winsize=)
-  end
-
-  def add_client(ws)
-    @clients << ws unless @clients.include?(ws)
-  end
-
-  def remove_client(ws)
-    @clients.delete(ws)
-  end
-
-  def to_list_entry
-    {
-      id: @terminal_id,
-      status: 'active',
-      cols: @cols,
-      rows: @rows
-    }
-  end
-end
-
-# ---------------------------------------------------------------------------
-# ChatRoom — IRC-style room, broadcasts to all members
-# ---------------------------------------------------------------------------
-class ChatRoom
-  attr_reader :room_id, :clients
-
-  def initialize(room_id)
-    @room_id = room_id
-    @clients = {}  # ws => { user_id:, name: }
-  end
-
-  def add_client(ws, user_id:, name:)
-    @clients[ws] = { user_id: user_id, name: name }
-    broadcast_to_others(ws, 'user_join', { room_id: @room_id, user_id: user_id, name: name })
-    send_msg(ws, 'chat', 'user_list', { room_id: @room_id, users: user_list })
-  end
-
-  def remove_client(ws)
-    info = @clients.delete(ws)
-    return unless info
-    broadcast_all('user_leave', { room_id: @room_id, user_id: info[:user_id], name: info[:name] })
-  end
-
-  def handle_message(ws, text)
-    info = @clients[ws]
-    return unless info
-    broadcast_all('message', {
-      room_id:   @room_id,
-      user_id:   info[:user_id],
-      name:      info[:name],
-      text:      text,
-      timestamp: Time.now.utc.iso8601
-    })
-  end
-
-  def user_list
-    @clients.values.map { |c| { user_id: c[:user_id], name: c[:name] } }
-  end
-
-  private
-
-  def broadcast_all(cmd, payload)
-    broadcast(@clients.keys, 'chat', cmd, payload)
-  end
-
-  def broadcast_to_others(ws, cmd, payload)
-    broadcast(@clients.keys.reject { |s| s == ws }, 'chat', cmd, payload)
-  end
-end
-
-# ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 TERMINALS  = {}  # terminal_id (int) => TerminalInstance
 CHAT_ROOMS = {}  # room_id (string)  => ChatRoom
 SESSIONS_BY_PROJECT = {}  # project_id => [Session, ...]
-
-# ---------------------------------------------------------------------------
-# Per-connection session state
-# ---------------------------------------------------------------------------
-class Session
-  attr_reader :ws, :user_id, :name, :project_id, :terminals, :rooms
-
-  def initialize(ws, payload)
-    @ws         = ws
-    @user_id    = payload['user']
-    @name       = payload['name'] || "user_#{@user_id}"
-    @project_id = payload['project']
-    @terminals  = []  # terminal_ids joined
-    @rooms      = []  # room_ids joined
-  end
-
-  def cleanup
-    @terminals.each do |tid|
-      TERMINALS[tid]&.remove_client(@ws)
-    end
-    @rooms.each do |rid|
-      CHAT_ROOMS[rid]&.remove_client(@ws)
-    end
-  end
-end
 
 # ---------------------------------------------------------------------------
 # Message router
@@ -214,12 +71,21 @@ end
 def handle_term(session, cmd, payload)
   case cmd
   when 'create'
-    # Create new terminal in current project
-    terminal_id = (TERMINALS.keys.map(&:to_i).max || 0) + 1
-    term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24)
-    TERMINALS[terminal_id] = term
-    send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
-    broadcast_terminals_to_project(session.project_id)
+    begin
+      # Create new terminal in current project
+      terminal_id = (TERMINALS.keys.map(&:to_i).max || 0) + 1
+      puts "[handle_term] creating terminal #{terminal_id} for project #{session.project_id}"
+      term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24)
+      TERMINALS[terminal_id] = term
+      puts "[handle_term] sending 'created' to client"
+      send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
+      puts "[handle_term] broadcasting terminal list to project"
+      broadcast_terminals_to_project(session.project_id)
+      puts "[handle_term] done"
+    rescue => e
+      puts "[handle_term] ERROR: #{e.class} #{e.message}\n#{e.backtrace.first(5).join("\n")}"
+      send_msg(session.ws, 'system', 'error', { message: "Failed to create terminal: #{e.message}" })
+    end
 
   when 'join'
     tid  = payload['terminal_id'].to_i
@@ -252,20 +118,36 @@ end
 def handle_chat(session, cmd, payload)
   case cmd
   when 'join'
-    rid  = "project_#{session.project_id}"
-    room = CHAT_ROOMS[rid] ||= ChatRoom.new(rid)
+    cid = Integer(payload['channel_id']) rescue nil
+    return send_msg(session.ws, 'system', 'error', { message: 'chat join requires channel_id' }) unless cid
+    rid  = "project_#{session.project_id}_channel_#{cid}"
+    room = CHAT_ROOMS[rid] ||= ChatRoom.new(rid, channel_id: cid)
+    already_joined = room.member?(session.ws)
     room.add_client(session.ws, user_id: session.user_id, name: session.name)
     session.rooms << rid unless session.rooms.include?(rid)
+    send_msg(session.ws, 'chat', 'joined', { channel_id: cid, room_id: rid, already_joined: already_joined })
 
   when 'message'
-    rid  = "project_#{session.project_id}"
+    cid = Integer(payload['channel_id']) rescue nil
+    return send_msg(session.ws, 'system', 'error', { message: 'chat message requires channel_id' }) unless cid
+    rid  = "project_#{session.project_id}_channel_#{cid}"
     room = CHAT_ROOMS[rid]
-    room.handle_message(session.ws, payload['text'].to_s) if room
+    unless room && room.member?(session.ws)
+      return send_msg(session.ws, 'system', 'error', { message: 'not joined to channel' })
+    end
+    room.handle_message(session.ws, payload['text'].to_s)
 
   when 'leave'
-    rid = "project_#{session.project_id}"
-    CHAT_ROOMS[rid]&.remove_client(session.ws)
+    cid = Integer(payload['channel_id']) rescue nil
+    return send_msg(session.ws, 'system', 'error', { message: 'chat leave requires channel_id' }) unless cid
+    rid = "project_#{session.project_id}_channel_#{cid}"
+    room = CHAT_ROOMS[rid]
+    unless room && room.member?(session.ws)
+      return send_msg(session.ws, 'system', 'error', { message: 'not joined to channel' })
+    end
+    room.remove_client(session.ws)
     session.rooms.delete(rid)
+    send_msg(session.ws, 'chat', 'left', { channel_id: cid, room_id: rid })
   end
 end
 
@@ -276,6 +158,7 @@ end
 def broadcast_terminals_to_project(project_id)
   clients = (SESSIONS_BY_PROJECT[project_id] || []).map(&:ws)
   terminals = get_project_terminals(project_id)
+  puts "[broadcast_terminals_to_project] project=#{project_id}, clients=#{clients.length}, terminals=#{terminals.length}"
   broadcast(clients, 'term', 'list', { project_id: project_id, terminals: terminals })
 end
 
