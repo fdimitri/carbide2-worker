@@ -74,8 +74,9 @@ def handle_term(session, cmd, payload)
     begin
       # Create new terminal in current project
       terminal_id = (TERMINALS.keys.map(&:to_i).max || 0) + 1
+      requested_name = payload['name']
       puts "[handle_term] creating terminal #{terminal_id} for project #{session.project_id}"
-      term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24)
+      term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24, name: requested_name)
       TERMINALS[terminal_id] = term
       puts "[handle_term] sending 'created' to client"
       send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
@@ -93,7 +94,7 @@ def handle_term(session, cmd, payload)
     if term && term.project_id == session.project_id
       term.add_client(session.ws)
       session.terminals << tid unless session.terminals.include?(tid)
-      send_msg(session.ws, 'term', 'joined', { terminal_id: tid })
+      send_msg(session.ws, 'term', 'joined', { terminal_id: tid, rows: term.rows, cols: term.cols })
     else
       send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} not found or access denied" })
     end
@@ -106,7 +107,25 @@ def handle_term(session, cmd, payload)
   when 'resize'
     tid  = payload['terminal_id'].to_i
     term = TERMINALS[tid]
-    term.apply_winsize(payload['rows'], payload['cols']) if term
+    if term
+      term.apply_winsize(payload['rows'], payload['cols'])
+      broadcast(term.clients.values, 'term', 'resized', {
+        terminal_id: tid,
+        rows: term.rows,
+        cols: term.cols,
+        user_id: session.user_id
+      })
+    end
+
+  when 'rename'
+    tid  = payload['terminal_id'].to_i
+    term = TERMINALS[tid]
+    if term && term.project_id == session.project_id && term.rename(payload['name'])
+      send_msg(session.ws, 'term', 'renamed', { terminal_id: tid, name: term.name })
+      broadcast_terminals_to_project(session.project_id)
+    else
+      send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} rename failed" })
+    end
 
   when 'leave'
     tid = payload['terminal_id'].to_i

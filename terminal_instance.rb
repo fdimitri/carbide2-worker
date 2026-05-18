@@ -1,10 +1,12 @@
 # TerminalInstance owns one PTY and broadcasts output to subscribed sockets.
 class TerminalInstance
-  attr_reader :terminal_id, :project_id, :master, :slave, :pid, :clients, :cols, :rows
+  attr_reader :terminal_id, :project_id, :master, :slave, :pid, :clients, :cols, :rows, :name
 
-  def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash')
+  def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash', name: nil)
     @terminal_id = terminal_id
     @project_id  = project_id
+    @name        = name.to_s.strip
+    @name        = "terminal-#{terminal_id}" if @name.empty?
     # Track subscribers by object identity so separate browser windows are never collapsed.
     @clients     = {}
     @cols        = cols
@@ -67,10 +69,18 @@ class TerminalInstance
   def to_list_entry
     {
       id: @terminal_id,
+      name: @name,
       status: 'active',
       cols: @cols,
       rows: @rows
     }
+  end
+
+  def rename(new_name)
+    candidate = new_name.to_s.strip
+    return false if candidate.empty?
+    @name = candidate
+    true
   end
 
   def append_scrollback(data)
