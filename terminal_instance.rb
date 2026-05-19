@@ -31,13 +31,15 @@ class TerminalInstance
         puts "[PTY:#{@terminal_id}] read #{data.bytes.size} bytes: #{data.inspect[0..50]}"
         append_scrollback(data)
         EM.next_tick do
-          broadcast(@clients.values, 'term', 'output', { terminal_id: @terminal_id, data: data })
+          dead = broadcast(@clients.values, 'term', 'output', { terminal_id: @terminal_id, data: data })
+          dead.each { |ws| @clients.delete(ws.object_id) }
         end
       end
     rescue EOFError, Errno::EIO => e
       puts "[PTY:#{@terminal_id}] reader EOF: #{e.class}"
       EM.next_tick do
-        broadcast(@clients.values, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
+        dead = broadcast(@clients.values, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
+        dead.each { |ws| @clients.delete(ws.object_id) }
       end
     rescue => e
       puts "[PTY:#{@terminal_id}] reader error: #{e.class} #{e.message}"

@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 # Carbide2 worker — EventMachine WebSocket server
 # Handles: terminal (PTY), chat. Protocol: { cs, cmd, payload }
+$stdout.sync = true
+$stderr.sync = true
 require 'eventmachine'
 require 'em-websocket'
 require 'json'
@@ -32,12 +34,15 @@ def send_msg(ws, cs, cmd, payload = {})
 end
 
 def broadcast(clients, cs, cmd, payload = {})
-  msg = { cs: cs, cmd: cmd, payload: payload }.to_json
+  msg  = { cs: cs, cmd: cmd, payload: payload }.to_json
+  dead = []
   clients.each do |ws|
     ws.send(msg)
   rescue => e
     puts "[broadcast] send failed: #{e.class} #{e.message}"
+    dead << ws
   end
+  dead
 end
 
 # ---------------------------------------------------------------------------

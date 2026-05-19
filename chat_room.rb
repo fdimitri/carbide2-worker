@@ -47,10 +47,12 @@ class ChatRoom
   private
 
   def broadcast_all(cmd, payload)
-    broadcast(@clients.keys, 'chat', cmd, payload)
+    dead = broadcast(@clients.keys, 'chat', cmd, payload)
+    dead.each { |ws| @clients.delete(ws) }
   end
 
   def broadcast_to_others(ws, cmd, payload)
-    broadcast(@clients.keys.reject { |s| s == ws }, 'chat', cmd, payload)
+    dead = broadcast(@clients.keys.reject { |s| s == ws }, 'chat', cmd, payload)
+    dead.each { |dead_ws| @clients.delete(dead_ws) }
   end
 end
