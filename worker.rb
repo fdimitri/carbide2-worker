@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 # Carbide2 worker — EventMachine WebSocket server
-# Handles: terminal (PTY), chat. Protocol: { cs, cmd, payload }
+# Handles: terminal (PTY), chat, fs (file read). Protocol: { cs, cmd, payload }
 $stdout.sync = true
 $stderr.sync = true
 require 'eventmachine'
@@ -16,6 +16,7 @@ require_relative 'session'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
+PROJECT_ROOT  = File.expand_path(ENV.fetch('PROJECT_ROOT', Dir.pwd)).freeze
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,6 +67,8 @@ def route(session, msg_str)
     handle_term(session, cmd, payload)
   when 'chat'
     handle_chat(session, cmd, payload)
+  when 'fs'
+    handle_fs(session, cmd, payload)
   else
     send_msg(session.ws, 'system', 'error', { message: "unknown commandSet: #{cs}" })
   end
@@ -173,6 +176,30 @@ def handle_chat(session, cmd, payload)
     session.rooms.delete(rid)
     send_msg(session.ws, 'chat', 'left', { channel_id: cid, room_id: rid })
   end
+end
+
+# ---------------------------------------------------------------------------
+# Filesystem handler — read-only, restricted to PROJECT_ROOT
+# ---------------------------------------------------------------------------
+def handle_fs(session, cmd, payload)
+  case cmd
+  when 'read'
+    raw  = payload['path'].to_s.strip
+    full = File.expand_path(raw, PROJECT_ROOT)
+    # Prevent path traversal outside the project root
+    unless full.start_with?(PROJECT_ROOT + '/') || full == PROJECT_ROOT
+      return send_msg(session.ws, 'fs', 'error', { path: raw, error: 'access denied' })
+    end
+    unless File.file?(full)
+      return send_msg(session.ws, 'fs', 'error', { path: raw, error: 'file not found' })
+    end
+    content = File.read(full, encoding: 'utf-8')
+    send_msg(session.ws, 'fs', 'content', { path: raw, content: content })
+  else
+    send_msg(session.ws, 'system', 'error', { message: "unknown fs cmd: #{cmd}" })
+  end
+rescue => e
+  send_msg(session.ws, 'fs', 'error', { path: payload['path'].to_s, error: e.message })
 end
 
 def get_project_terminals(project_id)
