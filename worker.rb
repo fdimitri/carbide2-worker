@@ -13,6 +13,8 @@ require 'uri'
 require_relative 'terminal_instance'
 require_relative 'chat_room'
 require_relative 'session'
+require_relative 'ar_boot'
+require_relative 'fs_store'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
@@ -179,27 +181,15 @@ def handle_chat(session, cmd, payload)
 end
 
 # ---------------------------------------------------------------------------
-# Filesystem handler — read-only, restricted to PROJECT_ROOT
+# Filesystem handler — database-backed via FsStore
 # ---------------------------------------------------------------------------
 def handle_fs(session, cmd, payload)
-  case cmd
-  when 'read'
-    raw  = payload['path'].to_s.strip
-    full = File.expand_path(raw, PROJECT_ROOT)
-    # Prevent path traversal outside the project root
-    unless full.start_with?(PROJECT_ROOT + '/') || full == PROJECT_ROOT
-      return send_msg(session.ws, 'fs', 'error', { path: raw, error: 'access denied' })
-    end
-    unless File.file?(full)
-      return send_msg(session.ws, 'fs', 'error', { path: raw, error: 'file not found' })
-    end
-    content = File.read(full, encoding: 'utf-8')
-    send_msg(session.ws, 'fs', 'content', { path: raw, content: content })
-  else
-    send_msg(session.ws, 'system', 'error', { message: "unknown fs cmd: #{cmd}" })
-  end
-rescue => e
-  send_msg(session.ws, 'fs', 'error', { path: payload['path'].to_s, error: e.message })
+  FsStore.handle(
+    session, cmd, payload,
+    SESSIONS_BY_PROJECT,
+    method(:send_msg),
+    method(:broadcast)
+  )
 end
 
 def get_project_terminals(project_id)
@@ -232,6 +222,22 @@ EM.run do
   port = ENV.fetch('WORKER_PORT', '8080').to_i
 
   puts "Carbide2 worker starting on #{host}:#{port}"
+
+  # Seed the filesystem for project 1 from the default directory on startup.
+  # Override with FS_ROOT env var; disable entirely with FS_SKIP_LOAD=1.
+  unless ENV['FS_SKIP_LOAD'] == '1'
+    EM.defer do
+      begin
+        project_id = Integer(ENV.fetch('FS_PROJECT_ID', '1'))
+        fs_root    = File.expand_path(ENV.fetch('FS_ROOT', '~/repos/carbide2-server'))
+        puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
+        stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
+        puts "[startup] FS load complete — #{stats[:dirs]} dirs, #{stats[:files]} files, #{stats[:existing]} skipped (already in DB)"
+      rescue => e
+        puts "[startup] FS load failed: #{e.class}: #{e.message}"
+      end
+    end
+  end
 
   EM::WebSocket.start(host: host, port: port) do |ws|
     session = nil
