@@ -204,7 +204,8 @@ module FsStore
   private_class_method
 
   def self.find_entry!(project_id, path)
-    entry = DirectoryEntry.find_by_project_and_path(project_id, path)
+    normalized = path.start_with?('/') ? path : "/#{path}"
+    entry = DirectoryEntry.find_by_project_and_path(project_id, normalized)
     raise ActiveRecord::RecordNotFound, path unless entry
     entry
   end
