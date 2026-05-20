@@ -27,6 +27,7 @@ class ApplicationRecord < ActiveRecord::Base
 end
 
 # Load the FS models and services.
+require_relative '../app/models/project'
 require_relative '../app/models/fs_document'
 require_relative '../app/models/directory_entry'
 require_relative '../app/models/file_change'

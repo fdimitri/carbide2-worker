@@ -27,7 +27,7 @@ _cfg      = File.exist?(_cfg_path) ? (require 'yaml'; YAML.load_file(_cfg_path, 
 PROJECT_ROOT = File.expand_path(
   ENV['PROJECT_ROOT'] || _cfg['project_root'].to_s.then { |p| p.empty? ? Dir.pwd : p }
 ).freeze
-puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT}"
+puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT} (fallback only — overridden by project.root_path from DB)"
 
 # ---------------------------------------------------------------------------
 # Helpers
