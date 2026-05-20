@@ -109,7 +109,7 @@ def handle_term(session, cmd, payload)
 
       if ENV['CARBIDE_USE_DOCKER'] == '1'
         container = PROJECT_CONTAINERS[session.project_id] ||=
-          ProjectContainer.new(session.project_id, root_path: proj&.root_path.presence)
+          ProjectContainer.new(session.project_id, root_path: proj&.project_setting&.root_path.presence)
         container.ensure_running!
         term = TerminalInstance.new(
           terminal_id,
@@ -120,7 +120,7 @@ def handle_term(session, cmd, payload)
           cwd:  nil   # cwd is handled by the container's -w flag
         )
       else
-        cwd  = proj&.root_path.presence || PROJECT_ROOT
+        cwd  = proj&.project_setting&.root_path.presence || PROJECT_ROOT
         term = TerminalInstance.new(
           terminal_id,
           project_id: session.project_id,
@@ -282,14 +282,14 @@ EM.run do
 
   # Seed the filesystem for project 1 from the default directory on startup.
   # Override with FS_ROOT env var; disable entirely with FS_SKIP_LOAD=1.
-  # If the project has a root_path set in the DB, that takes precedence over FS_ROOT.
+  # If the project has a root_path set in project_settings in the DB, that takes precedence over FS_ROOT.
   unless ENV['FS_SKIP_LOAD'] == '1'
     EM.defer do
       begin
         project_id = Integer(ENV.fetch('FS_PROJECT_ID', '1'))
         proj       = Project.find_by(id: project_id)
         fs_root    = File.expand_path(
-          proj&.root_path.presence ||
+          proj&.project_setting&.root_path.presence ||
           ENV.fetch('FS_ROOT', '~/repos/carbide2-server')
         )
         puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
