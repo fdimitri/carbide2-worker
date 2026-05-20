@@ -11,11 +11,16 @@ class OpenDocument
   end
 
   def add_client(ws, user_id:, name:)
-    @clients[ws] = { user_id: user_id, name: name }
+    @clients[ws] = { user_id: user_id, name: name, cursor: nil }
   end
 
   def remove_client(ws)
     @clients.delete(ws)
+  end
+
+  def update_cursor(ws, line:, char:)
+    return unless @clients[ws]
+    @clients[ws][:cursor] = { line: line, char: char }
   end
 
   def member?(ws)
@@ -28,7 +33,7 @@ class OpenDocument
 
   # List of viewers for sending to newly-joining clients.
   def viewers
-    @clients.values.map { |c| { user_id: c[:user_id], name: c[:name] } }
+    @clients.values.map { |c| { user_id: c[:user_id], name: c[:name], cursor: c[:cursor] } }
   end
 
   # ws sockets for all subscribers except the given one.

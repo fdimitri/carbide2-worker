@@ -26,6 +26,8 @@ module FsStore
       handle_open(session, payload, send_fn)
     when 'close'
       handle_close(session, payload)
+    when 'cursor'
+      handle_cursor(session, payload, broadcast_fn)
     when 'write'
       handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'set_contents'
@@ -95,6 +97,27 @@ module FsStore
     doc.remove_client(session.ws)
     session.close_file(norm)
     OPEN_DOCUMENTS.delete(key) if doc.empty?
+  end
+
+  # cursor — update this session's cursor position and broadcast to co-viewers
+  def self.handle_cursor(session, payload, broadcast_fn)
+    path = payload['path'].to_s.strip
+    norm = path.start_with?('/') ? path : "/#{path}"
+    key  = "#{session.project_id}:#{norm}"
+    doc  = OPEN_DOCUMENTS[key]
+    return unless doc&.member?(session.ws)
+
+    line = payload['line'].to_i
+    char = payload['char'].to_i
+    doc.update_cursor(session.ws, line: line, char: char)
+
+    broadcast_fn.call(doc.others(session.ws), 'fs', 'cursor', {
+      path:    norm,
+      user_id: session.user_id,
+      name:    session.name,
+      line:    line,
+      char:    char
+    })
   end
 
   # write — accepts { path:, changes: [...] }
