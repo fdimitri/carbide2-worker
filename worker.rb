@@ -13,6 +13,7 @@ require 'uri'
 require_relative 'terminal_instance'
 require_relative 'chat_room'
 require_relative 'open_document'
+require_relative 'project_container'
 require_relative 'session'
 require_relative 'ar_boot'
 require_relative 'fs_store'
@@ -59,9 +60,10 @@ end
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-TERMINALS       = {}  # terminal_id (int) => TerminalInstance
-CHAT_ROOMS      = {}  # room_id (string)  => ChatRoom
-OPEN_DOCUMENTS  = {}  # "#{project_id}:#{path}" => OpenDocument
+TERMINALS           = {}  # terminal_id (int) => TerminalInstance
+CHAT_ROOMS          = {}  # room_id (string)  => ChatRoom
+OPEN_DOCUMENTS      = {}  # "#{project_id}:#{path}" => OpenDocument
+PROJECT_CONTAINERS  = {}  # project_id (int)  => ProjectContainer
 SESSIONS_BY_PROJECT = {}  # project_id => [Session, ...]
 
 # ---------------------------------------------------------------------------
@@ -91,13 +93,36 @@ def handle_term(session, cmd, payload)
   case cmd
   when 'create'
     begin
-      # Create new terminal in current project
-      terminal_id = (TERMINALS.keys.map(&:to_i).max || 0) + 1
+      # Create new terminal in current project — attach to (or start) the
+      # project's persistent Docker container.
+      terminal_id    = (TERMINALS.keys.map(&:to_i).max || 0) + 1
       requested_name = payload['name']
       puts "[handle_term] creating terminal #{terminal_id} for project #{session.project_id}"
+
       proj = Project.find_by(id: session.project_id)
-      cwd  = proj&.root_path.presence || PROJECT_ROOT
-      term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24, name: requested_name, cwd: cwd)
+
+      if ENV['CARBIDE_USE_DOCKER'] == '1'
+        container = PROJECT_CONTAINERS[session.project_id] ||=
+          ProjectContainer.new(session.project_id, root_path: proj&.root_path.presence)
+        container.ensure_running!
+        term = TerminalInstance.new(
+          terminal_id,
+          project_id: session.project_id,
+          cols: 80, rows: 24,
+          name: requested_name,
+          cmd:  container.exec_cmd,
+          cwd:  nil   # cwd is handled by the container's -w flag
+        )
+      else
+        cwd  = proj&.root_path.presence || PROJECT_ROOT
+        term = TerminalInstance.new(
+          terminal_id,
+          project_id: session.project_id,
+          cols: 80, rows: 24,
+          name: requested_name,
+          cwd:  cwd
+        )
+      end
       TERMINALS[terminal_id] = term
       puts "[handle_term] sending 'created' to client"
       send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
@@ -233,6 +258,13 @@ EM.run do
   port = ENV.fetch('WORKER_PORT', '8080').to_i
 
   puts "Carbide2 worker starting on #{host}:#{port}"
+  puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
+
+  # Stop all project containers cleanly when the worker shuts down.
+  EM.add_shutdown_hook do
+    PROJECT_CONTAINERS.each_value(&:stop)
+    puts '[worker] all project containers stopped'
+  end
 
   # Seed the filesystem for project 1 from the default directory on startup.
   # Override with FS_ROOT env var; disable entirely with FS_SKIP_LOAD=1.
