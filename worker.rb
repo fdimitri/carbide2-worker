@@ -95,7 +95,9 @@ def handle_term(session, cmd, payload)
       terminal_id = (TERMINALS.keys.map(&:to_i).max || 0) + 1
       requested_name = payload['name']
       puts "[handle_term] creating terminal #{terminal_id} for project #{session.project_id}"
-      term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24, name: requested_name)
+      proj = Project.find_by(id: session.project_id)
+      cwd  = proj&.root_path.presence || PROJECT_ROOT
+      term = TerminalInstance.new(terminal_id, project_id: session.project_id, cols: 80, rows: 24, name: requested_name, cwd: cwd)
       TERMINALS[terminal_id] = term
       puts "[handle_term] sending 'created' to client"
       send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
@@ -234,11 +236,16 @@ EM.run do
 
   # Seed the filesystem for project 1 from the default directory on startup.
   # Override with FS_ROOT env var; disable entirely with FS_SKIP_LOAD=1.
+  # If the project has a root_path set in the DB, that takes precedence over FS_ROOT.
   unless ENV['FS_SKIP_LOAD'] == '1'
     EM.defer do
       begin
         project_id = Integer(ENV.fetch('FS_PROJECT_ID', '1'))
-        fs_root    = File.expand_path(ENV.fetch('FS_ROOT', '~/repos/carbide2-server'))
+        proj       = Project.find_by(id: project_id)
+        fs_root    = File.expand_path(
+          proj&.root_path.presence ||
+          ENV.fetch('FS_ROOT', '~/repos/carbide2-server')
+        )
         puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
         stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
         puts "[startup] FS load complete — #{stats[:dirs]} dirs, #{stats[:files]} files, #{stats[:existing]} skipped (already in DB)"

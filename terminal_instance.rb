@@ -2,7 +2,7 @@
 class TerminalInstance
   attr_reader :terminal_id, :project_id, :master, :slave, :pid, :clients, :cols, :rows, :name
 
-  def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash', name: nil)
+  def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash', name: nil, cwd: nil)
     @terminal_id = terminal_id
     @project_id  = project_id
     @name        = name.to_s.strip
@@ -14,7 +14,8 @@ class TerminalInstance
     @scrollback  = +''
     @scrollback_limit = 200_000
     begin
-      @master, @slave, @pid = PTY.spawn(cmd)
+      spawn_cmd = build_spawn_cmd(cmd, cwd)
+      @master, @slave, @pid = PTY.spawn(spawn_cmd)
     rescue => e
       puts "[PTY] ERROR spawning #{cmd}: #{e.class} #{e.message}"
       raise e
@@ -83,6 +84,15 @@ class TerminalInstance
     return false if candidate.empty?
     @name = candidate
     true
+  end
+
+  private
+
+  # Build the shell command. If cwd is given, cd into it before exec-ing the shell.
+  def build_spawn_cmd(cmd, cwd)
+    return cmd if cwd.nil? || cwd.strip.empty?
+    safe_dir = cwd.strip.gsub("'", "'\\\\''")
+    "cd '#{safe_dir}' && exec #{cmd}"
   end
 
   def append_scrollback(data)
