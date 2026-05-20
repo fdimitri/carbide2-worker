@@ -19,7 +19,14 @@ require_relative 'fs_store'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
-PROJECT_ROOT  = File.expand_path(ENV.fetch('PROJECT_ROOT', Dir.pwd)).freeze
+
+# Load worker/carbide.yml if present; allows per-machine config without env vars.
+_cfg_path = File.join(__dir__, 'carbide.yml')
+_cfg      = File.exist?(_cfg_path) ? (require 'yaml'; YAML.load_file(_cfg_path, permitted_classes: []) || {}) : {}
+PROJECT_ROOT = File.expand_path(
+  ENV['PROJECT_ROOT'] || _cfg['project_root'].to_s.then { |p| p.empty? ? Dir.pwd : p }
+).freeze
+puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT}"
 
 # ---------------------------------------------------------------------------
 # Helpers
