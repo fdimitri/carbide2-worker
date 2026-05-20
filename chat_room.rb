@@ -36,6 +36,16 @@ class ChatRoom
     })
   end
 
+  def handle_typing(ws)
+    info = @clients[ws]
+    return unless info
+    broadcast_to_others(ws, 'typing', {
+      channel_id: @channel_id,
+      user_id:    info[:user_id],
+      name:       info[:name]
+    })
+  end
+
   def user_list
     @clients.values.map { |c| { user_id: c[:user_id], name: c[:name] } }
   end

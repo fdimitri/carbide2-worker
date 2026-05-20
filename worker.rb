@@ -208,6 +208,13 @@ def handle_chat(session, cmd, payload)
     end
     room.handle_message(session.ws, payload['text'].to_s)
 
+  when 'typing'
+    cid = Integer(payload['channel_id']) rescue nil
+    return unless cid
+    rid  = "project_#{session.project_id}_channel_#{cid}"
+    room = CHAT_ROOMS[rid]
+    room&.handle_typing(session.ws)
+
   when 'leave'
     cid = Integer(payload['channel_id']) rescue nil
     return send_msg(session.ws, 'system', 'error', { message: 'chat leave requires channel_id' }) unless cid
