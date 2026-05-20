@@ -294,7 +294,7 @@ EM.run do
           flusher = VfsFlusher.new(project_id: project_id, root_path: fs_root,
                                    suppress_set: VFS_FLUSH_SUPPRESS)
           VFS_FLUSHERS[project_id] = flusher
-          EM.add_periodic_timer(VfsFlusher::INTERVAL) { flusher.flush! }
+          EM.add_periodic_timer(VfsFlusher::INTERVAL_S) { flusher.flush! }
 
           watcher = VfsWatcher.new(project_id: project_id, root_path: fs_root,
                                    suppress_set: VFS_FLUSH_SUPPRESS)

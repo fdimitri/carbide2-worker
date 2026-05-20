@@ -167,6 +167,9 @@ module FsStore
         user_id:     session.user_id
       })
     end
+
+    data_bytes = changes.sum { |ch| ch['change_data'].to_s.bytesize }
+    VFS_FLUSHERS[session.project_id]&.record_write(entry.id, data_bytes)
   end
 
   def self.handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -195,6 +198,8 @@ module FsStore
       revision: fc.revision,
       user_id:  session.user_id
     })
+
+    VFS_FLUSHERS[session.project_id]&.record_write(entry.id, content.bytesize)
   end
 
   def self.handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
