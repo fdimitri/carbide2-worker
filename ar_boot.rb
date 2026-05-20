@@ -28,6 +28,7 @@ end
 
 # Load the FS models and services.
 require_relative '../app/models/project'
+require_relative '../app/models/project_membership'
 require_relative '../app/models/project_setting'
 require_relative '../app/models/fs_document'
 require_relative '../app/models/directory_entry'
