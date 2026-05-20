@@ -12,6 +12,7 @@
 # The container name is deterministic: "carbide2-project-<id>" so a restart of
 # the worker can re-adopt a container that survived the crash.
 require 'shellwords'
+require 'open3'
 
 class ProjectContainer
   # Override with CARBIDE_SHELL_IMAGE env var to use a custom image.
@@ -63,9 +64,6 @@ class ProjectContainer
     # Remove any stale stopped/exited container before creating a fresh one.
     system("docker rm -f #{Shellwords.escape(@name)} >/dev/null 2>&1")
 
-    vol_flag = @root_path.empty? ? '' : "-v #{Shellwords.escape("#{@root_path}:/workspace")}"
-    dir_flag = @root_path.empty? ? '' : '-w /workspace'
-
     args = [
       'docker', 'run', '-d',
       '--name', @name,
@@ -76,8 +74,11 @@ class ProjectContainer
     args.push(SHELL_IMAGE, 'sleep', 'infinity')
 
     puts "[ProjectContainer:#{@name}] #{args.join(' ')}"
-    out = IO.popen(args, err: '/dev/null', &:read).strip
-    raise "docker run failed for project #{@project_id} (exit #{$?.exitstatus}): #{out}" unless $?.success? && !out.empty?
+    out, err, status = Open3.capture3(*args)
+    out = out.strip
+    unless status.success? && !out.empty?
+      raise "docker run failed (exit #{status.exitstatus}): #{err.strip}"
+    end
 
     puts "[ProjectContainer:#{@name}] up (#{out[0, 12]})"
   end

@@ -17,6 +17,9 @@ require_relative 'project_container'
 require_relative 'session'
 require_relative 'ar_boot'
 require_relative 'fs_store'
+require_relative 'vfs_flusher'
+require_relative 'vfs_watcher'
+require 'set'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
@@ -60,11 +63,14 @@ end
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-TERMINALS           = {}  # terminal_id (int) => TerminalInstance
-CHAT_ROOMS          = {}  # room_id (string)  => ChatRoom
-OPEN_DOCUMENTS      = {}  # "#{project_id}:#{path}" => OpenDocument
-PROJECT_CONTAINERS  = {}  # project_id (int)  => ProjectContainer
-SESSIONS_BY_PROJECT = {}  # project_id => [Session, ...]
+TERMINALS           = {}        # terminal_id (int) => TerminalInstance
+CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
+OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
+PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
+SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
+VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
+VFS_FLUSHERS        = {}        # project_id => VfsFlusher
+VFS_WATCHERS        = {}        # project_id => VfsWatcher
 
 # ---------------------------------------------------------------------------
 # Message router
@@ -260,10 +266,11 @@ EM.run do
   puts "Carbide2 worker starting on #{host}:#{port}"
   puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
 
-  # Stop all project containers cleanly when the worker shuts down.
+  # Stop all project containers and VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do
+    VFS_WATCHERS.each_value(&:stop)
     PROJECT_CONTAINERS.each_value(&:stop)
-    puts '[worker] all project containers stopped'
+    puts '[worker] all project containers and VFS watchers stopped'
   end
 
   # Seed the filesystem for project 1 from the default directory on startup.
@@ -281,6 +288,20 @@ EM.run do
         puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
         stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
         puts "[startup] FS load complete — #{stats[:dirs]} dirs, #{stats[:files]} files, #{stats[:existing]} skipped (already in DB)"
+
+        # Start periodic flush (DB → disk) and inotify watcher (disk → DB)
+        EM.next_tick do
+          flusher = VfsFlusher.new(project_id: project_id, root_path: fs_root,
+                                   suppress_set: VFS_FLUSH_SUPPRESS)
+          VFS_FLUSHERS[project_id] = flusher
+          EM.add_periodic_timer(VfsFlusher::INTERVAL) { flusher.flush! }
+
+          watcher = VfsWatcher.new(project_id: project_id, root_path: fs_root,
+                                   suppress_set: VFS_FLUSH_SUPPRESS)
+          VFS_WATCHERS[project_id] = watcher
+          watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
+                         broadcast_fn: method(:broadcast))
+        end
       rescue => e
         puts "[startup] FS load failed: #{e.class}: #{e.message}"
       end
