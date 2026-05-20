@@ -12,6 +12,7 @@ require 'io/console'
 require 'uri'
 require_relative 'terminal_instance'
 require_relative 'chat_room'
+require_relative 'open_document'
 require_relative 'session'
 require_relative 'ar_boot'
 require_relative 'fs_store'
@@ -51,8 +52,9 @@ end
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-TERMINALS  = {}  # terminal_id (int) => TerminalInstance
-CHAT_ROOMS = {}  # room_id (string)  => ChatRoom
+TERMINALS       = {}  # terminal_id (int) => TerminalInstance
+CHAT_ROOMS      = {}  # room_id (string)  => ChatRoom
+OPEN_DOCUMENTS  = {}  # "#{project_id}:#{path}" => OpenDocument
 SESSIONS_BY_PROJECT = {}  # project_id => [Session, ...]
 
 # ---------------------------------------------------------------------------

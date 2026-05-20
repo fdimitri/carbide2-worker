@@ -22,6 +22,10 @@ module FsStore
       handle_tree(session, send_fn)
     when 'read'
       handle_read(session, payload, send_fn)
+    when 'open'
+      handle_open(session, payload, send_fn)
+    when 'close'
+      handle_close(session, payload)
     when 'write'
       handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'set_contents'
@@ -65,6 +69,34 @@ module FsStore
     })
   end
 
+  # open — register this session as viewing a file; receive its peer viewer list
+  def self.handle_open(session, payload, send_fn)
+    path  = payload['path'].to_s.strip
+    entry = find_entry!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
+
+    norm = entry.srcpath
+    key  = "#{session.project_id}:#{norm}"
+    doc  = OPEN_DOCUMENTS[key] ||= OpenDocument.new(session.project_id, norm)
+    doc.add_client(session.ws, user_id: session.user_id, name: session.name)
+    session.open_file(norm)
+
+    send_fn.call(session.ws, 'fs', 'opened', { path: norm, viewers: doc.viewers })
+  end
+
+  # close — unregister this session from a file
+  def self.handle_close(session, payload)
+    path = payload['path'].to_s.strip
+    norm = path.start_with?('/') ? path : "/#{path}"
+    key  = "#{session.project_id}:#{norm}"
+    doc  = OPEN_DOCUMENTS[key]
+    return unless doc
+
+    doc.remove_client(session.ws)
+    session.close_file(norm)
+    OPEN_DOCUMENTS.delete(key) if doc.empty?
+  end
+
   # write — accepts { path:, changes: [...] }
   # Each change in the array: { change_type:, change_data:, start_line:, start_char:, end_line:, end_char: }
   def self.handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -95,8 +127,10 @@ module FsStore
       revisions: stored.map(&:revision)
     })
 
-    # Broadcast each change to other clients in the same project
-    peers = other_project_sessions(session, sessions_by_project)
+    # Broadcast only to clients that have this file open
+    key   = "#{session.project_id}:#{entry.srcpath}"
+    doc   = OPEN_DOCUMENTS[key]
+    peers = doc ? doc.others(session.ws) : []
     changes.each_with_index do |ch, i|
       broadcast_fn.call(peers, 'fs', 'change', {
         path:        entry.srcpath,
@@ -129,7 +163,9 @@ module FsStore
     end
 
     send_fn.call(session.ws, 'fs', 'written', { path: entry.srcpath, revisions: [fc.revision] })
-    peers = other_project_sessions(session, sessions_by_project)
+    key   = "#{session.project_id}:#{entry.srcpath}"
+    doc   = OPEN_DOCUMENTS[key]
+    peers = doc ? doc.others(session.ws) : []
     broadcast_fn.call(peers, 'fs', 'set_contents', {
       path:     entry.srcpath,
       content:  content,
