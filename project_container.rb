@@ -13,10 +13,18 @@
 # the worker can re-adopt a container that survived the crash.
 require 'shellwords'
 require 'open3'
+require 'fileutils'
 
 class ProjectContainer
   # Override with CARBIDE_SHELL_IMAGE env var to use a custom image.
   SHELL_IMAGE = ENV.fetch('CARBIDE_SHELL_IMAGE', 'ubuntu:24.04').freeze
+
+  # When the worker runs inside docker compose, all project files live on a
+  # shared named volume mounted at PROJECTS_ROOT in the worker container.
+  # Spawned shell containers mount the same volume with a per-project subpath
+  # so they see exactly the same files without any host-path coupling.
+  PROJECTS_ROOT   = ENV.fetch('PROJECTS_ROOT', '').freeze
+  PROJECTS_VOLUME = ENV.fetch('CARBIDE_PROJECTS_VOLUME', '').freeze
 
   attr_reader :project_id, :name
 
@@ -58,19 +66,29 @@ class ProjectContainer
     out == 'true'
   end
 
+  # Absolute path the *worker* uses for this project's files (for FsLoader,
+  # VfsFlusher, VfsWatcher).  When PROJECTS_ROOT is set, derived from the
+  # project id; otherwise falls back to the ProjectSetting root_path.
+  def worker_path
+    if !PROJECTS_ROOT.empty?
+      File.join(PROJECTS_ROOT, @project_id.to_s)
+    else
+      @root_path
+    end
+  end
+
   private
 
   def start!
     # Remove any stale stopped/exited container before creating a fresh one.
     system("docker rm -f #{Shellwords.escape(@name)} >/dev/null 2>&1")
 
-    args = [
-      'docker', 'run', '-d',
-      '--name', @name,
-    ]
-    unless @root_path.empty?
-      args.push('-v', "#{@root_path}:/workspace", '-w', '/workspace')
-    end
+    args = ['docker', 'run', '-d', '--name', @name]
+
+    mount_args = build_mount_args
+    args.concat(mount_args) unless mount_args.empty?
+    args.push('-w', '/workspace') unless mount_args.empty?
+
     args.push(SHELL_IMAGE, 'sleep', 'infinity')
 
     puts "[ProjectContainer:#{@name}] #{args.join(' ')}"
@@ -82,4 +100,29 @@ class ProjectContainer
 
     puts "[ProjectContainer:#{@name}] up (#{out[0, 12]})"
   end
+
+  # Decide how to expose project files to the shell container:
+  #   1. CARBIDE_PROJECTS_VOLUME set → mount the named volume with subpath
+  #      <project_id>.  Worker also pre-creates the subdir under
+  #      PROJECTS_ROOT so the subpath exists before docker stats it.
+  #   2. PROJECTS_ROOT set (no volume) → bind-mount the per-project subdir
+  #      from PROJECTS_ROOT (worker and shell must see the same host path).
+  #   3. Legacy: bind-mount @root_path directly.
+  def build_mount_args
+    if !PROJECTS_VOLUME.empty?
+      FileUtils.mkdir_p(worker_path) unless worker_path.empty?
+      [
+        '--mount',
+        "type=volume,source=#{PROJECTS_VOLUME},target=/workspace,volume-subpath=#{@project_id}"
+      ]
+    elsif !PROJECTS_ROOT.empty?
+      FileUtils.mkdir_p(worker_path)
+      ['-v', "#{worker_path}:/workspace"]
+    elsif !@root_path.empty?
+      ['-v', "#{@root_path}:/workspace"]
+    else
+      []
+    end
+  end
 end
+
