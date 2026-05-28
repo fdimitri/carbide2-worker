@@ -288,10 +288,17 @@ EM.run do
       begin
         project_id = Integer(ENV.fetch('FS_PROJECT_ID', '1'))
         proj       = Project.find_by(id: project_id)
-        fs_root    = File.expand_path(
+        # Resolution order:
+        #   1. project.project_setting.root_path (DB, set by Project#ensure_project_setting!)
+        #   2. FS_ROOT env (operator override)
+        #   3. PROJECTS_ROOT/<project_id>  (matches Project.default_root_path)
+        projects_root = ENV.fetch('PROJECTS_ROOT', '/srv/projects')
+        fs_root       = File.expand_path(
           proj&.project_setting&.root_path.presence ||
-          ENV.fetch('FS_ROOT', '~/repos/carbide2-server')
+          ENV['FS_ROOT'].presence ||
+          File.join(projects_root, project_id.to_s)
         )
+        FileUtils.mkdir_p(fs_root) rescue nil
         puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
         stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
         puts "[startup] FS load complete — #{stats[:dirs]} dirs, #{stats[:files]} files, #{stats[:existing]} skipped (already in DB)"
