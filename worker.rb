@@ -148,7 +148,7 @@ def handle_term(session, cmd, payload)
       TERMINALS[terminal_id] = term
       term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
       puts "[handle_term] sending 'created' to client"
-      send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
+      send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id, name: term.name })
       puts "[handle_term] broadcasting terminal list to project"
       broadcast_terminals_to_project(session.project_id)
       puts "[handle_term] done"
