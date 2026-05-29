@@ -14,6 +14,7 @@ require_relative 'terminal_instance'
 require_relative 'chat_room'
 require_relative 'open_document'
 require_relative 'project_container'
+require_relative 'project_pod'
 require_relative 'session'
 require_relative 'ar_boot'
 require_relative 'fs_store'
@@ -67,6 +68,8 @@ TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
 OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
 PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
+PROJECT_PODS        = {}        # project_id (int)  => ProjectPod
+POD_REFCOUNTS       = Hash.new(0)  # project_id => live terminal count
 SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
 VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
 VFS_FLUSHERS        = {}        # project_id => VfsFlusher
@@ -107,7 +110,20 @@ def handle_term(session, cmd, payload)
 
       proj = Project.find_by(id: session.project_id)
 
-      if ENV['CARBIDE_USE_DOCKER'] == '1'
+      case ENV.fetch('CARBIDE_BACKEND', 'local')
+      when 'kube'
+        pod = PROJECT_PODS[session.project_id] ||= ProjectPod.new(session.project_id)
+        pod.ensure_running!
+        POD_REFCOUNTS[session.project_id] += 1
+        term = TerminalInstance.new(
+          terminal_id,
+          project_id: session.project_id,
+          cols: 80, rows: 24,
+          name: requested_name,
+          cmd:  pod.exec_cmd,
+          cwd:  nil
+        )
+      when 'docker'
         container = PROJECT_CONTAINERS[session.project_id] ||=
           ProjectContainer.new(session.project_id, root_path: proj&.project_setting&.root_path.presence)
         container.ensure_running!
@@ -130,6 +146,7 @@ def handle_term(session, cmd, payload)
         )
       end
       TERMINALS[terminal_id] = term
+      term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
       puts "[handle_term] sending 'created' to client"
       send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id })
       puts "[handle_term] broadcasting terminal list to project"
@@ -183,6 +200,42 @@ def handle_term(session, cmd, payload)
     tid = payload['terminal_id'].to_i
     TERMINALS[tid]&.remove_client(session.ws)
     session.terminals.delete(tid)
+
+  when 'destroy'
+    tid  = payload['terminal_id'].to_i
+    term = TERMINALS[tid]
+    if term && term.project_id == session.project_id
+      puts "[handle_term] destroy requested for tid=#{tid}"
+      term.destroy!
+      # destroy! triggers the PTY reader's EOF path, which fires on_exit and
+      # broadcasts 'term' 'exit'. As a belt-and-braces fallback in case the
+      # reader thread is wedged, prune + broadcast here too.
+      EM.add_timer(0.5) { on_terminal_exit(tid, session.project_id) if TERMINALS.key?(tid) }
+    else
+      send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} not found or access denied" })
+    end
+  end
+end
+
+# Called once per terminal when its PTY reader hits EOF (shell exited, was
+# killed, or the user clicked 'Destroy'). Prunes the global map, removes the
+# id from every session's list, and re-broadcasts the project's terminal list
+# so the UI removes the entry.
+def on_terminal_exit(tid, project_id)
+  return unless TERMINALS.delete(tid)
+  (SESSIONS_BY_PROJECT[project_id] || []).each { |s| s.terminals.delete(tid) }
+  broadcast_terminals_to_project(project_id)
+  remaining = get_project_terminals(project_id).size
+  puts "[on_terminal_exit] terminal=#{tid} project=#{project_id} pruned; #{remaining} remain"
+
+  # Ref-count the kube-backed pod; tear it down when the last terminal exits.
+  if ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube' && PROJECT_PODS.key?(project_id)
+    POD_REFCOUNTS[project_id] -= 1 if POD_REFCOUNTS[project_id] > 0
+    if POD_REFCOUNTS[project_id] <= 0
+      POD_REFCOUNTS.delete(project_id)
+      pod = PROJECT_PODS.delete(project_id)
+      Thread.new { pod.stop! } if pod  # don't block the EM reactor on kubectl delete
+    end
   end
 end
 
@@ -272,6 +325,7 @@ EM.run do
 
   puts "Carbide2 worker starting on #{host}:#{port}"
   puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
+  puts "[worker] Shell backend: #{ENV.fetch('CARBIDE_BACKEND', 'local')} (image=#{ENV['CARBIDE_SHELL_IMAGE'] || 'n/a'} ns=#{ENV['CARBIDE_NAMESPACE'] || 'n/a'})"
 
   # Stop all project containers and VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do

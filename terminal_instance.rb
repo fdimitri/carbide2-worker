@@ -41,6 +41,7 @@ class TerminalInstance
       EM.next_tick do
         dead = broadcast(@clients.values, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
         dead.each { |ws| @clients.delete(ws.object_id) }
+        @on_exit&.call(@terminal_id)
       end
     rescue => e
       puts "[PTY:#{@terminal_id}] reader error: #{e.class} #{e.message}"
@@ -69,6 +70,13 @@ class TerminalInstance
     @clients.delete(ws.object_id)
   end
 
+  # Register a single callback fired (on the EM thread) when the PTY reader
+  # hits EOF / EIO. Used by the worker to drop the terminal from its TERMINALS
+  # map and trigger ref-count cleanup of the project sandbox.
+  def on_exit(&block)
+    @on_exit = block
+  end
+
   def to_list_entry
     {
       id: @terminal_id,
@@ -86,7 +94,28 @@ class TerminalInstance
     true
   end
 
+  # Force-kill the underlying process and close the PTY. Safe to call multiple
+  # times; the reader thread's EOF path will broadcast 'term' 'exit'.
+  def destroy!
+    begin
+      Process.kill('TERM', @pid) if @pid
+      sleep 0.05
+      Process.kill('KILL', @pid) if @pid && process_alive?(@pid)
+    rescue Errno::ESRCH, Errno::EPERM
+      # already gone
+    end
+    @master.close rescue nil
+    @slave.close  rescue nil
+  end
+
   private
+
+  def process_alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH, Errno::EPERM
+    false
+  end
 
   # Build the shell command. If cwd is given, cd into it before exec-ing the shell.
   def build_spawn_cmd(cmd, cwd)
