@@ -165,7 +165,12 @@ def handle_term(session, cmd, payload)
       session.terminals << tid unless session.terminals.include?(tid)
       send_msg(session.ws, 'term', 'joined', { terminal_id: tid, rows: term.rows, cols: term.cols })
     else
-      send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} not found or access denied" })
+      # Terminal is gone (shell exited, destroyed, or never existed). Reply
+      # with 'exit' rather than 'system/error' so the client treats it as a
+      # closed session ([session ended] in the pane) instead of surfacing a
+      # red banner — useful for tabs that were left open after the shell
+      # exited and are clicked again later.
+      send_msg(session.ws, 'term', 'exit', { terminal_id: tid, code: nil, reason: 'gone' })
     end
 
   when 'input'
