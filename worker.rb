@@ -280,41 +280,57 @@ EM.run do
     puts '[worker] all project containers and VFS watchers stopped'
   end
 
-  # Seed the filesystem for project 1 from the default directory on startup.
-  # Override with FS_ROOT env var; disable entirely with FS_SKIP_LOAD=1.
-  # If the project has a root_path set in project_settings in the DB, that takes precedence over FS_ROOT.
+  # Seed the filesystem for every project from its configured root on startup.
+  # FS_PROJECT_ID still works as a single-project override; FS_ROOT only
+  # applies in that single-project mode (it makes no sense to point every
+  # project at the same directory). Disable entirely with FS_SKIP_LOAD=1.
   unless ENV['FS_SKIP_LOAD'] == '1'
     EM.defer do
       begin
-        project_id = Integer(ENV.fetch('FS_PROJECT_ID', '1'))
-        proj       = Project.find_by(id: project_id)
-        # Resolution order:
-        #   1. project.project_setting.root_path (DB, set by Project#ensure_project_setting!)
-        #   2. FS_ROOT env (operator override)
-        #   3. PROJECTS_ROOT/<project_id>  (matches Project.default_root_path)
         projects_root = ENV.fetch('PROJECTS_ROOT', '/srv/projects')
-        fs_root       = File.expand_path(
-          proj&.project_setting&.root_path.presence ||
-          ENV['FS_ROOT'].presence ||
-          File.join(projects_root, project_id.to_s)
-        )
-        FileUtils.mkdir_p(fs_root) rescue nil
-        puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
-        stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
-        puts "[startup] FS load complete — #{stats[:dirs]} dirs, #{stats[:files]} files, #{stats[:existing]} skipped (already in DB)"
+        single_id     = ENV['FS_PROJECT_ID']
+        fs_root_env   = ENV['FS_ROOT'].presence
 
-        # Start periodic flush (DB → disk) and inotify watcher (disk → DB)
-        EM.next_tick do
-          flusher = VfsFlusher.new(project_id: project_id, root_path: fs_root,
-                                   suppress_set: VFS_FLUSH_SUPPRESS)
-          VFS_FLUSHERS[project_id] = flusher
-          EM.add_periodic_timer(VfsFlusher::POLL_INTERVAL) { flusher.flush! }
+        project_ids =
+          if single_id
+            [Integer(single_id)]
+          else
+            Project.pluck(:id)
+          end
 
-          watcher = VfsWatcher.new(project_id: project_id, root_path: fs_root,
-                                   suppress_set: VFS_FLUSH_SUPPRESS)
-          VFS_WATCHERS[project_id] = watcher
-          watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
-                         broadcast_fn: method(:broadcast))
+        project_ids.each do |project_id|
+          proj    = Project.find_by(id: project_id)
+          next unless proj
+
+          # Resolution order:
+          #   1. project.project_setting.root_path
+          #   2. FS_ROOT env (single-project mode only)
+          #   3. PROJECTS_ROOT/<project_id>
+          fs_root = File.expand_path(
+            proj.project_setting&.root_path.presence ||
+            (single_id ? fs_root_env : nil) ||
+            File.join(projects_root, project_id.to_s)
+          )
+          FileUtils.mkdir_p(fs_root) rescue nil
+          puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
+          stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
+          puts "[startup] FS load complete (project #{project_id}) — " \
+               "#{stats[:dirs]} dirs, #{stats[:files]} files, " \
+               "#{stats[:existing]} skipped (already in DB)"
+
+          # Start periodic flush (DB → disk) and inotify watcher (disk → DB)
+          EM.next_tick do
+            flusher = VfsFlusher.new(project_id: project_id, root_path: fs_root,
+                                     suppress_set: VFS_FLUSH_SUPPRESS)
+            VFS_FLUSHERS[project_id] = flusher
+            EM.add_periodic_timer(VfsFlusher::POLL_INTERVAL) { flusher.flush! }
+
+            watcher = VfsWatcher.new(project_id: project_id, root_path: fs_root,
+                                     suppress_set: VFS_FLUSH_SUPPRESS)
+            VFS_WATCHERS[project_id] = watcher
+            watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
+                           broadcast_fn: method(:broadcast))
+          end
         end
       rescue => e
         puts "[startup] FS load failed: #{e.class}: #{e.message}"
