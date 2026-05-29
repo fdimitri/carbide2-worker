@@ -54,24 +54,63 @@ class AgentSession
     @agent           = agent
     @project_id      = project_id
     @conversation_id = conversation_id
+    @owner_user_id   = session.user_id
     @history         = []
-    if @agent.system_prompt.present?
-      @history << { role: 'system', content: @agent.system_prompt }
+    @turn            = 0  # monotonic AgentMessage row counter
+
+    # Resume from DB if a conversation with this uuid exists, otherwise
+    # create one and seed with the agent's system prompt. We persist
+    # eagerly so a crash mid-turn still leaves a coherent transcript.
+    @convo = AgentConversation.find_by(uuid: @conversation_id)
+    if @convo
+      @owner_user_id = @convo.user_id
+      msgs = @convo.agent_messages.order(:turn).to_a
+      @history = msgs.map(&:to_history_entry)
+      @turn    = (msgs.last&.turn || -1) + 1
+    else
+      @convo = AgentConversation.create!(
+        uuid:             @conversation_id,
+        project_id:       @project_id,
+        user_id:          session.user_id,
+        agent_id:         @agent.id,
+        visibility:       'project',
+        last_activity_at: Time.current,
+      )
+      if @agent.system_prompt.present?
+        push_history!(role: 'system', content: @agent.system_prompt)
+      end
     end
   end
+
+  # Public — used by worker.rb to authorize set_visibility, ask, etc.
+  def owner_user_id ; @owner_user_id ; end
+  def convo         ; @convo         ; end
 
   # Send a user message into the loop. Runs until the model returns a plain
   # assistant reply (no tool calls) or MAX_TURNS is exceeded.
   def ask(user_text)
-    @history << { role: 'user', content: user_text.to_s }
+    push_history!(role: 'user', content: user_text.to_s)
+    # Auto-title from first user message so the recent-conversations
+    # dropdown shows something useful. Owner can rename later.
+    if @convo.title.blank?
+      t = user_text.to_s.strip.gsub(/\s+/, ' ')[0, 80]
+      @convo.update_column(:title, t) unless t.empty?
+    end
     MAX_TURNS.times do |turn|
       response = post_chat_completion
       msg      = response.dig('choices', 0, 'message') || {}
       content  = msg['content']
       calls    = msg['tool_calls'] || []
+      finish   = response.dig('choices', 0, 'finish_reason')
+
+      # One-line per-turn trace so we can see exactly what the model did.
+      content_preview = content.to_s.gsub(/\s+/, ' ').strip[0, 80]
+      puts "[AgentSession #{@conversation_id[0,8]} turn=#{turn}] " \
+           "finish=#{finish.inspect} calls=#{calls.size} " \
+           "content=#{content_preview.inspect}"
 
       # Always append whatever the model said, even if empty (tool-only turn).
-      @history << { role: 'assistant', content: content, tool_calls: calls }.compact
+      push_history!(role: 'assistant', content: content, tool_calls: calls)
 
       if calls.empty?
         emit('done', { content: content.to_s, turn: turn })
@@ -136,18 +175,17 @@ class AgentSession
       session:       @session,
       project_id:    @project_id,
       args:          args,
+      agent:         @agent,
     )
 
     emit('tool_result', { tool: fn_name, call_id: call_id, result: result })
 
     # The OpenAI tool-call protocol requires a 'tool' message keyed by the
     # original call id with the JSON-encoded result.
-    @history << {
-      role:         'tool',
-      tool_call_id: call_id,
-      name:         fn_name,
-      content:      result.to_json,
-    }
+    push_history!(role:         'tool',
+                  tool_call_id: call_id,
+                  name:         fn_name,
+                  content:      result.to_json)
   end
 
   def parse_args(raw)
@@ -157,9 +195,60 @@ class AgentSession
     { '_raw' => raw }
   end
 
+  # Fan agent events out to every client in the project who is allowed to
+  # see this conversation. 'project'-visibility conversations broadcast to
+  # all project sessions; 'private' conversations only go to the owner's
+  # sessions. Falls back to the originating ws if SESSIONS_BY_PROJECT is
+  # missing (e.g. in tests).
   def emit(cmd, payload)
-    return unless @session&.ws
     full = payload.merge(conversation_id: @conversation_id, agent: @agent.slug)
-    @session.ws.send({ cs: 'agent', cmd: cmd, payload: full }.to_json)
+    msg  = { cs: 'agent', cmd: cmd, payload: full }.to_json
+
+    sessions =
+      if defined?(SESSIONS_BY_PROJECT)
+        (SESSIONS_BY_PROJECT[@project_id] || []).select do |s|
+          @convo.visibility == 'project' || s.user_id == @owner_user_id
+        end
+      else
+        []
+      end
+    sessions = [@session] if sessions.empty? && @session
+
+    sessions.each do |s|
+      next unless s.ws
+      begin
+        s.ws.send(msg)
+      rescue => e
+        puts "[AgentSession.emit] ws send failed: #{e.class} #{e.message}"
+      end
+    end
+  end
+
+  # Append a message to both the in-memory @history and the persistent
+  # AgentConversation. tool_calls is the assistant turn's tool_calls array
+  # (or nil/[]); we store [] as nil to keep the column clean.
+  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil)
+    entry =
+      case role
+      when 'tool'
+        { role: 'tool', tool_call_id: tool_call_id, name: name, content: content.to_s }
+      when 'assistant'
+        h = { role: 'assistant', content: content }
+        h[:tool_calls] = tool_calls if tool_calls && !tool_calls.empty?
+        h.compact
+      else
+        { role: role, content: content.to_s }
+      end
+    @history << entry
+    persist_calls = tool_calls && !tool_calls.empty? ? tool_calls : nil
+    @convo.append!(turn: @turn, role: role, content: content,
+                   tool_calls: persist_calls,
+                   tool_call_id: tool_call_id, name: name)
+    @turn += 1
+  rescue => e
+    # Persistence failure is logged but does not kill the conversation —
+    # the in-memory copy still lets the user finish their turn. The next
+    # successful save will pick up from the new @turn counter.
+    puts "[AgentSession] persist failed: #{e.class} #{e.message}"
   end
 end

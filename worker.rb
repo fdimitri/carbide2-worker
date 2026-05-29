@@ -112,6 +112,7 @@ def handle_term(session, cmd, payload)
       # project's persistent Docker container.
       terminal_id    = (TERMINALS.keys.map(&:to_i).max || 0) + 1
       requested_name = payload['name']
+      agent_acc      = !!payload['agent_accessible']
       puts "[handle_term] creating terminal #{terminal_id} for project #{session.project_id}"
 
       proj = Project.find_by(id: session.project_id)
@@ -127,7 +128,8 @@ def handle_term(session, cmd, payload)
           cols: 80, rows: 24,
           name: requested_name,
           cmd:  pod.exec_cmd,
-          cwd:  nil
+          cwd:  nil,
+          agent_accessible: agent_acc
         )
       when 'docker'
         container = PROJECT_CONTAINERS[session.project_id] ||=
@@ -139,7 +141,8 @@ def handle_term(session, cmd, payload)
           cols: 80, rows: 24,
           name: requested_name,
           cmd:  container.exec_cmd,
-          cwd:  nil   # cwd is handled by the container's -w flag
+          cwd:  nil,   # cwd is handled by the container's -w flag
+          agent_accessible: agent_acc
         )
       else
         cwd  = proj&.project_setting&.root_path.presence || PROJECT_ROOT
@@ -148,11 +151,13 @@ def handle_term(session, cmd, payload)
           project_id: session.project_id,
           cols: 80, rows: 24,
           name: requested_name,
-          cwd:  cwd
+          cwd:  cwd,
+          agent_accessible: agent_acc
         )
       end
       TERMINALS[terminal_id] = term
       term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
+      term.on_state_change { |_t| broadcast_terminals_to_project(session.project_id) }
       puts "[handle_term] sending 'created' to client"
       send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id, name: term.name })
       puts "[handle_term] broadcasting terminal list to project"
@@ -205,6 +210,22 @@ def handle_term(session, cmd, payload)
       broadcast_terminals_to_project(session.project_id)
     else
       send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} rename failed" })
+    end
+
+  when 'set_agent_accessible'
+    # Toggle whether this terminal can be claimed by an agent. The flag is
+    # in-memory on TerminalInstance (terminals themselves are ephemeral).
+    # We deliberately allow toggling AFTER creation per the user's request,
+    # so a long-running shell can be handed over to an agent mid-session.
+    tid  = payload['terminal_id'].to_i
+    term = TERMINALS[tid]
+    if term && term.project_id == session.project_id
+      flag = !!payload['enabled']
+      term.set_agent_accessible(flag)
+      # state_change_cb already triggers a broadcast; no need to call again.
+    else
+      send_msg(session.ws, 'system', 'error',
+               { message: "terminal #{tid} not found or access denied" })
     end
 
   when 'leave'
@@ -351,6 +372,113 @@ def handle_agent(session, cmd, payload)
     end
     send_msg(session.ws, 'agent', 'list', { agents: agents })
 
+  when 'recent'
+    # Return conversations visible to the requesting user in this project:
+    # all 'project'-visibility threads + this user's own 'private' threads.
+    limit = (payload['limit'] || 25).to_i.clamp(1, 100)
+    rows  = AgentConversation
+              .visible_to(session.user_id, session.project_id)
+              .limit(limit)
+              .includes(:user, :agent)
+              .to_a
+    items = rows.map do |c|
+      email = c.user&.email.to_s
+      {
+        conversation_id:  c.uuid,
+        agent_slug:       c.agent.slug,
+        agent_name:       c.agent.name,
+        title:            c.title.presence || '(untitled)',
+        visibility:       c.visibility,
+        owner_user_id:    c.user_id,
+        owner_name:       email.split('@').first.presence || "user #{c.user_id}",
+        owner_is_self:    (c.user_id == session.user_id),
+        last_activity_at: c.last_activity_at&.iso8601,
+        message_count:    c.agent_messages.count,
+      }
+    end
+    send_msg(session.ws, 'agent', 'recent', { conversations: items })
+
+  when 'load'
+    conv = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      send_msg(session.ws, 'system', 'error',
+               { message: "agent/load: conversation not found in this project" })
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      send_msg(session.ws, 'system', 'error',
+               { message: "agent/load: conversation is private" })
+      return
+    end
+    # Replay messages in wire-shape that AgentPane already understands.
+    msgs = convo.agent_messages.order(:turn).to_a
+    items = msgs.flat_map do |m|
+      case m.role
+      when 'user'
+        [{ kind: 'user', text: m.content.to_s }]
+      when 'assistant'
+        out = []
+        if m.content.to_s.strip != ''
+          out << { kind: 'assistant', text: m.content.to_s }
+        end
+        # We surface tool_calls as their own UI rows. tool_call_id pairs
+        # with the matching role=tool row that follows.
+        (m.tool_calls || []).each do |tc|
+          out << {
+            kind: 'tool_call',
+            id:   tc['id'],
+            name: tc.dig('function', 'name'),
+            args: (JSON.parse(tc.dig('function', 'arguments').to_s) rescue {}),
+          }
+        end
+        out
+      when 'tool'
+        result = (JSON.parse(m.content.to_s) rescue m.content)
+        [{ kind: 'tool_result', id: m.tool_call_id, name: m.name, result: result }]
+      else
+        [] # 'system' is hidden from UI
+      end
+    end
+    send_msg(session.ws, 'agent', 'loaded', {
+      conversation_id: conv,
+      agent:           convo.agent.slug,
+      title:           convo.title,
+      visibility:      convo.visibility,
+      owner_user_id:   convo.user_id,
+      owner_is_self:   (convo.user_id == session.user_id),
+      messages:        items,
+    })
+
+  when 'set_visibility'
+    conv = payload['conversation_id'].to_s
+    vis  = payload['visibility'].to_s
+    unless AgentConversation::VISIBILITIES.include?(vis)
+      send_msg(session.ws, 'system', 'error',
+               { message: "agent/set_visibility: visibility must be one of #{AgentConversation::VISIBILITIES.inspect}" })
+      return
+    end
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      send_msg(session.ws, 'system', 'error',
+               { message: "agent/set_visibility: conversation not found in this project" })
+      return
+    end
+    unless convo.user_id == session.user_id
+      send_msg(session.ws, 'system', 'error',
+               { message: "agent/set_visibility: only the owner can change visibility" })
+      return
+    end
+    convo.update!(visibility: vis)
+    # Tell every project client to refresh their dropdown (someone may
+    # gain or lose visibility of this conversation).
+    clients = (SESSIONS_BY_PROJECT[session.project_id] || []).map(&:ws)
+    broadcast(clients, 'agent', 'visibility_changed', {
+      conversation_id: conv,
+      visibility:      vis,
+      owner_user_id:   convo.user_id,
+    })
+
   when 'ask'
     slug = payload['agent_slug'].to_s
     msg  = payload['message'].to_s
@@ -366,6 +494,18 @@ def handle_agent(session, cmd, payload)
     unless agent
       send_msg(session.ws, 'system', 'error', { message: "agent/ask: no enabled agent with slug=#{slug}" })
       return
+    end
+
+    # If resuming an existing conversation, only the owner (or anyone, if
+    # it's project-visible) may post into it. We default to "anyone in the
+    # project may post into a shared conversation" \u2014 multi-user agent
+    # collaboration is a stated goal.
+    if (existing = AgentConversation.find_by(uuid: conv))
+      unless existing.project_id == session.project_id && existing.visible_to?(session.user_id)
+        send_msg(session.ws, 'system', 'error',
+                 { message: 'agent/ask: not allowed to post into this conversation' })
+        return
+      end
     end
 
     sess = AgentSession.find(conv) ||
