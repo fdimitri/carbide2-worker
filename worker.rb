@@ -7,6 +7,7 @@ require 'eventmachine'
 require 'em-websocket'
 require 'json'
 require 'jwt'
+require 'open3'
 require 'pty'
 require 'io/console'
 require 'uri'
@@ -331,6 +332,28 @@ EM.run do
   puts "Carbide2 worker starting on #{host}:#{port}"
   puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
   puts "[worker] Shell backend: #{ENV.fetch('CARBIDE_BACKEND', 'local')} (image=#{ENV['CARBIDE_SHELL_IMAGE'] || 'n/a'} ns=#{ENV['CARBIDE_NAMESPACE'] || 'n/a'})"
+
+  # Big-hammer orphan cleanup: any carbide2-shell pods left in this
+  # workspace's namespace from a previous worker incarnation are dead to us
+  # (POD_REFCOUNTS lives in memory). Their PTYs are gone, no client is bound,
+  # and the pod is just consuming a node slot. Nuke them on startup. Other
+  # workspaces have their own namespaces, so this is scoped.
+  if ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube'
+    EM.defer do
+      ns = ENV.fetch('CARBIDE_NAMESPACE') { ProjectPod.read_namespace }
+      puts "[worker] pruning orphan carbide2-shell pods in ns=#{ns}"
+      out, err, status = Open3.capture3(
+        'kubectl', 'delete', 'pod', '-n', ns,
+        '-l', 'app.kubernetes.io/name=carbide2-shell',
+        '--ignore-not-found', '--wait=false', '--grace-period=5'
+      )
+      if status.success?
+        puts "[worker] orphan prune: #{out.strip.empty? ? 'nothing to delete' : out.strip}"
+      else
+        warn "[worker] orphan prune failed: #{err.strip}"
+      end
+    end
+  end
 
   # Stop all project containers and VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do
