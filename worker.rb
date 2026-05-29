@@ -24,6 +24,11 @@ require_relative 'vfs_flusher'
 require_relative 'vfs_watcher'
 require_relative 'agent_tools'
 require_relative 'agent_session'
+require_relative 'command'
+require_relative 'handlers/term_handlers'
+require_relative 'handlers/chat_handlers'
+require_relative 'handlers/fs_handlers'
+require_relative 'handlers/agent_handlers'
 require 'set'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
@@ -82,171 +87,27 @@ VFS_WATCHERS        = {}        # project_id => VfsWatcher
 # ---------------------------------------------------------------------------
 # Message router
 # ---------------------------------------------------------------------------
+ROUTES = {
+  'term'  => TermHandlers,
+  'chat'  => ChatHandlers,
+  'fs'    => FsHandlers,
+  'agent' => AgentHandlers,
+}.freeze
+
 def route(session, msg_str)
   msg     = JSON.parse(msg_str)
   cs      = msg['cs']
   cmd     = msg['cmd']
   payload = msg['payload'] || {}
 
-  case cs
-  when 'term'
-    handle_term(session, cmd, payload)
-  when 'chat'
-    handle_chat(session, cmd, payload)
-  when 'fs'
-    handle_fs(session, cmd, payload)
-  when 'agent'
-    handle_agent(session, cmd, payload)
+  handler = ROUTES[cs]
+  if handler
+    handler.dispatch(cmd, session, payload)
   else
     send_msg(session.ws, 'system', 'error', { message: "unknown commandSet: #{cs}" })
   end
 rescue JSON::ParserError
   send_msg(session.ws, 'system', 'error', { message: 'invalid json' })
-end
-
-def handle_term(session, cmd, payload)
-  case cmd
-  when 'create'
-    begin
-      # Create new terminal in current project — attach to (or start) the
-      # project's persistent Docker container.
-      terminal_id    = (TERMINALS.keys.map(&:to_i).max || 0) + 1
-      requested_name = payload['name']
-      agent_acc      = !!payload['agent_accessible']
-      puts "[handle_term] creating terminal #{terminal_id} for project #{session.project_id}"
-
-      proj = Project.find_by(id: session.project_id)
-
-      case ENV.fetch('CARBIDE_BACKEND', 'local')
-      when 'kube'
-        pod = PROJECT_PODS[session.project_id] ||= ProjectPod.new(session.project_id)
-        pod.ensure_running!
-        POD_REFCOUNTS[session.project_id] += 1
-        term = TerminalInstance.new(
-          terminal_id,
-          project_id: session.project_id,
-          cols: 80, rows: 24,
-          name: requested_name,
-          cmd:  pod.exec_cmd,
-          cwd:  nil,
-          agent_accessible: agent_acc
-        )
-      when 'docker'
-        container = PROJECT_CONTAINERS[session.project_id] ||=
-          ProjectContainer.new(session.project_id, root_path: proj&.project_setting&.root_path.presence)
-        container.ensure_running!
-        term = TerminalInstance.new(
-          terminal_id,
-          project_id: session.project_id,
-          cols: 80, rows: 24,
-          name: requested_name,
-          cmd:  container.exec_cmd,
-          cwd:  nil,   # cwd is handled by the container's -w flag
-          agent_accessible: agent_acc
-        )
-      else
-        cwd  = proj&.project_setting&.root_path.presence || PROJECT_ROOT
-        term = TerminalInstance.new(
-          terminal_id,
-          project_id: session.project_id,
-          cols: 80, rows: 24,
-          name: requested_name,
-          cwd:  cwd,
-          agent_accessible: agent_acc
-        )
-      end
-      TERMINALS[terminal_id] = term
-      term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
-      term.on_state_change { |_t| broadcast_terminals_to_project(session.project_id) }
-      puts "[handle_term] sending 'created' to client"
-      send_msg(session.ws, 'term', 'created', { terminal_id: terminal_id, name: term.name })
-      puts "[handle_term] broadcasting terminal list to project"
-      broadcast_terminals_to_project(session.project_id)
-      puts "[handle_term] done"
-    rescue => e
-      puts "[handle_term] ERROR: #{e.class} #{e.message}\n#{e.backtrace.first(5).join("\n")}"
-      send_msg(session.ws, 'system', 'error', { message: "Failed to create terminal: #{e.message}" })
-    end
-
-  when 'join'
-    tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    if term && term.project_id == session.project_id
-      term.add_client(session.ws)
-      session.terminals << tid unless session.terminals.include?(tid)
-      send_msg(session.ws, 'term', 'joined', { terminal_id: tid, rows: term.rows, cols: term.cols })
-    else
-      # Terminal is gone (shell exited, destroyed, or never existed). Reply
-      # with 'exit' rather than 'system/error' so the client treats it as a
-      # closed session ([session ended] in the pane) instead of surfacing a
-      # red banner — useful for tabs that were left open after the shell
-      # exited and are clicked again later.
-      send_msg(session.ws, 'term', 'exit', { terminal_id: tid, code: nil, reason: 'gone' })
-    end
-
-  when 'input'
-    tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    term.write_input(payload['data'].to_s) if term
-
-  when 'resize'
-    tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    if term
-      term.apply_winsize(payload['rows'], payload['cols'])
-      broadcast(term.clients.values, 'term', 'resized', {
-        terminal_id: tid,
-        rows: term.rows,
-        cols: term.cols,
-        user_id: session.user_id
-      })
-    end
-
-  when 'rename'
-    tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    if term && term.project_id == session.project_id && term.rename(payload['name'])
-      send_msg(session.ws, 'term', 'renamed', { terminal_id: tid, name: term.name })
-      broadcast_terminals_to_project(session.project_id)
-    else
-      send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} rename failed" })
-    end
-
-  when 'set_agent_accessible'
-    # Toggle whether this terminal can be claimed by an agent. The flag is
-    # in-memory on TerminalInstance (terminals themselves are ephemeral).
-    # We deliberately allow toggling AFTER creation per the user's request,
-    # so a long-running shell can be handed over to an agent mid-session.
-    tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    if term && term.project_id == session.project_id
-      flag = !!payload['enabled']
-      term.set_agent_accessible(flag)
-      # state_change_cb already triggers a broadcast; no need to call again.
-    else
-      send_msg(session.ws, 'system', 'error',
-               { message: "terminal #{tid} not found or access denied" })
-    end
-
-  when 'leave'
-    tid = payload['terminal_id'].to_i
-    TERMINALS[tid]&.remove_client(session.ws)
-    session.terminals.delete(tid)
-
-  when 'destroy'
-    tid  = payload['terminal_id'].to_i
-    term = TERMINALS[tid]
-    if term && term.project_id == session.project_id
-      puts "[handle_term] destroy requested for tid=#{tid}"
-      term.destroy!
-      # destroy! triggers the PTY reader's EOF path, which fires on_exit and
-      # broadcasts 'term' 'exit'. As a belt-and-braces fallback in case the
-      # reader thread is wedged, prune + broadcast here too.
-      EM.add_timer(0.5) { on_terminal_exit(tid, session.project_id) if TERMINALS.key?(tid) }
-    else
-      send_msg(session.ws, 'system', 'error', { message: "terminal #{tid} not found or access denied" })
-    end
-  end
 end
 
 # Called once per terminal when its PTY reader hits EOF (shell exited, was
@@ -271,61 +132,6 @@ def on_terminal_exit(tid, project_id)
   end
 end
 
-def handle_chat(session, cmd, payload)
-  case cmd
-  when 'join'
-    cid = Integer(payload['channel_id']) rescue nil
-    return send_msg(session.ws, 'system', 'error', { message: 'chat join requires channel_id' }) unless cid
-    rid  = "project_#{session.project_id}_channel_#{cid}"
-    room = CHAT_ROOMS[rid] ||= ChatRoom.new(rid, channel_id: cid)
-    already_joined = room.member?(session.ws)
-    room.add_client(session.ws, user_id: session.user_id, name: session.name)
-    session.rooms << rid unless session.rooms.include?(rid)
-    send_msg(session.ws, 'chat', 'joined', { channel_id: cid, room_id: rid, already_joined: already_joined })
-
-  when 'message'
-    cid = Integer(payload['channel_id']) rescue nil
-    return send_msg(session.ws, 'system', 'error', { message: 'chat message requires channel_id' }) unless cid
-    rid  = "project_#{session.project_id}_channel_#{cid}"
-    room = CHAT_ROOMS[rid]
-    unless room && room.member?(session.ws)
-      return send_msg(session.ws, 'system', 'error', { message: 'not joined to channel' })
-    end
-    room.handle_message(session.ws, payload['text'].to_s)
-
-  when 'typing'
-    cid = Integer(payload['channel_id']) rescue nil
-    return unless cid
-    rid  = "project_#{session.project_id}_channel_#{cid}"
-    room = CHAT_ROOMS[rid]
-    room&.handle_typing(session.ws)
-
-  when 'leave'
-    cid = Integer(payload['channel_id']) rescue nil
-    return send_msg(session.ws, 'system', 'error', { message: 'chat leave requires channel_id' }) unless cid
-    rid = "project_#{session.project_id}_channel_#{cid}"
-    room = CHAT_ROOMS[rid]
-    unless room && room.member?(session.ws)
-      return send_msg(session.ws, 'system', 'error', { message: 'not joined to channel' })
-    end
-    room.remove_client(session.ws)
-    session.rooms.delete(rid)
-    send_msg(session.ws, 'chat', 'left', { channel_id: cid, room_id: rid })
-  end
-end
-
-# ---------------------------------------------------------------------------
-# Filesystem handler — database-backed via FsStore
-# ---------------------------------------------------------------------------
-def handle_fs(session, cmd, payload)
-  FsStore.handle(
-    session, cmd, payload,
-    SESSIONS_BY_PROJECT,
-    method(:send_msg),
-    method(:broadcast)
-  )
-end
-
 def get_project_terminals(project_id)
   TERMINALS.values.select { |t| t.project_id == project_id }.map(&:to_list_entry)
 end
@@ -346,181 +152,6 @@ def create_terminal(terminal_id, project_id:, cols: 80, rows: 24)
   TERMINALS[terminal_id] = term
   broadcast_terminals_to_project(project_id)
   terminal_id
-end
-
-# ---------------------------------------------------------------------------
-# Agent — LLM tool-call loop. Per-conversation state lives in AgentSession.
-# Commands:
-#   agent/list           -> agent/list  { agents: [{slug, name, role, ...}] }
-#   agent/ask  { agent_slug, conversation_id?, message } ->
-#     emits agent/tool_call, agent/tool_result, agent/stream*, agent/done
-# Heavy-lifting (HTTP to model server) runs in EM.defer so the reactor stays
-# free for other clients.
-# ---------------------------------------------------------------------------
-def handle_agent(session, cmd, payload)
-  case cmd
-  when 'list'
-    agents = Agent.enabled.order(:role, :name).map do |a|
-      {
-        slug:        a.slug,
-        name:        a.name,
-        description: a.description,
-        role:        a.role,
-        model:       a.model,
-        tools:       a.allowed_tool_slugs,
-      }
-    end
-    send_msg(session.ws, 'agent', 'list', { agents: agents })
-
-  when 'recent'
-    # Return conversations visible to the requesting user in this project:
-    # all 'project'-visibility threads + this user's own 'private' threads.
-    limit = (payload['limit'] || 25).to_i.clamp(1, 100)
-    rows  = AgentConversation
-              .visible_to(session.user_id, session.project_id)
-              .limit(limit)
-              .includes(:user, :agent)
-              .to_a
-    items = rows.map do |c|
-      email = c.user&.email.to_s
-      {
-        conversation_id:  c.uuid,
-        agent_slug:       c.agent.slug,
-        agent_name:       c.agent.name,
-        title:            c.title.presence || '(untitled)',
-        visibility:       c.visibility,
-        owner_user_id:    c.user_id,
-        owner_name:       email.split('@').first.presence || "user #{c.user_id}",
-        owner_is_self:    (c.user_id == session.user_id),
-        last_activity_at: c.last_activity_at&.iso8601,
-        message_count:    c.agent_messages.count,
-      }
-    end
-    send_msg(session.ws, 'agent', 'recent', { conversations: items })
-
-  when 'load'
-    conv = payload['conversation_id'].to_s
-    convo = AgentConversation.find_by(uuid: conv)
-    unless convo && convo.project_id == session.project_id
-      send_msg(session.ws, 'system', 'error',
-               { message: "agent/load: conversation not found in this project" })
-      return
-    end
-    unless convo.visible_to?(session.user_id)
-      send_msg(session.ws, 'system', 'error',
-               { message: "agent/load: conversation is private" })
-      return
-    end
-    # Replay messages in wire-shape that AgentPane already understands.
-    msgs = convo.agent_messages.order(:turn).to_a
-    items = msgs.flat_map do |m|
-      case m.role
-      when 'user'
-        [{ kind: 'user', text: m.content.to_s }]
-      when 'assistant'
-        out = []
-        if m.content.to_s.strip != ''
-          out << { kind: 'assistant', text: m.content.to_s }
-        end
-        # We surface tool_calls as their own UI rows. tool_call_id pairs
-        # with the matching role=tool row that follows.
-        (m.tool_calls || []).each do |tc|
-          out << {
-            kind: 'tool_call',
-            id:   tc['id'],
-            name: tc.dig('function', 'name'),
-            args: (JSON.parse(tc.dig('function', 'arguments').to_s) rescue {}),
-          }
-        end
-        out
-      when 'tool'
-        result = (JSON.parse(m.content.to_s) rescue m.content)
-        [{ kind: 'tool_result', id: m.tool_call_id, name: m.name, result: result }]
-      else
-        [] # 'system' is hidden from UI
-      end
-    end
-    send_msg(session.ws, 'agent', 'loaded', {
-      conversation_id: conv,
-      agent:           convo.agent.slug,
-      title:           convo.title,
-      visibility:      convo.visibility,
-      owner_user_id:   convo.user_id,
-      owner_is_self:   (convo.user_id == session.user_id),
-      messages:        items,
-    })
-
-  when 'set_visibility'
-    conv = payload['conversation_id'].to_s
-    vis  = payload['visibility'].to_s
-    unless AgentConversation::VISIBILITIES.include?(vis)
-      send_msg(session.ws, 'system', 'error',
-               { message: "agent/set_visibility: visibility must be one of #{AgentConversation::VISIBILITIES.inspect}" })
-      return
-    end
-    convo = AgentConversation.find_by(uuid: conv)
-    unless convo && convo.project_id == session.project_id
-      send_msg(session.ws, 'system', 'error',
-               { message: "agent/set_visibility: conversation not found in this project" })
-      return
-    end
-    unless convo.user_id == session.user_id
-      send_msg(session.ws, 'system', 'error',
-               { message: "agent/set_visibility: only the owner can change visibility" })
-      return
-    end
-    convo.update!(visibility: vis)
-    # Tell every project client to refresh their dropdown (someone may
-    # gain or lose visibility of this conversation).
-    clients = (SESSIONS_BY_PROJECT[session.project_id] || []).map(&:ws)
-    broadcast(clients, 'agent', 'visibility_changed', {
-      conversation_id: conv,
-      visibility:      vis,
-      owner_user_id:   convo.user_id,
-    })
-
-  when 'ask'
-    slug = payload['agent_slug'].to_s
-    msg  = payload['message'].to_s
-    conv = payload['conversation_id'].to_s
-    conv = SecureRandom.uuid if conv.empty?
-
-    if msg.empty?
-      send_msg(session.ws, 'system', 'error', { message: 'agent/ask: message is required' })
-      return
-    end
-
-    agent = Agent.enabled.find_by(slug: slug)
-    unless agent
-      send_msg(session.ws, 'system', 'error', { message: "agent/ask: no enabled agent with slug=#{slug}" })
-      return
-    end
-
-    # If resuming an existing conversation, only the owner (or anyone, if
-    # it's project-visible) may post into it. We default to "anyone in the
-    # project may post into a shared conversation" \u2014 multi-user agent
-    # collaboration is a stated goal.
-    if (existing = AgentConversation.find_by(uuid: conv))
-      unless existing.project_id == session.project_id && existing.visible_to?(session.user_id)
-        send_msg(session.ws, 'system', 'error',
-                 { message: 'agent/ask: not allowed to post into this conversation' })
-        return
-      end
-    end
-
-    sess = AgentSession.find(conv) ||
-           AgentSession.start(session: session, agent: agent,
-                              project_id: session.project_id,
-                              conversation_id: conv)
-    # Ack immediately so the UI can show the conversation id.
-    send_msg(session.ws, 'agent', 'started',
-             { conversation_id: conv, agent: agent.slug })
-
-    EM.defer { sess.ask(msg) }
-
-  else
-    send_msg(session.ws, 'system', 'error', { message: "unknown agent cmd: #{cmd}" })
-  end
 end
 
 # ---------------------------------------------------------------------------
