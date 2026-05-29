@@ -33,6 +33,7 @@ require_relative '../app/models/project_setting'
 require_relative '../app/models/fs_document'
 require_relative '../app/models/directory_entry'
 require_relative '../app/models/file_change'
+require_relative '../app/models/agent'
 require_relative '../app/services/fs_loader'
 
 puts "[ar_boot] connected to Postgres at #{ENV.fetch('POSTGRES_HOST', '?')}:#{ENV.fetch('POSTGRES_PORT', '?')}"

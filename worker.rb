@@ -9,6 +9,7 @@ require 'json'
 require 'jwt'
 require 'open3'
 require 'pty'
+require 'securerandom'
 require 'io/console'
 require 'uri'
 require_relative 'terminal_instance'
@@ -21,6 +22,8 @@ require_relative 'ar_boot'
 require_relative 'fs_store'
 require_relative 'vfs_flusher'
 require_relative 'vfs_watcher'
+require_relative 'agent_tools'
+require_relative 'agent_session'
 require 'set'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
@@ -92,6 +95,8 @@ def route(session, msg_str)
     handle_chat(session, cmd, payload)
   when 'fs'
     handle_fs(session, cmd, payload)
+  when 'agent'
+    handle_agent(session, cmd, payload)
   else
     send_msg(session.ws, 'system', 'error', { message: "unknown commandSet: #{cs}" })
   end
@@ -320,6 +325,62 @@ def create_terminal(terminal_id, project_id:, cols: 80, rows: 24)
   TERMINALS[terminal_id] = term
   broadcast_terminals_to_project(project_id)
   terminal_id
+end
+
+# ---------------------------------------------------------------------------
+# Agent — LLM tool-call loop. Per-conversation state lives in AgentSession.
+# Commands:
+#   agent/list           -> agent/list  { agents: [{slug, name, role, ...}] }
+#   agent/ask  { agent_slug, conversation_id?, message } ->
+#     emits agent/tool_call, agent/tool_result, agent/stream*, agent/done
+# Heavy-lifting (HTTP to model server) runs in EM.defer so the reactor stays
+# free for other clients.
+# ---------------------------------------------------------------------------
+def handle_agent(session, cmd, payload)
+  case cmd
+  when 'list'
+    agents = Agent.enabled.order(:role, :name).map do |a|
+      {
+        slug:        a.slug,
+        name:        a.name,
+        description: a.description,
+        role:        a.role,
+        model:       a.model,
+        tools:       a.allowed_tool_slugs,
+      }
+    end
+    send_msg(session.ws, 'agent', 'list', { agents: agents })
+
+  when 'ask'
+    slug = payload['agent_slug'].to_s
+    msg  = payload['message'].to_s
+    conv = payload['conversation_id'].to_s
+    conv = SecureRandom.uuid if conv.empty?
+
+    if msg.empty?
+      send_msg(session.ws, 'system', 'error', { message: 'agent/ask: message is required' })
+      return
+    end
+
+    agent = Agent.enabled.find_by(slug: slug)
+    unless agent
+      send_msg(session.ws, 'system', 'error', { message: "agent/ask: no enabled agent with slug=#{slug}" })
+      return
+    end
+
+    sess = AgentSession.find(conv) ||
+           AgentSession.start(session: session, agent: agent,
+                              project_id: session.project_id,
+                              conversation_id: conv)
+    # Ack immediately so the UI can show the conversation id.
+    send_msg(session.ws, 'agent', 'started',
+             { conversation_id: conv, agent: agent.slug })
+
+    EM.defer { sess.ask(msg) }
+
+  else
+    send_msg(session.ws, 'system', 'error', { message: "unknown agent cmd: #{cmd}" })
+  end
 end
 
 # ---------------------------------------------------------------------------
