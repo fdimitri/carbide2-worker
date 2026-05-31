@@ -5,14 +5,19 @@
 # and broadcast the operation to other connected clients in the same project.
 #
 # Supported commands (cs: 'fs'):
-#   tree        — return full file tree for the session's project
-#   read        — return current content for a single file
-#   write       — append one or more change operations to a file
-#   set_contents— replace file content entirely (setContents)
-#   create_file — create a new file entry
-#   create_dir  — create a directory (mkdir -p)
-#   rename      — rename a file entry
-#   delete      — delete an entry (and children)
+#   tree         — return full file tree for the session's project
+#   read         — return current content for a single file (text only)
+#   read_binary  — return base64 chunk of a binary file's on-disk bytes
+#   stat         — return stat-style metadata for a single entry (#5)
+#   write        — append one or more change operations to a file
+#   set_contents — replace file content entirely (setContents)
+#   create_file  — create a new file entry
+#   create_dir   — create a directory (mkdir -p)
+#   rename       — rename a file entry
+#   delete       — delete an entry (and children) from DB and disk (#12)
+
+require 'base64'
+require 'fileutils'
 
 module FsStore
   # Entry point — called by worker route() for cs == 'fs'
@@ -22,6 +27,10 @@ module FsStore
       handle_tree(session, send_fn)
     when 'read'
       handle_read(session, payload, send_fn)
+    when 'read_binary'
+      handle_read_binary(session, payload, send_fn)
+    when 'stat'
+      handle_stat(session, payload, send_fn)
     when 'open'
       handle_open(session, payload, send_fn)
     when 'close'
@@ -63,12 +72,58 @@ module FsStore
     path  = payload['path'].to_s.strip
     entry = find_entry!(session.project_id, path)
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if entry.binary?
 
     content = entry.calc_current
     send_fn.call(session.ws, 'fs', 'content', {
       path:    entry.srcpath,
       content: content
     })
+  end
+
+  # read_binary — stream a chunk of a binary file from disk.
+  # Payload: { path:, offset: 0, length: 65536 }
+  # Reply:   { path:, offset:, length: (actual), size: (total), eof: bool, data: base64 }
+  def self.handle_read_binary(session, payload, send_fn)
+    path  = payload['path'].to_s.strip
+    entry = find_entry!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
+
+    flusher   = VFS_FLUSHERS[session.project_id]
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'no disk root configured' }) unless flusher
+    disk_path = File.join(flusher.root_path, entry.srcpath)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'not present on disk' }) unless File.file?(disk_path)
+
+    offset = [payload['offset'].to_i, 0].max
+    # Cap a single chunk at 1 MB to keep WS frames sane. The client should
+    # loop until eof for whole-file reads (e.g. download).
+    length = payload['length'].to_i
+    length = 64 * 1024 if length <= 0
+    length = [length, 1024 * 1024].min
+
+    total = File.size(disk_path)
+    bytes = ''
+    if offset < total
+      File.open(disk_path, 'rb') do |f|
+        f.seek(offset)
+        bytes = f.read(length).to_s
+      end
+    end
+    send_fn.call(session.ws, 'fs', 'binary_chunk', {
+      path:   entry.srcpath,
+      offset: offset,
+      length: bytes.bytesize,
+      size:   total,
+      eof:    offset + bytes.bytesize >= total,
+      data:   Base64.strict_encode64(bytes)
+    })
+  end
+
+  # stat — metadata snapshot for the explorer Properties panel (#5).
+  def self.handle_stat(session, payload, send_fn)
+    path  = payload['path'].to_s.strip
+    entry = find_entry!(session.project_id, path)
+    send_fn.call(session.ws, 'fs', 'stat', entry.stat_hash)
   end
 
   # open — register this session as viewing a file; receive its peer viewer list
@@ -257,11 +312,36 @@ module FsStore
   def self.handle_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path  = payload['path'].to_s.strip
     entry = find_entry!(session.project_id, path)
+    entry_path = entry.srcpath
+
+    # Collect every descendant srcpath FIRST, then destroy the DB row. After
+    # destroy ActiveRecord's dependent: :destroy has already cascaded, so we
+    # need the list in advance. Mark each abs path in the suppress-set so the
+    # VfsWatcher doesn't try to handle the resulting :delete inotify event as
+    # an external mutation. Fixes #12 in May30-Questions.md.
+    flusher  = VFS_FLUSHERS[session.project_id]
+    root     = flusher&.root_path
+    abs_path = root ? File.join(root, entry_path) : nil
+
     entry.destroy!
 
-    send_fn.call(session.ws, 'fs', 'deleted', { path: path })
+    if root && abs_path
+      flusher.suppress_set&.add(abs_path)
+      begin
+        FileUtils.rm_rf(abs_path)
+      rescue => e
+        puts "[FsStore] disk delete failed for #{abs_path}: #{e.class}: #{e.message}"
+      ensure
+        EM.add_timer(1) { flusher.suppress_set&.delete(abs_path) }
+      end
+    end
+
+    send_fn.call(session.ws, 'fs', 'deleted', { path: entry_path })
     peers = other_project_sessions(session, sessions_by_project)
-    broadcast_fn.call(peers, 'fs', 'deleted', { path: path, user_id: session.user_id })
+    broadcast_fn.call(peers, 'fs', 'deleted', { path: entry_path, user_id: session.user_id })
+    DebugStream.emit(:fs, level: :info,
+      message: "deleted #{entry_path}", project_id: session.project_id,
+      meta: { path: entry_path, user_id: session.user_id, source: 'ws' }) if defined?(DebugStream)
   end
 
   # -------------------------------------------------------------------------

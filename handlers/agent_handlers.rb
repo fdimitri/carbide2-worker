@@ -132,13 +132,19 @@ module AgentHandlers
   register 'set_visibility', :set_visibility
 
   def self.ask(session, payload)
-    slug = payload['agent_slug'].to_s
-    msg  = payload['message'].to_s
-    conv = payload['conversation_id'].to_s
+    slug   = payload['agent_slug'].to_s
+    msg    = payload['message'].to_s
+    conv   = payload['conversation_id'].to_s
+    # images: optional array of {mime, base64}. We assume the model supports
+    # vision; if it doesn't, the provider returns an error that surfaces via
+    # the existing agent/error path. Persistence-on-reload is intentionally
+    # out of scope for v1 (base64 payloads are big and the AgentMessage
+    # schema is text-only; a future migration can add an attachments table).
+    images = payload['images'].is_a?(Array) ? payload['images'] : nil
     conv = SecureRandom.uuid if conv.empty?
 
-    if msg.empty?
-      Command.error(session, 'agent/ask: message is required')
+    if msg.empty? && (images.nil? || images.empty?)
+      Command.error(session, 'agent/ask: message or images required')
       return
     end
 
@@ -166,7 +172,7 @@ module AgentHandlers
     Command.reply(session, 'agent', 'started',
                   { conversation_id: conv, agent: agent.slug })
 
-    EM.defer { sess.ask(msg) }
+    EM.defer { sess.ask(msg, images: images) }
   end
   register 'ask', :ask
 end

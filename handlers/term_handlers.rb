@@ -159,4 +159,59 @@ module TermHandlers
     end
   end
   register 'destroy', :destroy
+
+  # ─── Recording ──────────────────────────────────────────────────────────
+  # Start recording PTY output to an asciinema cast file. Idempotent: a
+  # second record_start on an already-recording terminal is a no-op (replies
+  # with the existing recording_id). Replies 'recording_started' to the
+  # caller and rebroadcasts the terminal list so other clients see the
+  # red-dot badge.
+
+  def self.record_start(session, payload)
+    tid  = payload['terminal_id'].to_i
+    term = TERMINALS[tid]
+    unless term && term.project_id == session.project_id
+      Command.error(session, "terminal #{tid} not found or access denied")
+      return
+    end
+    rec_id = term.recording? ? term.instance_variable_get(:@recording_id)
+                             : term.start_recording!(user_id: session.user_id)
+    if rec_id
+      Command.reply(session, 'term', 'recording_started',
+                    { terminal_id: tid, recording_id: rec_id })
+      broadcast_terminals_to_project(session.project_id)
+    else
+      Command.error(session, "failed to start recording for terminal #{tid}")
+    end
+  end
+  register 'record_start', :record_start
+
+  def self.record_stop(session, payload)
+    tid  = payload['terminal_id'].to_i
+    term = TERMINALS[tid]
+    unless term && term.project_id == session.project_id
+      Command.error(session, "terminal #{tid} not found or access denied")
+      return
+    end
+    rec_id = term.stop_recording!
+    if rec_id
+      Command.reply(session, 'term', 'recording_stopped',
+                    { terminal_id: tid, recording_id: rec_id })
+      broadcast_terminals_to_project(session.project_id)
+    else
+      Command.reply(session, 'term', 'recording_stopped',
+                    { terminal_id: tid, recording_id: nil, reason: 'not recording' })
+    end
+  end
+  register 'record_stop', :record_stop
+
+  # List all recordings for the current project (most recent first). The
+  # HTTP blob download lives in the Rails app (RecordingsController) — this
+  # WS reply is just the index so the client can populate a Recordings pane
+  # without a separate REST round-trip.
+  def self.list_recordings(session, _payload)
+    rows = TerminalRecording.for_project(session.project_id).limit(200).map(&:to_list_entry)
+    Command.reply(session, 'term', 'recordings', { recordings: rows })
+  end
+  register 'list_recordings', :list_recordings
 end

@@ -126,6 +126,15 @@ class ProjectPod
       spec: {
         restartPolicy: 'Never',
         terminationGracePeriodSeconds: 5,
+        # Run the shell pod as the non-root `carbide` user baked into
+        # Dockerfile.shell. fsGroup ensures the PVC subPath ends up
+        # writable by gid 1000 on first provision (k8s chowns the volume
+        # at mount time when fsGroup is set).
+        securityContext: {
+          runAsUser:  1000,
+          runAsGroup: 1000,
+          fsGroup:    1000,
+        },
         containers: [{
           name: 'shell',
           image: SHELL_IMAGE,

@@ -88,18 +88,31 @@ class AgentSession
 
   # Send a user message into the loop. Runs until the model returns a plain
   # assistant reply (no tool calls) or MAX_TURNS is exceeded.
-  def ask(user_text)
-    push_history!(role: 'user', content: user_text.to_s)
+  #
+  # images: optional array of { 'mime' => 'image/png', 'base64' => '...' }.
+  # When present, the user message is sent to the model as the OpenAI
+  # multimodal content-array shape (text part + one image_url part per image
+  # encoded as a data: URL). Per #4 in May30-Questions, we assume the model
+  # supports vision; non-vision models will return an HTTP error that the
+  # caller surfaces via agent/error.
+  def ask(user_text, images: nil)
+    push_history!(role: 'user', content: user_text.to_s, images: images)
+    DebugStream.emit(:agent, level: :info,
+      message: "ask: #{user_text.to_s[0, 80]}", project_id: @project_id,
+      meta: { conversation: @conversation_id[0, 8], chars: user_text.to_s.length,
+              images: images&.size.to_i, agent: @agent.name }) if defined?(DebugStream)
     # Auto-title from first user message so the recent-conversations
     # dropdown shows something useful. Owner can rename later.
     if @convo.title.blank?
       t = user_text.to_s.strip.gsub(/\s+/, ' ')[0, 80]
+      t = '(image)' if t.empty? && images && !images.empty?
       @convo.update_column(:title, t) unless t.empty?
     end
     MAX_TURNS.times do |turn|
       response = post_chat_completion
       msg      = response.dig('choices', 0, 'message') || {}
       content  = msg['content']
+      reasoning = msg['reasoning_content']
       calls    = msg['tool_calls'] || []
       finish   = response.dig('choices', 0, 'finish_reason')
 
@@ -113,7 +126,24 @@ class AgentSession
       push_history!(role: 'assistant', content: content, tool_calls: calls)
 
       if calls.empty?
-        emit('done', { content: content.to_s, turn: turn })
+        # Pass finish_reason and reasoning_content through so the client can
+        # distinguish "model genuinely had nothing to say" (stop, empty
+        # content) from "model was cut off mid-output by the context window"
+        # (length). Reasoning content is what some models (Qwen3, DeepSeek-R1)
+        # emit in `reasoning_content` — strip nil so older endpoints that
+        # don't return the field don't get noise.
+        emit('done', {
+          content:       content.to_s,
+          turn:          turn,
+          finish_reason: finish,
+          reasoning:     reasoning,
+        }.compact)
+        DebugStream.emit(:agent, level: finish == 'length' ? :warn : :info,
+          message: "done turn=#{turn} finish=#{finish} chars=#{content.to_s.length}",
+          project_id: @project_id,
+          meta: { conversation: @conversation_id[0, 8], turn: turn,
+                  finish_reason: finish, chars: content.to_s.length,
+                  reasoning_chars: reasoning.to_s.length }) if defined?(DebugStream)
         return content.to_s
       end
 
@@ -125,6 +155,9 @@ class AgentSession
     nil
   rescue => e
     emit('error', { message: "#{e.class}: #{e.message}" })
+    DebugStream.emit(:agent, level: :error,
+      message: "error: #{e.class}: #{e.message}", project_id: @project_id,
+      meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
     nil
   end
 
@@ -227,7 +260,13 @@ class AgentSession
   # Append a message to both the in-memory @history and the persistent
   # AgentConversation. tool_calls is the assistant turn's tool_calls array
   # (or nil/[]); we store [] as nil to keep the column clean.
-  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil)
+  #
+  # images (user turns only): when provided, the @history entry uses the
+  # OpenAI multimodal content-array shape. The persisted AgentMessage row
+  # still stores plain text only — base64 payloads are too big for the
+  # current text column, and conversation replay therefore loses image
+  # context. Acceptable for v1.
+  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil, images: nil)
     entry =
       case role
       when 'tool'
@@ -236,6 +275,25 @@ class AgentSession
         h = { role: 'assistant', content: content }
         h[:tool_calls] = tool_calls if tool_calls && !tool_calls.empty?
         h.compact
+      when 'user'
+        if images && !images.empty?
+          parts = []
+          text = content.to_s
+          parts << { type: 'text', text: text } unless text.empty?
+          images.each do |img|
+            mime = (img['mime']   || img[:mime]   || 'image/png').to_s
+            b64  = (img['base64'] || img[:base64]).to_s
+            next if b64.empty?
+            parts << { type: 'image_url',
+                       image_url: { url: "data:#{mime};base64,#{b64}" } }
+          end
+          # Some providers (e.g. older llama.cpp builds) choke on an empty
+          # text part; ensure at least an empty-string text element exists.
+          parts.unshift({ type: 'text', text: '' }) unless parts.any? { |p| p[:type] == 'text' }
+          { role: 'user', content: parts }
+        else
+          { role: 'user', content: content.to_s }
+        end
       else
         { role: role, content: content.to_s }
       end

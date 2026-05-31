@@ -37,6 +37,8 @@ class TerminalInstance
     @agent_release_timer = nil  # EM timer object for auto-release
     @prompt_marker_installed = false
     @state_change_cb     = nil  # set by worker for badge updates
+    @recorder            = nil  # TerminalRecorder when recording
+    @recording_id        = nil  # DB id of the active TerminalRecording row
     begin
       spawn_cmd = build_spawn_cmd(cmd, cwd)
       @master, @slave, @pid = PTY.spawn(spawn_cmd)
@@ -76,11 +78,18 @@ class TerminalInstance
               puts "[PTY:#{@terminal_id}] agent tap raised: #{e.class} #{e.message}"
             end
           end
+          # Tee to the recorder (if any). Same isolation — a recorder write
+          # failure must not take down the reader. Byte count gets flushed
+          # back to the DB row on stop.
+          @recorder&.write_output(data)
         end
       end
     rescue EOFError, Errno::EIO => e
       puts "[PTY:#{@terminal_id}] reader EOF: #{e.class}"
       EM.next_tick do
+        # Close the recording file (if any) before broadcasting exit so the
+        # cast on disk reflects the full session.
+        stop_recording!(status: 'stopped') if recording?
         dead = broadcast(@clients.values, 'term', 'exit', { terminal_id: @terminal_id, code: 0 })
         dead.each { |ws| @clients.delete(ws.object_id) }
         # Wake any agent currently blocked on this terminal so the tool call
@@ -259,7 +268,79 @@ class TerminalInstance
       agent_accessible: @agent_accessible,
       agent_busy:       @agent_busy,
       agent_busy_until_ms: @agent_busy_until_ms,
+      recording:        recording?,
+      recording_id:     @recording_id,
     }
+  end
+
+  # ─── Recording ────────────────────────────────────────────────
+
+  def recording?
+    !@recorder.nil? && !@recorder.closed?
+  end
+
+  # Start a recording. Creates the DB index row + opens the asciinema cast
+  # file, then attaches the recorder to the PTY reader (subsequent output
+  # is teed to disk). Returns the recording_id, or nil if already recording.
+  def start_recording!(user_id: nil)
+    return nil if recording?
+    rec_row = TerminalRecording.create!(
+      project_id:    @project_id,
+      created_by_id: user_id,
+      terminal_id:   @terminal_id,
+      terminal_name: @name,
+      cols:          @cols,
+      rows:          @rows,
+      started_at:    Time.current,
+      status:        'recording',
+      file_path:     File.join(@project_id.to_s, "placeholder")  # rewritten below
+    )
+    rel_path = File.join(@project_id.to_s, "#{rec_row.id}.cast")
+    rec_row.update!(file_path: rel_path)
+
+    @recorder = TerminalRecorder.new(
+      recording_id:   rec_row.id,
+      abs_file_path:  rec_row.absolute_file_path,
+      cols:           @cols,
+      rows:           @rows,
+      title:          @name
+    ).open!
+    @recording_id = rec_row.id
+
+    # Seed the recording with current scrollback so playback starts at the
+    # state the user sees — otherwise the file would begin blank even if the
+    # shell has been printing for an hour.
+    @recorder.write_output(@scrollback) unless @scrollback.empty?
+
+    fire_state_change
+    puts "[PTY:#{@terminal_id}] recording started -> #{rec_row.file_path}"
+    rec_row.id
+  rescue => e
+    puts "[PTY:#{@terminal_id}] start_recording! failed: #{e.class}: #{e.message}"
+    @recorder&.close! rescue nil
+    @recorder     = nil
+    @recording_id = nil
+    nil
+  end
+
+  # Stop the active recording, close the file, mark the DB row stopped.
+  # Returns the recording_id (so callers can broadcast it), or nil if no
+  # recording was active.
+  def stop_recording!(status: 'stopped')
+    return nil unless recording?
+    rec_id = @recording_id
+    bytes  = @recorder.byte_count
+    @recorder.close!
+    @recorder     = nil
+    @recording_id = nil
+    rec = TerminalRecording.find_by(id: rec_id)
+    rec&.update!(ended_at: Time.current, byte_count: bytes, status: status)
+    fire_state_change
+    puts "[PTY:#{@terminal_id}] recording stopped (#{bytes}B)"
+    rec_id
+  rescue => e
+    puts "[PTY:#{@terminal_id}] stop_recording! failed: #{e.class}: #{e.message}"
+    nil
   end
 
   def rename(new_name)
@@ -272,6 +353,7 @@ class TerminalInstance
   # Force-kill the underlying process and close the PTY. Safe to call multiple
   # times; the reader thread's EOF path will broadcast 'term' 'exit'.
   def destroy!
+    stop_recording!(status: 'stopped') if recording?
     begin
       Process.kill('TERM', @pid) if @pid
       sleep 0.05

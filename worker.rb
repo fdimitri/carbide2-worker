@@ -13,6 +13,7 @@ require 'securerandom'
 require 'io/console'
 require 'uri'
 require_relative 'terminal_instance'
+require_relative 'terminal_recorder'
 require_relative 'chat_room'
 require_relative 'open_document'
 require_relative 'project_container'
@@ -25,6 +26,7 @@ require_relative 'vfs_watcher'
 require_relative 'agent_tools'
 require_relative 'agent_session'
 require_relative 'command'
+require_relative 'debug_stream'
 require_relative 'handlers/term_handlers'
 require_relative 'handlers/chat_handlers'
 require_relative 'handlers/fs_handlers'
@@ -87,11 +89,31 @@ VFS_WATCHERS        = {}        # project_id => VfsWatcher
 # ---------------------------------------------------------------------------
 # Message router
 # ---------------------------------------------------------------------------
+# Tiny handler module for the 'debug' commandSet — just (un)subscribes the
+# caller to the DebugStream pub/sub. Events are pushed via DebugStream.emit
+# from anywhere in the worker; see worker/debug_stream.rb.
+module DebugHandlers
+  def self.dispatch(cmd, session, payload)
+    case cmd
+    when 'subscribe'
+      scope = payload['scope'] == 'all' ? :all : nil
+      DebugStream.subscribe(session, scope: scope)
+      send_msg(session.ws, 'debug', 'subscribed', { scope: (scope || session.project_id).to_s })
+    when 'unsubscribe'
+      DebugStream.unsubscribe(session)
+      send_msg(session.ws, 'debug', 'unsubscribed', {})
+    else
+      send_msg(session.ws, 'system', 'error', { message: "unknown debug cmd: #{cmd}" })
+    end
+  end
+end
+
 ROUTES = {
   'term'  => TermHandlers,
   'chat'  => ChatHandlers,
   'fs'    => FsHandlers,
   'agent' => AgentHandlers,
+  'debug' => DebugHandlers,
 }.freeze
 
 def route(session, msg_str)
@@ -295,7 +317,10 @@ EM.run do
     ws.onclose do
       if session
         puts "Client disconnected: user=#{session.user_id}"
-        
+
+        # Drop any debug-stream subscription this session held
+        DebugStream.unsubscribe(session)
+
         # Remove session from project tracking
         if SESSIONS_BY_PROJECT[session.project_id]
           SESSIONS_BY_PROJECT[session.project_id].delete(session)

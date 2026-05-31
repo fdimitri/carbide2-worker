@@ -15,12 +15,15 @@
 # The worker timer fires every POLL_INTERVAL seconds (0.1 s); the flusher
 # internally decides whether enough time has elapsed for a full sweep.
 require 'fileutils'
+require 'etc'
 
 class VfsFlusher
   POLL_INTERVAL          = 0.1   # seconds — EM timer granularity (fixed)
   DEFAULT_INTERVAL_S     = Float(ENV.fetch('CARBIDE_FLUSH_INTERVAL', '0.8'))
   DEFAULT_BYTE_THRESHOLD = Integer(ENV.fetch('CARBIDE_FLUSH_BYTES',  '20'))
   SETTINGS_CACHE_TTL     = 5.0   # seconds between DB re-reads
+
+  attr_reader :root_path, :project_id, :suppress_set
 
   def initialize(project_id:, root_path:, suppress_set: nil)
     @project_id      = project_id
@@ -52,7 +55,7 @@ class VfsFlusher
 
     rows = DirectoryEntry
       .joins(:file_changes)
-      .where(project_id: @project_id, ftype: 'file')
+      .where(project_id: @project_id, ftype: 'file', binary: false)
       .group('directory_entries.id')
       .select('directory_entries.id, directory_entries.srcpath, MAX(file_changes.revision) AS max_rev')
 
@@ -84,6 +87,7 @@ class VfsFlusher
   def flush_entry_by_id!(entry_id)
     entry = DirectoryEntry.find_by(id: entry_id, project_id: @project_id, ftype: 'file')
     return unless entry
+    return if entry.binary?   # binary entries hold no text content to flush
     max_rev = FileChange.where(directory_entry_id: entry_id).maximum(:revision).to_i
     return if @last_rev[entry_id] == max_rev
     flush_single(entry, max_rev)
@@ -98,15 +102,45 @@ class VfsFlusher
     begin
       FileUtils.mkdir_p(File.dirname(abs_path))
       File.write(abs_path, content)
+      apply_posix!(entry, abs_path)
+      entry.update_columns(last_size: content.bytesize, mtime: Time.current, updated_at: Time.current)
       @last_rev[entry.id]        = max_rev
       @unflushed_bytes[entry.id] = 0
       puts "[VfsFlusher:#{@project_id}] flushed #{entry.srcpath}"
+      DebugStream.emit(:flusher, level: :info,
+        message: "flushed #{entry.srcpath}", project_id: @project_id,
+        meta: { path: entry.srcpath, bytes: content.bytesize, rev: max_rev }) if defined?(DebugStream)
       true
     rescue => e
       puts "[VfsFlusher:#{@project_id}] write error #{abs_path}: #{e.message}"
+      DebugStream.emit(:flusher, level: :error,
+        message: "write error #{entry.srcpath}: #{e.message}", project_id: @project_id,
+        meta: { path: entry.srcpath, error: e.class.to_s }) if defined?(DebugStream)
       false
     ensure
       EM.add_timer(1) { @suppress_set&.delete(abs_path) }
+    end
+  end
+
+  # Best-effort POSIX metadata application. chown almost always fails when
+  # the worker isn't root (single-user dev container is usually fine; multi-
+  # tenant prod will need a privileged side-process). We swallow EPERM so a
+  # missing chown doesn't break the flush of file contents.
+  def apply_posix!(entry, abs_path)
+    if entry.posix_mode
+      File.chmod(entry.posix_mode & 0o7777, abs_path) rescue nil
+    end
+    if entry.posix_owner || entry.posix_group
+      begin
+        uid = entry.posix_owner ? (Etc.getpwnam(entry.posix_owner).uid rescue Integer(entry.posix_owner, 10) rescue nil) : nil
+        gid = entry.posix_group ? (Etc.getgrnam(entry.posix_group).gid rescue Integer(entry.posix_group, 10) rescue nil) : nil
+        File.chown(uid, gid, abs_path) if uid || gid
+      rescue Errno::EPERM
+        # Worker not running as root — silently skip; the file's mode is what
+        # matters most for builds/scripts and we did set it above.
+      rescue => e
+        puts "[VfsFlusher:#{@project_id}] chown skipped (#{e.class}): #{e.message}"
+      end
     end
   end
 end
