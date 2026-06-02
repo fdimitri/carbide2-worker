@@ -48,8 +48,38 @@ puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT} (fallback only — overridden by p
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Validate a worker JWT. Accepts two formats:
+#   1. New (carbide2-control-minted): iss=carbide-control, aud=workspace:<id>,
+#      project_id, user_id, scope=workspace:rw. Audience + iss + project_id
+#      enforced when ENV['WORKSPACE_PROJECT_ID'] is set.
+#   2. Legacy (server-minted by WorkerTokenIssuer): no iss/aud, claims
+#      named project/user/name. Accepted for backward compat during the
+#      control-plane rollout; remove once everything mints via the new path.
+#
+# See JWT_CLAIMS.md for the wire format.
 def validate_token(token)
   payload, _ = JWT.decode(token, WORKER_SECRET, true, { algorithm: ALGORITHM })
+
+  expected_project = ENV['WORKSPACE_PROJECT_ID']&.to_i
+
+  if payload['iss'] == 'carbide-control'
+    # --- new format ---
+    if expected_project && expected_project > 0
+      if payload['aud'] != "workspace:#{expected_project}"
+        puts "[validate_token] aud mismatch: got #{payload['aud'].inspect}, want workspace:#{expected_project}"
+        return nil
+      end
+      if payload['project_id'].to_i != expected_project
+        puts "[validate_token] project_id mismatch: got #{payload['project_id'].inspect}, want #{expected_project}"
+        return nil
+      end
+    end
+    unless %w[workspace:rw].include?(payload['scope'])
+      puts "[validate_token] unsupported scope: #{payload['scope'].inspect}"
+      return nil
+    end
+  end
+
   payload
 rescue JWT::DecodeError => e
   puts "Invalid token: #{e}"

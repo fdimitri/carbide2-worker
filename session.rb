@@ -4,9 +4,11 @@ class Session
 
   def initialize(ws, payload)
     @ws         = ws
-    @user_id    = payload['user']
-    @name       = payload['name'] || "user_#{@user_id}"
-    @project_id = payload['project']
+    # Accept both the new control-plane JWT format (user_id/project_id) and
+    # the legacy server-minted format (user/project). See JWT_CLAIMS.md.
+    @user_id    = payload['user_id']    || payload['user']
+    @name       = payload['user_email'] || payload['name'] || "user_#{@user_id}"
+    @project_id = payload['project_id'] || payload['project']
     @terminals  = []  # terminal_ids joined
     @rooms      = []  # room_ids joined
     @open_files = []  # normalized paths currently open
