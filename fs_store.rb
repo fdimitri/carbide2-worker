@@ -18,6 +18,7 @@
 
 require 'base64'
 require 'fileutils'
+require 'open3'
 
 module FsStore
   # Entry point — called by worker route() for cs == 'fs'
@@ -49,6 +50,8 @@ module FsStore
       handle_rename(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'delete'
       handle_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'import_git'
+      handle_import_git(session, payload, sessions_by_project, send_fn, broadcast_fn)
     else
       send_fn.call(session.ws, 'fs', 'error', { message: "unknown fs cmd: #{cmd}" })
     end
@@ -342,6 +345,119 @@ module FsStore
     DebugStream.emit(:fs, level: :info,
       message: "deleted #{entry_path}", project_id: session.project_id,
       meta: { path: entry_path, user_id: session.user_id, source: 'ws' }) if defined?(DebugStream)
+  end
+
+  # -------------------------------------------------------------------------
+  # Import a public git repo into this project's on-disk root, then walk the
+  # result into the DBFS.
+  #
+  # This lives in the worker (not Rails) on purpose: the worker already owns
+  # the project's on-disk root, the FsLoader, and the broadcast path, so it can
+  # clone, ingest, and notify connected clients all in-process. A git clone is
+  # a write-heavy burst that the inotify watcher cannot reliably keep up with
+  # (children get written before the new recursive watch is registered), so we
+  # do an authoritative FsLoader walk after the clone rather than trusting the
+  # live event stream, then broadcast a single tree refresh.
+  #
+  # The clone + walk is blocking, so it runs on EM's deferred thread pool; the
+  # completion callback runs back on the reactor thread where touching the
+  # WebSocket connections is safe.
+  def self.handle_import_git(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    git_url = payload['git_url'].to_s.strip
+    git_ref = payload['git_ref'].to_s.strip
+    git_ref = nil if git_ref.empty?
+
+    if git_url.empty? || !git_url.match?(/\A(https?:\/\/|git@)[^\s]+\z/)
+      return send_fn.call(session.ws, 'fs', 'error',
+                          { message: 'git_url must be an http(s):// or git@ URL' })
+    end
+    unless DirectoryEntry.project_empty?(session.project_id)
+      return send_fn.call(session.ws, 'fs', 'error',
+                          { message: 'project is not empty; refusing to import' })
+    end
+
+    root = VFS_FLUSHERS[session.project_id]&.root_path ||
+           Project.find(session.project_id).project_setting&.root_path
+    unless root
+      return send_fn.call(session.ws, 'fs', 'error',
+                          { message: 'no root_path configured for project' })
+    end
+
+    project_id = session.project_id
+    user_id    = session.user_id
+    send_fn.call(session.ws, 'fs', 'import_started', { git_url: git_url, git_ref: git_ref })
+    puts "[FsStore] import_git project=#{project_id} url=#{git_url} ref=#{git_ref || '(default)'} -> #{root}"
+
+    EM.defer(
+      proc do
+        ActiveRecord::Base.connection_pool.with_connection do
+          do_import_git(project_id, user_id, root, git_url, git_ref)
+        end
+      end,
+      proc do |result|
+        if result[:ok]
+          all = (sessions_by_project[project_id] || []).map(&:ws)
+          broadcast_fn.call(all, 'fs', 'created', { path: '/', reason: 'import_git' })
+          send_fn.call(session.ws, 'fs', 'import_done', { stats: result[:stats] })
+          puts "[FsStore] import_git project=#{project_id} done: #{result[:stats].inspect}"
+        else
+          send_fn.call(session.ws, 'fs', 'error', { message: result[:error] })
+          puts "[FsStore] import_git project=#{project_id} failed: #{result[:error]}"
+        end
+      end
+    )
+  end
+
+  # Blocking worker for handle_import_git. Runs on a deferred thread with its
+  # own AR connection checked out. Returns a result hash.
+  def self.do_import_git(project_id, user_id, root, git_url, git_ref)
+    FileUtils.mkdir_p(root)
+    unless Dir.empty?(root)
+      return { ok: false, error: 'project root is not empty on disk' }
+    end
+
+    out, ok = clone_repo(git_url, git_ref, root)
+    unless ok
+      # Wipe the partial clone so the user can retry from a clean slate.
+      FileUtils.rm_rf(Dir.glob(File.join(root, '*')) + Dir.glob(File.join(root, '.[!.]*')))
+      return { ok: false, error: "clone failed: #{out.to_s.lines.last&.strip || out}" }
+    end
+
+    stats = FsLoader.new(project_id: project_id, root_path: root,
+                         user_id: user_id, verbose: false).load!
+    { ok: true, stats: stats }
+  rescue => e
+    { ok: false, error: "#{e.class}: #{e.message}" }
+  end
+
+  # Run `git clone --depth 1` with a hard timeout, killing the child if it
+  # hangs. Returns [combined_output, success_bool].
+  def self.clone_repo(git_url, git_ref, root)
+    timeout = Integer(ENV.fetch('IMPORT_FROM_GIT_TIMEOUT_S', '1800'))
+    cmd = ['git', 'clone', '--depth', '1']
+    cmd += ['--branch', git_ref] if git_ref
+    cmd += ['--', git_url, root]
+
+    out_buf = +''
+    _stdin, stdout_err, wait_thr = Open3.popen2e(*cmd)
+    _stdin.close
+    reader = Thread.new { stdout_err.each_line { |line| out_buf << line } }
+
+    start = Time.now
+    while wait_thr.alive?
+      if Time.now - start > timeout
+        Process.kill('TERM', wait_thr.pid) rescue nil
+        sleep 2
+        Process.kill('KILL', wait_thr.pid) rescue nil
+        out_buf << "\n[clone_repo] timeout after #{timeout}s\n"
+        break
+      end
+      sleep 0.5
+    end
+    reader.join(5)
+    [out_buf, !!wait_thr.value&.success?]
+  ensure
+    stdout_err&.close
   end
 
   # -------------------------------------------------------------------------
