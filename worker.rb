@@ -31,6 +31,7 @@ require_relative 'handlers/term_handlers'
 require_relative 'handlers/chat_handlers'
 require_relative 'handlers/fs_handlers'
 require_relative 'handlers/agent_handlers'
+require_relative 'handlers/rtc_handlers'
 require 'set'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
@@ -143,6 +144,7 @@ ROUTES = {
   'chat'  => ChatHandlers,
   'fs'    => FsHandlers,
   'agent' => AgentHandlers,
+  'rtc'   => RtcHandlers,
   'debug' => DebugHandlers,
 }.freeze
 
