@@ -16,6 +16,9 @@ class ChatRoom
       broadcast_to_others(ws, 'user_join', { room_id: @room_id, channel_id: @channel_id, user_id: user_id, name: name })
     end
     send_msg(ws, 'chat', 'user_list', { room_id: @room_id, channel_id: @channel_id, users: user_list })
+    # Tell the (re)joining member whether a call is already in progress here so
+    # they can offer to join it instead of starting a fresh one.
+    send_call_state(ws)
   end
 
   def remove_client(ws)
@@ -78,6 +81,9 @@ class ChatRoom
     @call_clients[ws] = { peer_id: peer_id, user_id: info[:user_id], name: info[:name] }
     broadcast_call_to_others(ws, 'peer_join',
       { channel_id: @channel_id, peer_id: peer_id, user_id: info[:user_id], name: info[:name] })
+    # Presence: let every channel member (not just call members) know a call is
+    # live so non-participants can see it and join.
+    broadcast_call_state
     existing
   end
 
@@ -86,6 +92,7 @@ class ChatRoom
     return unless info
     broadcast_call_all('peer_leave',
       { channel_id: @channel_id, peer_id: info[:peer_id], user_id: info[:user_id], name: info[:name] })
+    broadcast_call_state
   end
 
   # Relay a signalling blob (offer/answer/ICE candidate) from one call member to
@@ -104,7 +111,24 @@ class ChatRoom
                  .values.map { |c| { peer_id: c[:peer_id], user_id: c[:user_id], name: c[:name] } }
   end
 
+  # Full roster of the live call (everyone, including the asker). Used for
+  # channel-wide call presence so non-participants can choose to join.
+  def call_roster
+    @call_clients.values.map { |c| { peer_id: c[:peer_id], user_id: c[:user_id], name: c[:name] } }
+  end
+
   private
+
+  def send_call_state(ws)
+    send_msg(ws, 'rtc', 'call_state',
+      { channel_id: @channel_id, participants: call_roster })
+  end
+
+  def broadcast_call_state
+    payload = { channel_id: @channel_id, participants: call_roster }
+    dead = broadcast(@clients.keys, 'rtc', 'call_state', payload)
+    dead.each { |ws| @clients.delete(ws) }
+  end
 
   def broadcast_call_all(cmd, payload)
     dead = broadcast(@call_clients.keys, 'rtc', cmd, payload)
