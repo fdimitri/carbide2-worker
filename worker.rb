@@ -139,13 +139,48 @@ module DebugHandlers
   end
 end
 
+# Connection liveness + in-band re-authentication for the client.
+#   - ping:   echoed straight back as pong so the client can measure round-trip
+#             latency and prove the socket is alive end-to-end (not just
+#             TCP-open). Stateless.
+#   - reauth: the client mints a fresh worker JWT over HTTP shortly before the
+#             current one expires and presents it here, so a long-lived session
+#             survives token rotation without ever dropping the socket. We
+#             re-validate the token (same rules as the handshake) and, on
+#             success, adopt its new expiry; on failure we tell the client and
+#             let the normal expiry sweep close the socket.
+module SystemHandlers
+  def self.dispatch(cmd, session, payload)
+    case cmd
+    when 'ping'
+      send_msg(session.ws, 'system', 'pong', { t: payload['t'] })
+    when 'reauth'
+      new_payload = validate_token(payload['token'])
+      # Pin identity: a refreshed token must belong to the same user/project as
+      # the one that opened the socket. Anything else is rejected outright.
+      same_identity = new_payload &&
+        (new_payload['user_id'] || new_payload['user']).to_s == session.user_id.to_s &&
+        (new_payload['project_id'] || new_payload['project']).to_s == session.project_id.to_s
+      if same_identity
+        session.reauth(new_payload)
+        send_msg(session.ws, 'system', 'reauth_ok', { exp: session.token_exp })
+      else
+        send_msg(session.ws, 'system', 'reauth_failed', { message: 'invalid or mismatched token' })
+      end
+    else
+      send_msg(session.ws, 'system', 'error', { message: "unknown system cmd: #{cmd}" })
+    end
+  end
+end
+
 ROUTES = {
-  'term'  => TermHandlers,
-  'chat'  => ChatHandlers,
-  'fs'    => FsHandlers,
-  'agent' => AgentHandlers,
-  'rtc'   => RtcHandlers,
-  'debug' => DebugHandlers,
+  'term'   => TermHandlers,
+  'chat'   => ChatHandlers,
+  'fs'     => FsHandlers,
+  'agent'  => AgentHandlers,
+  'rtc'    => RtcHandlers,
+  'debug'  => DebugHandlers,
+  'system' => SystemHandlers,
 }.freeze
 
 def route(session, msg_str)
@@ -306,6 +341,24 @@ EM.run do
     end
   end
 
+  # Token-expiry sweep. A socket may not outlive its credential: the client is
+  # expected to refresh in-band (system/reauth) before exp, but if it fails to,
+  # we close the connection once the token lapses beyond a short grace window.
+  # The grace absorbs clock skew and in-flight reauths. Closing triggers the
+  # client's normal reconnect (which mints a fresh token), so a transient miss
+  # self-heals; a truly expired upstream session ends up at the login screen.
+  TOKEN_EXP_GRACE_SECONDS = 30
+  EM.add_periodic_timer(15) do
+    SESSIONS_BY_PROJECT.each_value do |sessions|
+      sessions.dup.each do |s|
+        next unless s.token_expired?(TOKEN_EXP_GRACE_SECONDS)
+        puts "[token-sweep] closing expired session user=#{s.user_id} project=#{s.project_id}"
+        send_msg(s.ws, 'system', 'token_expired', {})
+        s.ws.close_connection_after_writing
+      end
+    end
+  end
+
   EM::WebSocket.start(host: host, port: port) do |ws|
     session = nil
 
@@ -323,7 +376,10 @@ EM.run do
         
         send_msg(ws, 'system', 'connected', {
           user_id:    session.user_id,
-          project_id: session.project_id
+          project_id: session.project_id,
+          # Token expiry (unix seconds) so the client can refresh in-band before
+          # it lapses. nil for legacy tokens with no exp claim.
+          token_exp:  session.token_exp
         })
         
         # Send initial terminal list
