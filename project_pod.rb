@@ -72,6 +72,18 @@ class ProjectPod
     status.success? ? out.strip : nil
   end
 
+  # The container's waiting reason, if any (e.g. ImagePullBackOff, ErrImagePull,
+  # InvalidImageName, ContainerCreating). Empty string when not waiting. Lets
+  # wait_ready! fail fast on an unrecoverable image problem instead of burning
+  # the full READY_TIMEOUT while the pod sits in Pending.
+  def container_waiting_reason
+    out, _err, status = Open3.capture3(
+      'kubectl', 'get', 'pod', '-n', NAMESPACE, @name,
+      '-o', 'jsonpath={.status.containerStatuses[0].state.waiting.reason}'
+    )
+    status.success? ? out.strip : ''
+  end
+
   # Pods in Failed/Succeeded can't be re-used; delete before recreating.
   def delete_if_terminal!
     phase = pod_phase
@@ -102,6 +114,15 @@ class ProjectPod
         return
       when 'Failed', 'Unknown', nil
         raise "pod #{@name} entered phase=#{phase || 'missing'} before ready"
+      end
+      # Fail fast on an unrecoverable image problem rather than blocking the
+      # caller for the full READY_TIMEOUT. With IfNotPresent + a local-only
+      # image that isn't on the node, kubelet falls back to docker.io and sits
+      # in ImagePullBackOff forever — there's nothing to wait for.
+      reason = container_waiting_reason
+      if %w[ImagePullBackOff ErrImagePull InvalidImageName ErrImageNeverPull].include?(reason)
+        raise "pod #{@name} cannot start: image #{SHELL_IMAGE} #{reason} " \
+              "(import it into the node: `k3d image import #{SHELL_IMAGE}`)"
       end
       if Time.now >= deadline
         raise "pod #{@name} not Ready after #{READY_TIMEOUT}s (phase=#{phase})"

@@ -12,61 +12,80 @@ module TermHandlers
   extend Command::Dispatcher
   namespace 'term'
 
+  # IDs reserved by an in-flight create whose terminal isn't in TERMINALS yet
+  # (the kube path starts the pod off the reactor before registering). Counted
+  # when picking the next id so two rapid creates can't collide during that gap.
+  # Only ever touched on the EM reactor thread, so no locking needed.
+  PENDING_TERMINAL_IDS = []
+
   def self.create(session, payload)
     # Create new terminal in current project — attach to (or start) the
     # project's persistent Docker container.
-    terminal_id    = (TERMINALS.keys.map(&:to_i).max || 0) + 1
+    terminal_id    = ((TERMINALS.keys.map(&:to_i) + PENDING_TERMINAL_IDS).max || 0) + 1
+    PENDING_TERMINAL_IDS << terminal_id
     requested_name = payload['name']
     agent_acc      = !!payload['agent_accessible']
     puts "[term/create] terminal=#{terminal_id} project=#{session.project_id}"
 
     proj = Project.find_by(id: session.project_id)
 
-    case ENV.fetch('CARBIDE_BACKEND', 'local')
-    when 'kube'
-      pod = PROJECT_PODS[session.project_id] ||= ProjectPod.new(session.project_id)
-      pod.ensure_running!
-      POD_REFCOUNTS[session.project_id] += 1
+    # Continuation that builds the PTY-backed terminal, registers it, and
+    # notifies clients. Runs on the EM reactor thread. `cmd` defaults to the
+    # local-shell default; kube/docker pass an exec command into the pod/container.
+    finish = lambda do |cmd: '/bin/bash', cwd: nil|
+      PENDING_TERMINAL_IDS.delete(terminal_id)
       term = TerminalInstance.new(
         terminal_id,
         project_id: session.project_id,
         cols: 80, rows: 24,
         name: requested_name,
-        cmd:  pod.exec_cmd,
-        cwd:  nil,
+        cmd:  cmd,
+        cwd:  cwd,
         agent_accessible: agent_acc
+      )
+      TERMINALS[terminal_id] = term
+      term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
+      term.on_state_change { |_t| broadcast_terminals_to_project(session.project_id) }
+      Command.reply(session, 'term', 'created',
+                    { terminal_id: terminal_id, name: term.name })
+      broadcast_terminals_to_project(session.project_id)
+    end
+
+    case ENV.fetch('CARBIDE_BACKEND', 'local')
+    when 'kube'
+      pod = PROJECT_PODS[session.project_id] ||= ProjectPod.new(session.project_id)
+      # ensure_running! does blocking kubectl polls (up to READY_TIMEOUT). Run it
+      # OFF the reactor so a slow/failing pod can't freeze fs/editor/other clients
+      # (the single EM reactor thread serves every WS command). Resume on the
+      # reactor once the pod is Ready, or surface an error to just this client.
+      EM.defer(
+        proc do
+          pod.ensure_running!
+          :ok
+        rescue => e
+          e
+        end,
+        proc do |result|
+          if result == :ok
+            POD_REFCOUNTS[session.project_id] += 1
+            finish.call(cmd: pod.exec_cmd, cwd: nil)
+          else
+            PENDING_TERMINAL_IDS.delete(terminal_id)
+            warn "[term/create] ERROR: #{result.class} #{result.message}\n  " \
+                 "#{Array(result.backtrace).first(5).join("\n  ")}"
+            Command.error(session, "term/create failed: #{result.message}")
+          end
+        end
       )
     when 'docker'
       container = PROJECT_CONTAINERS[session.project_id] ||=
         ProjectContainer.new(session.project_id, root_path: proj&.project_setting&.root_path.presence)
       container.ensure_running!
-      term = TerminalInstance.new(
-        terminal_id,
-        project_id: session.project_id,
-        cols: 80, rows: 24,
-        name: requested_name,
-        cmd:  container.exec_cmd,
-        cwd:  nil,
-        agent_accessible: agent_acc
-      )
+      finish.call(cmd: container.exec_cmd, cwd: nil)
     else
       cwd  = proj&.project_setting&.root_path.presence || PROJECT_ROOT
-      term = TerminalInstance.new(
-        terminal_id,
-        project_id: session.project_id,
-        cols: 80, rows: 24,
-        name: requested_name,
-        cwd:  cwd,
-        agent_accessible: agent_acc
-      )
+      finish.call(cwd: cwd)
     end
-
-    TERMINALS[terminal_id] = term
-    term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
-    term.on_state_change { |_t| broadcast_terminals_to_project(session.project_id) }
-    Command.reply(session, 'term', 'created',
-                  { terminal_id: terminal_id, name: term.name })
-    broadcast_terminals_to_project(session.project_id)
   end
   register 'create', :create
 
