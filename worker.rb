@@ -37,6 +37,21 @@ require 'set'
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
 
+# ---------------------------------------------------------------------------
+# Wire-protocol versioning
+# ---------------------------------------------------------------------------
+# Compatibility is decided by a single monotonic integer per side plus a floor,
+# NOT a SemVer range matrix:
+#   PROTOCOL   — the wire protocol this build speaks. Bump on ANY wire change.
+#   MIN_CLIENT — the oldest client PROTOCOL this build still tolerates. Bump
+#                ONLY on a breaking change.
+# Two peers are compatible iff each is at or above the other's floor:
+#   client.protocol >= server.MIN_CLIENT  AND  server.protocol >= client.min_server
+# The check is advisory for now: on mismatch we warn (log + tell the client),
+# but still serve the connection. Flip to a hard refuse later if needed.
+PROTOCOL   = 1
+MIN_CLIENT = 1
+
 # Load worker/carbide.yml if present; allows per-machine config without env vars.
 _cfg_path = File.join(__dir__, 'carbide.yml')
 _cfg      = File.exist?(_cfg_path) ? (require 'yaml'; YAML.load_file(_cfg_path, permitted_classes: []) || {}) : {}
@@ -366,6 +381,13 @@ EM.run do
       params = URI.decode_www_form(handshake.query_string || '').to_h
       token  = params['token']
 
+      # Wire-protocol handshake (advisory). A client that predates versioning
+      # sends neither param: treat it as proto=0 / min_server=0 so the floor
+      # comparison still runs and we warn rather than crash.
+      client_proto      = params['proto'].to_i
+      client_min_server = params['min_server'].to_i
+      proto_ok = client_proto >= MIN_CLIENT && PROTOCOL >= client_min_server
+
       payload = validate_token(token)
       if payload
         session = Session.new(ws, payload)
@@ -373,10 +395,19 @@ EM.run do
         # Track session by project for terminal broadcasts
         SESSIONS_BY_PROJECT[session.project_id] ||= []
         SESSIONS_BY_PROJECT[session.project_id] << session
-        
+
+        unless proto_ok
+          puts "[proto] version mismatch: client(proto=#{client_proto} min_server=#{client_min_server}) " \
+               "server(proto=#{PROTOCOL} min_client=#{MIN_CLIENT}) — serving anyway (advisory)"
+        end
+
         send_msg(ws, 'system', 'connected', {
           user_id:    session.user_id,
           project_id: session.project_id,
+          # Wire-protocol advertisement so the client can compare against its
+          # own floor and surface a mismatch banner. See PROTOCOL/MIN_CLIENT.
+          protocol:   PROTOCOL,
+          min_client: MIN_CLIENT,
           # Token expiry (unix seconds) so the client can refresh in-band before
           # it lapses. nil for legacy tokens with no exp claim.
           token_exp:  session.token_exp
