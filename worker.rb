@@ -3,6 +3,84 @@
 # Handles: terminal (PTY), chat, fs (file read). Protocol: { cs, cmd, payload }
 $stdout.sync = true
 $stderr.sync = true
+
+# ---------------------------------------------------------------------------
+# Persistent worker log (survives pod reaping)
+# ---------------------------------------------------------------------------
+# kubectl logs only retains output while the pod exists; a reaped/rolled pod
+# takes its logs with it, so an overnight death leaves nothing to read. When
+# CARBIDE_WORKER_LOG is set (the kube deployment points it at the project PVC),
+# mirror stdout/stderr to that file with a timestamp on every line, emit a
+# heartbeat so the time-of-death is known, and record the exit reason. The
+# file lives on the persistent volume, so it outlives the container.
+if (worker_log_path = ENV['CARBIDE_WORKER_LOG'].to_s) && !worker_log_path.empty?
+  require 'fileutils'
+  require 'time'
+  begin
+    FileUtils.mkdir_p(File.dirname(worker_log_path))
+    # Roll if the previous run left a large file behind (the PVC also holds
+    # project files; a runaway log must not fill it and cause ErrImagePull).
+    if File.exist?(worker_log_path) && File.size(worker_log_path) > 16 * 1024 * 1024
+      File.rename(worker_log_path, "#{worker_log_path}.1") rescue nil
+    end
+    _worker_log_io = File.open(worker_log_path, 'a')
+    _worker_log_io.sync = true
+
+    # Tee: write to the original stream AND the persistent file, prefixing
+    # each line in the file with an ISO8601 timestamp. stdout/stderr that
+    # kubectl reads stays raw so existing log parsing is unaffected.
+    tee = Class.new do
+      def initialize(orig, file) = (@orig, @file, @at_bol = orig, file, true)
+      def write(str)
+        @orig.write(str)
+        s = str.to_s
+        unless s.empty?
+          stamped = +''
+          s.each_char do |c|
+            stamped << Time.now.utc.iso8601(3) << ' ' if @at_bol
+            stamped << c
+            @at_bol = (c == "\n")
+          end
+          @file.write(stamped)
+        end
+        str.to_s.bytesize
+      end
+      def puts(*a) = (a.empty? ? write("\n") : a.each { |x| write("#{x}\n") })
+      def print(*a) = a.each { |x| write(x.to_s) }
+      def printf(fmt, *a) = write(format(fmt, *a))
+      def <<(x) = (write(x.to_s); self)
+      def flush = (@orig.flush; @file.flush; self)
+      def sync = true
+      def sync=(v); v; end
+      def fileno = @orig.fileno
+      def tty? = @orig.tty?
+      def respond_to_missing?(m, inc = false) = @orig.respond_to?(m, inc)
+      def method_missing(m, *a, &b) = @orig.send(m, *a, &b)
+    end
+    $stdout = tee.new(STDOUT, _worker_log_io)
+    $stderr = tee.new(STDERR, _worker_log_io)
+    puts "[worker] persistent log opened at #{worker_log_path} (pid=#{Process.pid})"
+
+    # Record why the worker exits — clean shutdown, signal, or crash. This is
+    # the line that would have answered "why did the shell die overnight."
+    at_exit do
+      err = $! && $!.is_a?(Exception) ? "#{$!.class}: #{$!.message}" : nil
+      puts "[worker] exiting (pid=#{Process.pid})#{err ? " due to #{err}" : ''}"
+      if err && $!.backtrace
+        $!.backtrace.first(20).each { |l| puts "[worker]   #{l}" }
+      end
+    end
+    %w[TERM INT].each do |sig|
+      trap(sig) do
+        warn "[worker] received SIG#{sig} (pid=#{Process.pid}) — shutting down"
+        exit(0)
+      end
+    end
+  rescue => e
+    warn "[worker] could not open persistent log #{worker_log_path}: #{e.class}: #{e.message}"
+  end
+end
+
 require 'eventmachine'
 require 'em-websocket'
 require 'json'
@@ -266,6 +344,14 @@ EM.run do
   port = ENV.fetch('WORKER_PORT', '8080').to_i
 
   puts "Carbide2 worker starting on #{host}:#{port}"
+
+  # Liveness heartbeat. With timestamped persistent logs, the heartbeat's last
+  # line pins the time-of-death even when the worker was otherwise idle (an
+  # overnight reap leaves no other output). Cheap: one line/minute.
+  EM.add_periodic_timer(60) do
+    puts "[worker] heartbeat pid=#{Process.pid} sessions=#{SESSIONS_BY_PROJECT.values.sum(&:size)} " \
+         "terminals=#{(defined?(TERMINALS) ? TERMINALS.size : 0)} rss_kb=#{(File.read("/proc/#{Process.pid}/statm").split[1].to_i * 4 rescue 0)}"
+  end
   puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
   puts "[worker] Shell backend: #{ENV.fetch('CARBIDE_BACKEND', 'local')} (image=#{ENV['CARBIDE_SHELL_IMAGE'] || 'n/a'} ns=#{ENV['CARBIDE_NAMESPACE'] || 'n/a'})"
 
