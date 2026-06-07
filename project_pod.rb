@@ -156,6 +156,20 @@ class ProjectPod
           runAsGroup: 1000,
           fsGroup:    1000,
         },
+        # The k3d default `local-path` provisioner creates PV directories as
+        # root:root 0755, and kubelet's fsGroup recursive chown does not
+        # reliably apply to subPath mounts — so /workspace lands root-owned
+        # and the non-root `carbide` (uid 1000) cannot write. Fix ownership
+        # up front with a root initContainer before the unprivileged shell
+        # starts. No-op when there is no PVC (PVC_NAME empty).
+        initContainers: pvc_mounts.empty? ? [] : [{
+          name: 'fix-workspace-perms',
+          image: SHELL_IMAGE,
+          imagePullPolicy: IMAGE_PULL_POLICY,
+          command: ['sh', '-c', 'chown 1000:1000 /workspace && chmod 0775 /workspace'],
+          securityContext: { runAsUser: 0, runAsGroup: 0 },
+          volumeMounts: pvc_mounts,
+        }],
         containers: [{
           name: 'shell',
           image: SHELL_IMAGE,
