@@ -110,6 +110,7 @@ require_relative 'handlers/chat_handlers'
 require_relative 'handlers/fs_handlers'
 require_relative 'handlers/agent_handlers'
 require_relative 'handlers/rtc_handlers'
+require_relative 'handlers/session_handlers'
 require 'set'
 
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
@@ -127,7 +128,10 @@ ALGORITHM     = 'HS256'
 #   client.protocol >= server.MIN_CLIENT  AND  server.protocol >= client.min_server
 # The check is advisory for now: on mismatch we warn (log + tell the client),
 # but still serve the connection. Flip to a hard refuse later if needed.
-PROTOCOL   = 1
+# PROTOCOL 2: added the 'session' commandSet (server-side browser-session
+# tracking). Additive — MIN_CLIENT stays 1 (clients that never send session
+# frames are unaffected).
+PROTOCOL   = 2
 MIN_CLIENT = 1
 
 # Load worker/carbide.yml if present; allows per-machine config without env vars.
@@ -202,6 +206,7 @@ end
 TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
 OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
+SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
 PROJECT_PODS        = {}        # project_id (int)  => ProjectPod
 POD_REFCOUNTS       = Hash.new(0)  # project_id => live terminal count
@@ -272,6 +277,7 @@ ROUTES = {
   'fs'     => FsHandlers,
   'agent'  => AgentHandlers,
   'rtc'    => RtcHandlers,
+  'session' => SessionHandlers,
   'debug'  => DebugHandlers,
   'system' => SystemHandlers,
 }.freeze

@@ -1,0 +1,187 @@
+# worker/handlers/session_handlers.rb
+#
+# 'session' commandSet — server-side browser-session tracking (resume + watch).
+#
+# GENERIC BOILERPLATE: the wire shape of the session document is NOT finalized.
+# The server treats `doc` as an OPAQUE JSON tree and only applies generic path
+# patches ([key, key, ...] -> value | delete), persists on EVERY patch (plain AR
+# save — fine at carbide scale), and rebroadcasts to watchers. All session
+# semantics (what a "pane"/"focus" is) live client-side.
+#
+# Commands:
+#   create      {from_uuid?, name?, doc?}   -> create (or fork) a session; you are its producer
+#   resume      {session_uuid}              -> load a session you own; become producer + subscribe
+#   patch       {session_uuid, ops:[...]}   -> apply path ops to doc, persist, rebroadcast
+#   subscribe   {session_uuid}              -> WATCH read-only; get snapshot + future patches
+#   unsubscribe {session_uuid}
+#   snapshot    {session_uuid}              -> current doc (resume/join)
+#   list        {}                          -> this user's sessions (resume picker)
+#
+# ops shape (opaque values):
+#   [ { "path": ["a","b"], "value": <any> },   # set
+#     { "path": ["a","c"], "op": "delete" } ]   # delete
+module SessionHandlers
+  extend Command::Dispatcher
+  namespace 'session'
+
+  # --- lookup helper ---------------------------------------------------------
+  def self.find_session(session, payload, what)
+    uuid = payload['session_uuid'].to_s
+    if uuid.empty?
+      Command.error(session, "session #{what} requires session_uuid")
+      return nil
+    end
+    bs = BrowserSession.find_by(session_uuid: uuid)
+    unless bs
+      Command.error(session, "session not found: #{uuid}")
+      return nil
+    end
+    bs
+  end
+
+  def self.owns?(session, bs)
+    bs.user_id.to_s == session.user_id.to_s
+  end
+
+  # --- create / fork ---------------------------------------------------------
+  def self.create(session, payload)
+    user = User.find_by(id: session.user_id)
+    unless user
+      Command.error(session, 'session create requires a known user')
+      return
+    end
+
+    from_uuid = payload['from_uuid'].to_s
+    bs =
+      if from_uuid.empty?
+        BrowserSession.create!(user: user, name: payload['name'],
+                               doc: payload['doc'].is_a?(Hash) ? payload['doc'] : {})
+      else
+        src = BrowserSession.find_by(session_uuid: from_uuid)
+        return Command.error(session, "cannot fork unknown session: #{from_uuid}") unless src
+        src.fork_for(user)
+      end
+
+    subscribe_ws(session, bs, role: 'producer')
+    Command.reply(session, 'session', 'created',
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc,
+                    forked_from: bs.forked_from&.session_uuid })
+  end
+  register 'create', :create
+
+  # --- resume (own it again) -------------------------------------------------
+  def self.resume(session, payload)
+    bs = find_session(session, payload, 'resume') or return
+    unless owns?(session, bs)
+      Command.error(session, 'cannot resume a session you do not own')
+      return
+    end
+    subscribe_ws(session, bs, role: 'producer')
+    Command.reply(session, 'session', 'resumed',
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+  end
+  register 'resume', :resume
+
+  # --- patch (producer only) -------------------------------------------------
+  def self.patch(session, payload)
+    bs = find_session(session, payload, 'patch') or return
+    unless owns?(session, bs)
+      Command.error(session, 'cannot patch a session you do not own')
+      return
+    end
+    ops = payload['ops']
+    ops = [] unless ops.is_a?(Array)
+
+    doc = bs.doc || {}
+    ops.each { |op| apply_op(doc, op) if op.is_a?(Hash) }
+    bs.doc = doc
+    bs.doc_will_change!   # in-place jsonb mutation → force the dirty flag
+    bs.save!              # persist on every patch (settled: save every update)
+
+    # Live relay to WATCHERS (not the producer that sent it). The in-memory
+    # rebroadcast is independent of the DB write above.
+    broadcast_patch(bs, ops, except: session.ws)
+    Command.reply(session, 'session', 'patched',
+                  { session_uuid: bs.session_uuid, rev: bs.updated_at.to_f })
+  end
+  register 'patch', :patch
+
+  # --- subscribe (watch, read-only) -----------------------------------------
+  def self.subscribe(session, payload)
+    bs = find_session(session, payload, 'subscribe') or return
+    subscribe_ws(session, bs, role: 'watcher')
+    Command.reply(session, 'session', 'snapshot',
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+  end
+  register 'subscribe', :subscribe
+
+  def self.unsubscribe(session, payload)
+    uuid = payload['session_uuid'].to_s
+    return if uuid.empty?
+    unsubscribe_ws(session, uuid)
+    Command.reply(session, 'session', 'unsubscribed', { session_uuid: uuid })
+  end
+  register 'unsubscribe', :unsubscribe
+
+  # --- snapshot (fetch current doc) -----------------------------------------
+  def self.snapshot(session, payload)
+    bs = find_session(session, payload, 'snapshot') or return
+    Command.reply(session, 'session', 'snapshot',
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+  end
+  register 'snapshot', :snapshot
+
+  # --- list (resume picker) --------------------------------------------------
+  def self.list(session, _payload)
+    sessions = BrowserSession.where(user_id: session.user_id).order(updated_at: :desc)
+    Command.reply(session, 'session', 'list',
+                  { sessions: sessions.map { |bs|
+                    { session_uuid: bs.session_uuid, name: bs.name,
+                      updated_at: bs.updated_at, created_at: bs.created_at } } })
+  end
+  register 'list', :list
+
+  # --- generic path-patch application (opaque doc) ---------------------------
+  # Mutates `doc` in place. Missing intermediate keys are created as hashes.
+  def self.apply_op(doc, op)
+    return doc unless doc.is_a?(Hash)
+    path = Array(op['path']).map(&:to_s)
+    return doc if path.empty?
+
+    parent = doc
+    path[0...-1].each do |k|
+      parent[k] = {} unless parent[k].is_a?(Hash)
+      parent = parent[k]
+    end
+    last = path.last
+    if op['op'] == 'delete'
+      parent.delete(last)
+    else
+      parent[last] = op['value']
+    end
+    doc
+  end
+
+  # --- in-memory subscriber registry ----------------------------------------
+  # SESSION_SUBSCRIBERS[uuid] = { ws => { user_id:, name:, role: } }
+  def self.subscribe_ws(session, bs, role:)
+    subs = (SESSION_SUBSCRIBERS[bs.session_uuid] ||= {})
+    subs[session.ws] = { user_id: session.user_id, name: session.name, role: role }
+    session.session_subs << bs.session_uuid unless session.session_subs.include?(bs.session_uuid)
+  end
+
+  def self.unsubscribe_ws(session, uuid)
+    if (subs = SESSION_SUBSCRIBERS[uuid])
+      subs.delete(session.ws)
+      SESSION_SUBSCRIBERS.delete(uuid) if subs.empty?
+    end
+    session.session_subs.delete(uuid)
+  end
+
+  def self.broadcast_patch(bs, ops, except:)
+    subs = SESSION_SUBSCRIBERS[bs.session_uuid] or return
+    targets = subs.keys.reject { |ws| ws == except }
+    broadcast(targets, 'session', 'patch',
+              { session_uuid: bs.session_uuid, ops: ops })
+  end
+end
