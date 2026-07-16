@@ -132,12 +132,25 @@ module SessionHandlers
   register 'snapshot', :snapshot
 
   # --- list (resume picker) --------------------------------------------------
+  # `in_use` = the session currently has a live PRODUCER ws in the in-memory
+  # subscriber registry (another tab/window is driving it right now). It is the
+  # client's "give me the most-recent session NOT in use" signal — no DB column
+  # needed, and it self-cleans on disconnect via Session#cleanup. NOTE: the
+  # registry is per worker process; if this ever runs multi-replica, `in_use`
+  # only reflects THIS process and would need a shared store.
+  def self.in_use?(uuid)
+    subs = SESSION_SUBSCRIBERS[uuid]
+    return false unless subs
+    subs.any? { |_ws, meta| meta[:role] == 'producer' }
+  end
+
   def self.list(session, _payload)
     sessions = BrowserSession.where(user_id: session.user_id).order(updated_at: :desc)
     Command.reply(session, 'session', 'list',
                   { sessions: sessions.map { |bs|
                     { session_uuid: bs.session_uuid, name: bs.name,
-                      updated_at: bs.updated_at, created_at: bs.created_at } } })
+                      updated_at: bs.updated_at, created_at: bs.created_at,
+                      in_use: in_use?(bs.session_uuid) } } })
   end
   register 'list', :list
 
