@@ -131,7 +131,9 @@ ALGORITHM     = 'HS256'
 # PROTOCOL 2: added the 'session' commandSet (server-side browser-session
 # tracking). Additive — MIN_CLIENT stays 1 (clients that never send session
 # frames are unaffected).
-PROTOCOL   = 2
+# PROTOCOL 3: session/delete + client_version on session create/list, and a
+# stable per-terminal uuid in term/created + term/list. All additive.
+PROTOCOL   = 3
 MIN_CLIENT = 1
 
 # Load worker/carbide.yml if present; allows per-machine config without env vars.

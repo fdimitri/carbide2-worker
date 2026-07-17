@@ -9,12 +9,13 @@
 # semantics (what a "pane"/"focus" is) live client-side.
 #
 # Commands:
-#   create      {from_uuid?, name?, doc?}   -> create (or fork) a session; you are its producer
+#   create      {from_uuid?, name?, doc?, client_version?} -> create (or fork) a session; you are its producer
 #   resume      {session_uuid}              -> load a session you own; become producer + subscribe
 #   patch       {session_uuid, ops:[...]}   -> apply path ops to doc, persist, rebroadcast
 #   subscribe   {session_uuid}              -> WATCH read-only; get snapshot + future patches
 #   unsubscribe {session_uuid}
 #   snapshot    {session_uuid}              -> current doc (resume/join)
+#   delete      {session_uuid}              -> destroy a session you own (garbage collection)
 #   list        {}                          -> this user's sessions (resume picker)
 #
 # ops shape (opaque values):
@@ -55,11 +56,16 @@ module SessionHandlers
     bs =
       if from_uuid.empty?
         BrowserSession.create!(user: user, name: payload['name'],
+                               client_version: payload['client_version'],
                                doc: payload['doc'].is_a?(Hash) ? payload['doc'] : {})
       else
         src = BrowserSession.find_by(session_uuid: from_uuid)
         return Command.error(session, "cannot fork unknown session: #{from_uuid}") unless src
-        src.fork_for(user)
+        forked = src.fork_for(user)
+        # A fork adopts the FORKING client's version (its doc will now be driven
+        # by this build), not the source's.
+        forked.update!(client_version: payload['client_version']) if payload['client_version']
+        forked
       end
 
     subscribe_ws(session, bs, role: 'producer')
@@ -123,6 +129,29 @@ module SessionHandlers
   end
   register 'unsubscribe', :unsubscribe
 
+  # --- delete (garbage-collect a session you own) ---------------------------
+  # Tears down the in-memory subscriber registry for the session (so any live
+  # watchers are dropped) and destroys the row. Only the owner may delete.
+  def self.delete(session, payload)
+    bs = find_session(session, payload, 'delete') or return
+    unless owns?(session, bs)
+      Command.error(session, 'cannot delete a session you do not own')
+      return
+    end
+    uuid = bs.session_uuid
+    # Notify + drop every subscriber (producer + watchers), then forget the
+    # registry entry so nothing lingers pointing at a destroyed row.
+    if (subs = SESSION_SUBSCRIBERS[uuid])
+      targets = subs.keys
+      broadcast(targets, 'session', 'deleted', { session_uuid: uuid })
+      SESSION_SUBSCRIBERS.delete(uuid)
+    end
+    bs.destroy!
+    # Reply to the requester too (they may not be in the subscriber set).
+    Command.reply(session, 'session', 'deleted', { session_uuid: uuid })
+  end
+  register 'delete', :delete
+
   # --- snapshot (fetch current doc) -----------------------------------------
   def self.snapshot(session, payload)
     bs = find_session(session, payload, 'snapshot') or return
@@ -149,6 +178,7 @@ module SessionHandlers
     Command.reply(session, 'session', 'list',
                   { sessions: sessions.map { |bs|
                     { session_uuid: bs.session_uuid, name: bs.name,
+                      client_version: bs.client_version,
                       updated_at: bs.updated_at, created_at: bs.created_at,
                       in_use: in_use?(bs.session_uuid) } } })
   end
@@ -178,9 +208,29 @@ module SessionHandlers
   # --- in-memory subscriber registry ----------------------------------------
   # SESSION_SUBSCRIBERS[uuid] = { ws => { user_id:, name:, role: } }
   def self.subscribe_ws(session, bs, role:)
+    # A socket drives AT MOST ONE session. Becoming producer of a new session
+    # relinquishes the producer role on any OTHER session this socket was
+    # driving, so `in_use` releases on switch (create/resume) rather than only
+    # on disconnect. Watcher subscriptions are independent and left intact — a
+    # socket may watch several sessions at once.
+    release_other_producer_sessions(session, keep: bs.session_uuid) if role == 'producer'
+
     subs = (SESSION_SUBSCRIBERS[bs.session_uuid] ||= {})
     subs[session.ws] = { user_id: session.user_id, name: session.name, role: role }
     session.session_subs << bs.session_uuid unless session.session_subs.include?(bs.session_uuid)
+  end
+
+  # Drop this socket's PRODUCER entry from every session except `keep`. Leaves
+  # watcher entries (and the socket's session_subs for those) untouched.
+  def self.release_other_producer_sessions(session, keep:)
+    session.session_subs.dup.each do |uuid|
+      next if uuid == keep
+      subs = SESSION_SUBSCRIBERS[uuid]
+      next unless subs
+      meta = subs[session.ws]
+      next unless meta && meta[:role] == 'producer'
+      unsubscribe_ws(session, uuid)
+    end
   end
 
   def self.unsubscribe_ws(session, uuid)

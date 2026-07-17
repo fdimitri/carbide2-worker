@@ -47,7 +47,7 @@ module TermHandlers
       term.on_exit { |tid| on_terminal_exit(tid, session.project_id) }
       term.on_state_change { |_t| broadcast_terminals_to_project(session.project_id) }
       Command.reply(session, 'term', 'created',
-                    { terminal_id: terminal_id, name: term.name })
+                    { terminal_id: terminal_id, uuid: term.uuid, name: term.name })
       broadcast_terminals_to_project(session.project_id)
     end
 

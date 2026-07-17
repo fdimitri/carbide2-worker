@@ -14,13 +14,25 @@
 # which bypasses the gate. The auto-release timeout is mandatory to
 # prevent a wedged agent from locking the user out forever; the upper
 # bound is project_settings.agent_shell_busy_timeout_s.
+#
+# Identity
+# --------
+# @terminal_id is a SMALL REUSABLE INTEGER (display ordinal — "Terminal #1").
+# When a terminal exits its id is freed and a later create can mint a different
+# shell with the same number, so the integer is NOT a stable identity. @uuid is
+# the STABLE identity: unique, never reused, and what the browser-session doc
+# references so a stale/defunct tab resolves positively to "gone" instead of
+# silently binding a different shell that happens to share the recycled integer.
+require 'securerandom'
+
 class TerminalInstance
-  attr_reader :terminal_id, :project_id, :master, :slave, :pid, :clients, :cols, :rows, :name
+  attr_reader :terminal_id, :uuid, :project_id, :master, :slave, :pid, :clients, :cols, :rows, :name
   attr_reader :agent_accessible, :agent_busy, :agent_busy_until_ms
 
   def initialize(terminal_id, project_id:, cols: 80, rows: 24, cmd: '/bin/bash',
                  name: nil, cwd: nil, agent_accessible: false)
     @terminal_id = terminal_id
+    @uuid        = SecureRandom.uuid
     @project_id  = project_id
     @name        = name.to_s.strip
     @name        = "terminal-#{terminal_id}" if @name.empty?
@@ -261,6 +273,7 @@ class TerminalInstance
   def to_list_entry
     {
       id:               @terminal_id,
+      uuid:             @uuid,
       name:             @name,
       status:           'active',
       cols:             @cols,
