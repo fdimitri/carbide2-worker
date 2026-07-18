@@ -191,7 +191,16 @@ def send_msg(ws, cs, cmd, payload = {})
 end
 
 def broadcast(clients, cs, cmd, payload = {})
-  msg  = { cs: cs, cmd: cmd, payload: payload }.to_json
+  # Serialise ONCE, and never on a path that can crash the reactor. A malformed
+  # payload (e.g. invalid-UTF-8 PTY bytes that slipped past source scrubbing)
+  # would otherwise raise here inside an EM.next_tick and take the worker down.
+  # Drop the frame instead — one lost output chunk beats a dead reactor.
+  begin
+    msg = { cs: cs, cmd: cmd, payload: payload }.to_json
+  rescue => e
+    puts "[broadcast] payload not serialisable (cs=#{cs} cmd=#{cmd}): #{e.class} #{e.message}"
+    return []
+  end
   dead = []
   clients.each do |ws|
     ws.send(msg)

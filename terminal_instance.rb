@@ -1,4 +1,4 @@
-# TerminalInstance owns one PTY and broadcasts output to subscribed sockets.
+ # TerminalInstance owns one PTY and broadcasts output to subscribed sockets.
 #
 # Agent integration
 # -----------------
@@ -74,6 +74,16 @@ class TerminalInstance
       puts "[PTY:#{@terminal_id}] reader thread started, reading from master"
       loop do
         data = @master.readpartial(4096)
+        # PTY output is raw bytes (ASCII-8BIT) and is frequently invalid UTF-8:
+        # binary commands (`dd if=/dev/random`, `cat` a binary), or a multibyte
+        # sequence split across two readpartial chunks. Everything downstream
+        # serialises this to JSON (term/output broadcast, scrollback replay on
+        # join), and JSON.generate RAISES on malformed UTF-8 — on the EM reactor
+        # thread via next_tick, which would kill the whole worker. Scrub once at
+        # the source so every consumer sees valid UTF-8. xterm.js renders the
+        # replacement char for these bytes anyway, so nothing useful is lost.
+        data = data.force_encoding('UTF-8')
+        data = data.scrub('') unless data.valid_encoding?
         puts "[PTY:#{@terminal_id}] read #{data.bytes.size} bytes: #{data.inspect[0..50]}"
         append_scrollback(data)
         EM.next_tick do
