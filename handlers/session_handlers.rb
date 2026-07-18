@@ -9,9 +9,10 @@
 # semantics (what a "pane"/"focus" is) live client-side.
 #
 # Commands:
-#   create      {from_uuid?, name?, doc?, client_version?} -> create (or fork) a session; you are its producer
+#   create      {from_uuid?, name?, doc?, client_version?, client_sha?, doc_version?} -> create (or fork) a session; you are its producer
 #   resume      {session_uuid}              -> load a session you own; become producer + subscribe
-#   patch       {session_uuid, ops:[...]}   -> apply path ops to doc, persist, rebroadcast
+#   patch       {session_uuid, ops:[...], client_sha?, doc_version?} -> apply path ops to doc, re-stamp last-writer signature, persist, rebroadcast
+#   resync      {session_uuid, doc, client_sha?, doc_version?} -> REPLACE the whole doc (producer's normalized toDoc), re-stamp, persist, snapshot watchers
 #   subscribe   {session_uuid}              -> WATCH read-only; get snapshot + future patches
 #   unsubscribe {session_uuid}
 #   snapshot    {session_uuid}              -> current doc (resume/join)
@@ -57,14 +58,18 @@ module SessionHandlers
       if from_uuid.empty?
         BrowserSession.create!(user: user, name: payload['name'],
                                client_version: payload['client_version'],
+                               client_sha: payload['client_sha'],
+                               doc_version: payload['doc_version'],
                                doc: payload['doc'].is_a?(Hash) ? payload['doc'] : {})
       else
         src = BrowserSession.find_by(session_uuid: from_uuid)
         return Command.error(session, "cannot fork unknown session: #{from_uuid}") unless src
         forked = src.fork_for(user)
-        # A fork adopts the FORKING client's version (its doc will now be driven
-        # by this build), not the source's.
-        forked.update!(client_version: payload['client_version']) if payload['client_version']
+        # A fork adopts the FORKING client's build fingerprints (its doc will now
+        # be driven by this build), not the source's.
+        forked.update!(client_version: payload['client_version'],
+                       client_sha: payload['client_sha'],
+                       doc_version: payload['doc_version'])
         forked
       end
 
@@ -84,7 +89,8 @@ module SessionHandlers
     end
     subscribe_ws(session, bs, role: 'producer')
     Command.reply(session, 'session', 'resumed',
-                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc,
+                    client_sha: bs.client_sha, doc_version: bs.doc_version })
   end
   register 'resume', :resume
 
@@ -102,6 +108,11 @@ module SessionHandlers
     ops.each { |op| apply_op(doc, op) if op.is_a?(Hash) }
     bs.doc = doc
     bs.doc_will_change!   # in-place jsonb mutation → force the dirty flag
+    # Re-stamp the LAST-WRITER signature: the fingerprint describes the bytes on
+    # disk, and the producer that just wrote them is the honest author. Only
+    # overwrite when the producer supplied a value (nil payload leaves it as-is).
+    bs.client_sha  = payload['client_sha']  if payload.key?('client_sha')
+    bs.doc_version = payload['doc_version'] if payload.key?('doc_version')
     bs.save!              # persist on every patch (settled: save every update)
 
     # Live relay to WATCHERS (not the producer that sent it). The in-memory
@@ -111,6 +122,38 @@ module SessionHandlers
                   { session_uuid: bs.session_uuid, rev: bs.updated_at.to_f })
   end
   register 'patch', :patch
+
+  # --- resync (producer replaces the WHOLE doc) ------------------------------
+  # A diff-patch stream can never delete a key the current build doesn't know
+  # about, so a session authored by an older/foreign build accretes defunct keys
+  # forever. resync ships the producer's fully normalized doc (its loadDoc->toDoc
+  # round-trip has already dropped unknown keys and adopted the current shape),
+  # replacing the stored tree wholesale and re-stamping the signature. The client
+  # fires this after resuming a session whose signature differs from its own.
+  def self.resync(session, payload)
+    bs = find_session(session, payload, 'resync') or return
+    unless owns?(session, bs)
+      Command.error(session, 'cannot resync a session you do not own')
+      return
+    end
+    doc = payload['doc']
+    return Command.error(session, 'resync requires a doc object') unless doc.is_a?(Hash)
+
+    bs.doc         = doc
+    bs.client_sha  = payload['client_sha']  if payload.key?('client_sha')
+    bs.doc_version = payload['doc_version'] if payload.key?('doc_version')
+    bs.save!
+
+    # Watchers get a full snapshot (not path ops) since the whole tree changed.
+    if (subs = SESSION_SUBSCRIBERS[bs.session_uuid])
+      targets = subs.keys.reject { |ws| ws == session.ws }
+      broadcast(targets, 'session', 'snapshot',
+                { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+    end
+    Command.reply(session, 'session', 'patched',
+                  { session_uuid: bs.session_uuid, rev: bs.updated_at.to_f })
+  end
+  register 'resync', :resync
 
   # --- subscribe (watch, read-only) -----------------------------------------
   def self.subscribe(session, payload)
@@ -179,6 +222,8 @@ module SessionHandlers
                   { sessions: sessions.map { |bs|
                     { session_uuid: bs.session_uuid, name: bs.name,
                       client_version: bs.client_version,
+                      client_sha: bs.client_sha,
+                      doc_version: bs.doc_version,
                       updated_at: bs.updated_at, created_at: bs.created_at,
                       in_use: in_use?(bs.session_uuid) } } })
   end
