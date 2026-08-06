@@ -187,7 +187,48 @@ class ProjectPod
         volumes: pvc_volumes,
       },
     }
+    if (affinity = same_node_affinity)
+      spec[:spec][:affinity] = affinity
+    end
     spec
+  end
+
+  # The project PVC is ReadWriteOnce, so a shell pod scheduled onto a different
+  # node than the workspace pod fails with Multi-Attach and never starts. Require
+  # the workspace pod's node. nodeAffinity rather than nodeName so the scheduler
+  # still checks resources and admission.
+  def same_node_affinity
+    return nil if pvc_mounts.empty?
+    node = current_node
+    return nil if node.nil? || node.empty?
+    {
+      nodeAffinity: {
+        requiredDuringSchedulingIgnoredDuringExecution: {
+          nodeSelectorTerms: [
+            { matchExpressions: [
+              { key: 'kubernetes.io/hostname', operator: 'In', values: [node] }
+            ] }
+          ]
+        }
+      }
+    }
+  end
+
+  # This worker's own node, via its pod (HOSTNAME is the pod name).
+  def current_node
+    return @current_node if defined?(@current_node)
+    @current_node = begin
+      self_pod = ENV['HOSTNAME'].to_s
+      if self_pod.empty?
+        nil
+      else
+        out, _err, status = Open3.capture3(
+          'kubectl', 'get', 'pod', '-n', NAMESPACE, self_pod,
+          '-o', 'jsonpath={.spec.nodeName}'
+        )
+        status.success? ? out.strip : nil
+      end
+    end
   end
 
   def pvc_mounts
