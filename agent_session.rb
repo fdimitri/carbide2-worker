@@ -164,15 +164,26 @@ class AgentSession
   # ─────────────────────────────────────────────────────────────────────
   private
 
+  # POST one chat-completion turn. Uses SSE streaming (stream=true) so we can
+  # forward partial assistant text and reasoning to the client as it arrives
+  # via emit('stream', ...). Accumulates the deltas and returns a hash shaped
+  # exactly like a non-streaming response so the ask() loop is unchanged:
+  #   { 'choices' => [ { 'message' => {...}, 'finish_reason' => ... } ] }
+  #
+  # Tool-call fragments stream as partial pieces keyed by index; we reassemble
+  # id/name/arguments before returning. If the server ignores stream=true and
+  # returns a normal JSON body, we fall back to parsing it whole.
   def post_chat_completion
     uri = URI.parse(File.join(@agent.provider_url, 'chat/completions'))
     req = Net::HTTP::Post.new(uri)
     req['Content-Type']  = 'application/json'
+    req['Accept']        = 'text/event-stream'
     req['Authorization'] = @agent.auth_header if @agent.auth_header
 
     body = {
       model:    @agent.model,
       messages: @history,
+      stream:   true,
     }
     body.merge!(@agent.sampling_params)
     tools = AgentTools.openai_tools_for(@agent.allowed_tool_slugs)
@@ -187,11 +198,77 @@ class AgentSession
     http.open_timeout = 10
     http.read_timeout = TIMEOUT_S
 
-    resp = http.request(req)
-    unless resp.is_a?(Net::HTTPSuccess)
-      raise "model server #{resp.code}: #{resp.body.to_s[0, 300]}"
+    content   = +''
+    reasoning = +''
+    tool_acc  = {}   # index => { 'id', 'type', 'function' => { 'name', 'arguments' } }
+    finish    = nil
+    buffer    = +''
+    saw_sse   = false
+
+    http.request(req) do |resp|
+      unless resp.is_a?(Net::HTTPSuccess)
+        errbody = (resp.read_body rescue '')
+        raise "model server #{resp.code}: #{errbody.to_s[0, 300]}"
+      end
+
+      resp.read_body do |chunk|
+        buffer << chunk
+        while (nl = buffer.index("\n"))
+          line = buffer.slice!(0..nl).chomp
+          next if line.empty? || line.start_with?(':')   # blank or SSE comment
+          next unless line.start_with?('data:')
+          saw_sse = true
+          data = line.sub(/\Adata:\s*/, '')
+          next if data == '[DONE]'
+          begin
+            json = JSON.parse(data)
+          rescue JSON::ParserError
+            next
+          end
+          choice = (json['choices'] || [])[0] || {}
+          delta  = choice['delta'] || {}
+          finish = choice['finish_reason'] if choice['finish_reason']
+
+          if (c = delta['content']) && !c.empty?
+            content << c
+            emit('stream', { delta: c })
+          end
+          if (r = delta['reasoning_content']) && !r.empty?
+            reasoning << r
+            emit('stream', { reasoning_delta: r })
+          end
+          Array(delta['tool_calls']).each do |tc|
+            idx = tc['index'] || 0
+            acc = (tool_acc[idx] ||= {
+              'id' => nil, 'type' => 'function',
+              'function' => { 'name' => +'', 'arguments' => +'' },
+            })
+            acc['id'] = tc['id'] if tc['id']
+            fn = tc['function'] || {}
+            acc['function']['name']      << fn['name']      if fn['name']
+            acc['function']['arguments'] << fn['arguments'] if fn['arguments']
+          end
+        end
+      end
     end
-    JSON.parse(resp.body)
+
+    # Fallback: server ignored stream=true and returned a whole JSON body.
+    if !saw_sse && !buffer.strip.empty?
+      whole = JSON.parse(buffer) rescue nil
+      return whole if whole.is_a?(Hash) && whole['choices']
+    end
+
+    tool_calls = tool_acc.keys.sort.map { |k| tool_acc[k] }
+    {
+      'choices' => [{
+        'message' => {
+          'content'           => content,
+          'reasoning_content' => (reasoning.empty? ? nil : reasoning),
+          'tool_calls'        => (tool_calls.empty? ? nil : tool_calls),
+        }.compact,
+        'finish_reason' => finish,
+      }],
+    }
   end
 
   def run_tool_call(call)
