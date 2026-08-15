@@ -77,7 +77,7 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if entry.binary?
 
-    content = entry.calc_current
+    content = entry.get_content
     send_fn.call(session.ws, 'fs', 'content', {
       path:    entry.srcpath,
       content: content
@@ -208,6 +208,10 @@ module FsStore
       revisions: stored.map(&:revision)
     })
 
+    # Advance the in-memory buffer with the same changes we just persisted.
+    cached = Document.for(entry)
+    changes.each { |ch| cached&.apply!(ch['change_type'], ch['change_data']) }
+
     # Broadcast only to clients that have this file open
     key   = "#{session.project_id}:#{entry.srcpath}"
     doc   = OPEN_DOCUMENTS[key]
@@ -247,6 +251,7 @@ module FsStore
     end
 
     send_fn.call(session.ws, 'fs', 'written', { path: entry.srcpath, revisions: [fc.revision] })
+    Document.for(entry)&.apply!('setContents', content)
     key   = "#{session.project_id}:#{entry.srcpath}"
     doc   = OPEN_DOCUMENTS[key]
     peers = doc ? doc.others(session.ws) : []
@@ -301,6 +306,8 @@ module FsStore
     entry    = find_entry!(session.project_id, path)
     old_path = entry.srcpath
     entry.rename!(new_name)
+    Document.forget(old_path)
+    Document.forget(entry.srcpath)
 
     send_fn.call(session.ws, 'fs', 'renamed', { old_path: old_path, new_path: entry.srcpath, id: entry.id })
     peers = other_project_sessions(session, sessions_by_project)
@@ -327,6 +334,7 @@ module FsStore
     abs_path = root ? File.join(root, entry_path) : nil
 
     entry.destroy!
+    Document.forget(entry_path)
 
     if root && abs_path
       flusher.suppress_set&.add(abs_path)

@@ -80,6 +80,7 @@ class VfsWatcher
       return unless entry
       # destroy! cascades children via has_many :dependent => :destroy
       entry.destroy!
+      Document.forget(srcpath) if defined?(Document)
       sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
       @broadcast_fn.call(sessions, 'fs', 'deleted', { path: srcpath, source: 'inotify' })
       puts "[VfsWatcher:#{@project_id}] external delete: #{srcpath}"
@@ -154,7 +155,7 @@ class VfsWatcher
     end
 
     content = File.read(abs_path, encoding: 'UTF-8', invalid: :replace, undef: :replace, replace: '')
-    current = entry.calc_current
+    current = entry.get_content
     if content == current
       entry.refresh_disk_stat!(abs_path)
       return  # no net text change — stat refresh is still useful for mtime
@@ -170,6 +171,7 @@ class VfsWatcher
         start_char:         0
       )
     end
+    Document.for(entry)&.apply!('setContents', content) if defined?(Document)
     entry.refresh_disk_stat!(abs_path)
 
     sessions = (@sessions_by_project[@project_id] || []).map(&:ws)

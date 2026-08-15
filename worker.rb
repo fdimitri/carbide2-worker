@@ -94,6 +94,7 @@ require_relative 'terminal_instance'
 require_relative 'terminal_recorder'
 require_relative 'chat_room'
 require_relative 'open_document'
+require_relative 'document'
 require_relative 'project_container'
 require_relative 'project_pod'
 require_relative 'session'
@@ -217,6 +218,7 @@ end
 TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
 OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
+DOCUMENTS           = {}        # srcpath => Document (in-memory rendered buffer)
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
 PROJECT_PODS        = {}        # project_id (int)  => ProjectPod
