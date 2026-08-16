@@ -80,23 +80,53 @@ module AgentTools
     [line, char]
   end
 
-  # Append the delete(+insert) delta pair that replaces buf[off...endoff]
-  # with `new_text`, with coordinates computed against `buf` (the state a
-  # client will be in when this delta is applied). Returns the new buffer.
+  # Number of leading characters `a` and `b` share.
+  def self.common_prefix_len(a, b)
+    n = [a.length, b.length].min
+    i = 0
+    i += 1 while i < n && a[i] == b[i]
+    i
+  end
+
+  # Number of trailing characters `a` and `b` share.
+  def self.common_suffix_len(a, b)
+    n = [a.length, b.length].min
+    i = 0
+    i += 1 while i < n && a[a.length - 1 - i] == b[b.length - 1 - i]
+    i
+  end
+
+  # Append the delta(s) that replace buf[off...endoff] with `new_text`, with
+  # coordinates computed against `buf` (the state a client will be in when
+  # this delta is applied). Returns the new buffer.
+  #
+  # The replaced span is narrowed to the minimal changed region by keeping any
+  # shared prefix/suffix in place, so a pure insertion emits only an insert
+  # (and a pure deletion only a delete) instead of deleting then re-inserting
+  # identical text — one FileChange row, one revision bump, half the fs/change
+  # broadcast for the common "add a line" edit.
   def self.push_replace_spec(buf, off, endoff, new_text, specs)
-    sl, sc = char_offset_to_line_char(buf, off)
-    el, ec = char_offset_to_line_char(buf, endoff)
-    if endoff > off
+    old_text = buf[off...endoff].to_s
+    pfx = common_prefix_len(old_text, new_text)
+    sfx = common_suffix_len(old_text[pfx..].to_s, new_text[pfx..].to_s)
+
+    del_start = off + pfx
+    del_end   = endoff - sfx
+    ins_text  = new_text[pfx...(new_text.length - sfx)].to_s
+
+    sl, sc = char_offset_to_line_char(buf, del_start)
+    if del_end > del_start
+      el, ec = char_offset_to_line_char(buf, del_end)
       specs << {
         change_type: (sl == el ? 'deleteDataSingleLine' : 'deleteDataMultiLine'),
         change_data: { startLine: sl, startChar: sc, endLine: el, endChar: ec },
         start_line: sl, start_char: sc, end_line: el, end_char: ec,
       }
     end
-    unless new_text.empty?
+    unless ins_text.empty?
       specs << {
-        change_type: (new_text.include?("\n") ? 'insertDataMultiLine' : 'insertDataSingleLine'),
-        change_data: { startLine: sl, startChar: sc, data: new_text },
+        change_type: (ins_text.include?("\n") ? 'insertDataMultiLine' : 'insertDataSingleLine'),
+        change_data: { startLine: sl, startChar: sc, data: ins_text },
         start_line: sl, start_char: sc, end_line: nil, end_char: nil,
       }
     end
@@ -756,5 +786,218 @@ module AgentTools
     end
 
     { matches: matches, count: matches.size, files_scanned: files_scanned, truncated: truncated }
+  end
+
+  # =====================================================================
+  # AGENTS.md + agent memory
+  #
+  # AGENTS.md is a conventional per-project instruction file at the VFS root.
+  # It is auto-injected directly behind the system prompt on every inference
+  # turn (see AgentSession#outgoing_messages) — the tools below just let an
+  # agent read and rewrite it.
+  #
+  # Memories are markdown files under MEMORY_DIR. They are pull-based: an
+  # agent stores durable notes with memory_write and later retrieves them
+  # with memory_list / memory_read. Both live in the same VFS as the rest of
+  # the project, so they persist, mirror to disk, and are user-visible.
+  # =====================================================================
+  AGENTS_MD_PATH   = '/AGENTS.md'
+  MEMORY_DIR       = '/.carbide/memories'
+  MEMORY_NAME_RX   = /\A[a-z0-9][a-z0-9._-]*\z/
+
+  # Slugify a memory name into a safe '/.carbide/memories/<slug>.md' path, or
+  # nil if the name can't be reduced to a valid slug (empty / traversal).
+  def self.memory_path(name)
+    slug = name.to_s.strip.downcase
+    slug = slug.sub(/\.md\z/, '')
+    slug = slug.gsub(/[^a-z0-9._-]+/, '-').gsub(/\A[-.]+|[-.]+\z/, '')
+    return nil if slug.empty? || slug.include?('..') || !slug.match?(MEMORY_NAME_RX)
+    "#{MEMORY_DIR}/#{slug}.md"
+  end
+
+  # Tell every session in the project about a newly created entry so the file
+  # explorer picks it up without a manual refresh. Mirrors the fs/created
+  # broadcast FsStore.handle_create_file sends for interactive creates.
+  def self.broadcast_created!(project_id:, entry:)
+    return unless defined?(SESSIONS_BY_PROJECT)
+    msg = { cs: 'fs', cmd: 'created',
+            payload: { path: entry.srcpath, type: entry.ftype, id: entry.id } }.to_json
+    (SESSIONS_BY_PROJECT[project_id] || []).each { |s| s.ws&.send(msg) rescue nil }
+  end
+
+  # Create `srcpath` with `content` if it's missing, otherwise replace its
+  # whole content with a minimal delta. New files broadcast fs/created and are
+  # flushed to disk; edits go through commit_changes! (fs/change + flush) like
+  # every other agent edit. Returns a result Hash.
+  def self.write_whole_file!(project_id:, srcpath:, content:, user_id:)
+    content = content.to_s
+    entry   = DirectoryEntry.find_by_project_and_path(project_id, srcpath)
+    if entry.nil?
+      entry = DirectoryEntry.create_file!(project_id: project_id, srcpath: srcpath,
+                                          user_id: user_id, data: content, mkdirp: true)
+      broadcast_created!(project_id: project_id, entry: entry)
+      VFS_FLUSHERS[project_id]&.record_write(entry.id, content.bytesize) if defined?(VFS_FLUSHERS)
+      return { path: entry.srcpath, created: true, revision: entry.get_revision }
+    end
+    return { error: "not a file: #{srcpath} (ftype=#{entry.ftype})" } if entry.ftype != 'file'
+    return { error: "cannot write binary file: #{srcpath}" } if entry.binary?
+
+    specs = []
+    push_replace_spec(entry.get_content, 0, entry.get_content.length, content, specs)
+    stored = commit_changes!(project_id: project_id, entry: entry,
+                             specs: specs, user_id: user_id)
+    { path: entry.srcpath, created: false, changes: stored.size, revision: entry.get_revision }
+  end
+
+  # ---------------------------------------------------------------------
+  # agents_md_read() — return the current project AGENTS.md.
+  #
+  # AGENTS.md is already injected behind the system prompt every turn, so an
+  # agent rarely needs to read it — but this lets it fetch the exact current
+  # text before rewriting it with agents_md_write.
+  # ---------------------------------------------------------------------
+  register('agents_md_read',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'agents_md_read',
+        description: 'Read the project AGENTS.md — the always-in-effect ' \
+                     'instruction file for this project. Returns empty content ' \
+                     'with exists=false if no AGENTS.md has been created yet.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    entry = DirectoryEntry.find_by_project_and_path(project_id, AGENTS_MD_PATH)
+    if entry.nil? || entry.ftype != 'file'
+      { path: AGENTS_MD_PATH, exists: false, content: '' }
+    else
+      { path: entry.srcpath, exists: true,
+        revision: entry.get_revision, content: entry.get_content }
+    end
+  end
+
+  # ---------------------------------------------------------------------
+  # agents_md_write(content) — create or replace the project AGENTS.md.
+  #
+  # Overwrites the whole file. Because AGENTS.md is re-read and injected on
+  # every subsequent turn, the new guidance takes effect immediately — no
+  # need to restate it in chat.
+  # ---------------------------------------------------------------------
+  register('agents_md_write',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'agents_md_write',
+        description: 'Create or replace the project AGENTS.md with the given ' \
+                     'markdown. This file is injected directly behind the ' \
+                     'system prompt on every turn, so keep it concise and ' \
+                     'durable (build/test commands, conventions, constraints). ' \
+                     'Overwrites the entire file.',
+        parameters: {
+          type: 'object',
+          required: ['content'],
+          properties: {
+            content: { type: 'string', description: 'Full markdown body of AGENTS.md.' },
+          },
+          additionalProperties: false,
+        },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    write_whole_file!(project_id: project_id, srcpath: AGENTS_MD_PATH,
+                      content: args['content'].to_s, user_id: session.user_id)
+  end
+
+  # ---------------------------------------------------------------------
+  # memory_list() — enumerate stored memories.
+  # ---------------------------------------------------------------------
+  register('memory_list',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'memory_list',
+        description: 'List the agent memories stored for this project. Each ' \
+                     'memory is a markdown note under ' + MEMORY_DIR + '. ' \
+                     'Returns each memory name plus its first heading/line as a ' \
+                     'preview. Use memory_read to fetch a full memory.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    entries = DirectoryEntry.where(project_id: project_id, ftype: 'file')
+                            .where('srcpath LIKE ?', "#{MEMORY_DIR}/%")
+                            .order(:srcpath)
+    memories = entries.filter_map do |e|
+      next unless File.dirname(e.srcpath) == MEMORY_DIR   # direct children only
+      name    = File.basename(e.srcpath, '.md')
+      preview = e.binary? ? '' : e.get_content.lines.find { |l| !l.strip.empty? }.to_s.strip[0, 120]
+      { name: name, preview: preview }
+    end
+    { dir: MEMORY_DIR, count: memories.size, memories: memories }
+  end
+
+  # ---------------------------------------------------------------------
+  # memory_read(name) — fetch one memory's markdown.
+  # ---------------------------------------------------------------------
+  register('memory_read',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'memory_read',
+        description: 'Read a single stored memory by name (as listed by ' \
+                     'memory_list). Returns exists=false if there is no memory ' \
+                     'with that name.',
+        parameters: {
+          type: 'object',
+          required: ['name'],
+          properties: {
+            name: { type: 'string', description: 'Memory name, e.g. "build-commands".' },
+          },
+          additionalProperties: false,
+        },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    srcpath = memory_path(args['name'])
+    next { error: "invalid memory name: #{args['name'].inspect}" } if srcpath.nil?
+    entry = DirectoryEntry.find_by_project_and_path(project_id, srcpath)
+    if entry.nil? || entry.ftype != 'file'
+      { name: File.basename(srcpath, '.md'), exists: false, content: '' }
+    else
+      { name: File.basename(srcpath, '.md'), exists: true, path: entry.srcpath,
+        revision: entry.get_revision, content: entry.get_content }
+    end
+  end
+
+  # ---------------------------------------------------------------------
+  # memory_write(name, content) — create or replace a memory.
+  # ---------------------------------------------------------------------
+  register('memory_write',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'memory_write',
+        description: 'Store a durable memory as markdown under ' + MEMORY_DIR +
+                     '. Creates the memory if new, otherwise overwrites it ' \
+                     'entirely. Use a short kebab-case name that describes the ' \
+                     'note (e.g. "build-commands", "api-conventions").',
+        parameters: {
+          type: 'object',
+          required: ['name', 'content'],
+          properties: {
+            name:    { type: 'string', description: 'Memory name, e.g. "build-commands".' },
+            content: { type: 'string', description: 'Full markdown body of the memory.' },
+          },
+          additionalProperties: false,
+        },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    srcpath = memory_path(args['name'])
+    next { error: "invalid memory name: #{args['name'].inspect}" } if srcpath.nil?
+    res = write_whole_file!(project_id: project_id, srcpath: srcpath,
+                            content: args['content'].to_s, user_id: session.user_id)
+    res.is_a?(Hash) && res[:path] ? res.merge(name: File.basename(srcpath, '.md')) : res
   end
 end

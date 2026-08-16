@@ -164,10 +164,16 @@ module AgentHandlers
       end
     end
 
-    sess = AgentSession.find(conv) ||
-           AgentSession.start(session: session, agent: agent,
-                              project_id: session.project_id,
-                              conversation_id: conv)
+    sess = AgentSession.find(conv)
+    if sess
+      # Existing in-memory conversation: adopt the freshly-loaded agent so
+      # runtime config edits (model, provider_url, tools, sampling) propagate.
+      sess.refresh_agent!(agent)
+    else
+      sess = AgentSession.start(session: session, agent: agent,
+                                project_id: session.project_id,
+                                conversation_id: conv)
+    end
     # Ack immediately so the UI can show the conversation id.
     Command.reply(session, 'agent', 'started',
                   { conversation_id: conv, agent: agent.slug })

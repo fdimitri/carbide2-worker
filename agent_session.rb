@@ -86,6 +86,15 @@ class AgentSession
   def owner_user_id ; @owner_user_id ; end
   def convo         ; @convo         ; end
 
+  # Re-point an in-memory session at the latest Agent record so config edits
+  # made mid-conversation (model, provider_url, api_key, tools, sampling) take
+  # effect on the next turn. The system prompt already seeded into @history is
+  # intentionally left as-is — rewriting an in-flight transcript's system
+  # message would be surprising and isn't reversible.
+  def refresh_agent!(agent)
+    @agent = agent if agent
+  end
+
   # Send a user message into the loop. Runs until the model returns a plain
   # assistant reply (no tool calls) or MAX_TURNS is exceeded.
   #
@@ -164,6 +173,45 @@ class AgentSession
   # ─────────────────────────────────────────────────────────────────────
   private
 
+  # Maximum AGENTS.md size we inject, in characters. A runaway AGENTS.md
+  # shouldn't be able to crowd out the actual conversation; oversized files
+  # are truncated with a marker.
+  AGENTS_MD_MAX_CHARS = 32_000
+
+  # The messages array sent for inference: @history with the project's
+  # AGENTS.md injected as a system message directly behind the agent's own
+  # system prompt, exactly once. Read fresh each turn so edits made via
+  # agents_md_write (or by the user) take effect immediately. AGENTS.md is
+  # NEVER persisted into @history — it's re-derived on every send.
+  def outgoing_messages
+    md = agents_md_content
+    return @history if md.nil?
+
+    banner = { role: 'system',
+               content: "# AGENTS.md — project instructions (always in effect)\n\n#{md}" }
+    if @history[0] && @history[0][:role] == 'system'
+      [@history[0], banner, *@history[1..]]
+    else
+      [banner, *@history]
+    end
+  end
+
+  # Current project AGENTS.md text, or nil when absent/empty. Truncated to
+  # AGENTS_MD_MAX_CHARS. Never raises into the inference path.
+  def agents_md_content
+    entry = DirectoryEntry.find_by_project_and_path(@project_id, AgentTools::AGENTS_MD_PATH)
+    return nil unless entry && entry.ftype == 'file' && !entry.binary?
+    txt = entry.get_content.to_s
+    return nil if txt.strip.empty?
+    if txt.length > AGENTS_MD_MAX_CHARS
+      txt = txt[0, AGENTS_MD_MAX_CHARS] + "\n\n[AGENTS.md truncated at #{AGENTS_MD_MAX_CHARS} chars]"
+    end
+    txt
+  rescue => e
+    puts "[AgentSession] AGENTS.md load failed: #{e.class} #{e.message}"
+    nil
+  end
+
   # POST one chat-completion turn. Uses SSE streaming (stream=true) so we can
   # forward partial assistant text and reasoning to the client as it arrives
   # via emit('stream', ...). Accumulates the deltas and returns a hash shaped
@@ -182,7 +230,7 @@ class AgentSession
 
     body = {
       model:    @agent.model,
-      messages: @history,
+      messages: outgoing_messages,
       stream:   true,
     }
     body.merge!(@agent.sampling_params)
