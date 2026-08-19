@@ -117,7 +117,8 @@ class AgentSession
       t = '(image)' if t.empty? && images && !images.empty?
       @convo.update_column(:title, t) unless t.empty?
     end
-    MAX_TURNS.times do |turn|
+    max_turns = agent_max_turns
+    max_turns.times do |turn|
       response = post_chat_completion
       msg      = response.dig('choices', 0, 'message') || {}
       content  = msg['content']
@@ -160,7 +161,7 @@ class AgentSession
       # and loop back so the model can read them and continue.
       calls.each { |call| run_tool_call(call) }
     end
-    emit('error', { message: "agent exceeded MAX_TURNS=#{MAX_TURNS}" })
+    emit('error', { message: "agent exceeded max_turns=#{max_turns}" })
     nil
   rescue => e
     emit('error', { message: "#{e.class}: #{e.message}" })
@@ -172,6 +173,14 @@ class AgentSession
 
   # ─────────────────────────────────────────────────────────────────────
   private
+
+  # Tool-call loop budget for this agent: the per-agent agents.max_turns
+  # override, falling back to the MAX_TURNS default. This is orchestration,
+  # not a sampling param — it is never sent to the model API. See #73.
+  def agent_max_turns
+    v = @agent.respond_to?(:max_turns) ? @agent.max_turns.to_i : 0
+    v.positive? ? v : MAX_TURNS
+  end
 
   # Maximum AGENTS.md size we inject, in characters. A runaway AGENTS.md
   # shouldn't be able to crowd out the actual conversation; oversized files

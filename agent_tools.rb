@@ -33,6 +33,17 @@ module AgentTools
     allowed_slugs.filter_map { |s| REGISTRY.dig(s, :schema) }
   end
 
+  # Metadata for every registered tool, so a client can build its per-agent
+  # allowlist UI from the live registry instead of a hardcoded list. slug is
+  # the registry key; name/description come from the OpenAI schema. This is the
+  # authoritative set of tools the worker can expose. See fdimitri/carbide2#73.
+  def self.catalog
+    REGISTRY.map do |slug, entry|
+      fn = entry.dig(:schema, :function) || {}
+      { slug: slug.to_s, name: (fn[:name] || slug).to_s, description: fn[:description].to_s }
+    end
+  end
+
   # Invoke a tool by name. Returns the tool's result (Hash). Raises
   # ArgumentError if the tool isn't registered or isn't in allowed_slugs.
   # Any exception inside the tool is caught and returned as { error: ... }

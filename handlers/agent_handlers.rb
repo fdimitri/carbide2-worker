@@ -23,6 +23,14 @@ module AgentHandlers
   end
   register 'list', :list
 
+  # Advertise the tools this worker can make available, so the client builds
+  # its per-agent allowlist UI from the live registry rather than a hardcoded
+  # list. See fdimitri/carbide2#73.
+  def self.tools(session, _payload)
+    Command.reply(session, 'agent', 'tools', { tools: AgentTools.catalog })
+  end
+  register 'tools', :tools
+
   # Conversations visible to the requesting user in this project:
   # all 'project'-visibility threads + this user's own 'private' threads.
   def self.recent(session, payload)
