@@ -134,7 +134,9 @@ ALGORITHM     = 'HS256'
 # frames are unaffected).
 # PROTOCOL 3: session/delete + client_version on session create/list, and a
 # stable per-terminal uuid in term/created + term/list. All additive.
-PROTOCOL   = 3
+# PROTOCOL 4: agent/user_turn broadcast (shared conversations, #80) + per-message
+# author on agent user messages (#79). Additive — MIN_CLIENT stays 1.
+PROTOCOL   = 4
 MIN_CLIENT = 1
 
 # Load worker/carbide.yml if present; allows per-machine config without env vars.

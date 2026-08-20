@@ -95,6 +95,39 @@ class AgentSession
     @agent = agent if agent
   end
 
+  # Broadcast a user turn to every other eligible session in the project so
+  # shared conversations stay in sync (#80). The sender has already pushed the
+  # message locally, so exclude only the originating socket — NOT all of the
+  # user's sessions — so the same account on another device still sees it.
+  # Identity is injected from the worker session; the client is never trusted.
+  def broadcast_user_turn(user_id:, name:, text:, images: nil, origin_ws: nil)
+    full = {
+      conversation_id: @conversation_id,
+      user_id:         user_id,
+      name:            name,
+      text:            text,
+    }
+    full[:images] = images if images && !images.empty?
+
+    sessions =
+      if defined?(SESSIONS_BY_PROJECT)
+        (SESSIONS_BY_PROJECT[@project_id] || []).select do |s|
+          s.ws && s.ws != origin_ws &&
+            (@convo.visibility == 'project' || s.user_id == @owner_user_id)
+        end
+      else
+        []
+      end
+
+    sessions.each do |s|
+      begin
+        s.ws.send({ cs: 'agent', cmd: 'user_turn', payload: full }.to_json)
+      rescue => e
+        puts "[AgentSession.broadcast_user_turn] ws send failed: #{e.class} #{e.message}"
+      end
+    end
+  end
+
   # Send a user message into the loop. Runs until the model returns a plain
   # assistant reply (no tool calls) or MAX_TURNS is exceeded.
   #
@@ -104,8 +137,9 @@ class AgentSession
   # encoded as a data: URL). Per #4 in May30-Questions, we assume the model
   # supports vision; non-vision models will return an HTTP error that the
   # caller surfaces via agent/error.
-  def ask(user_text, images: nil)
-    push_history!(role: 'user', content: user_text.to_s, images: images)
+  def ask(user_text, images: nil, author_user_id: nil)
+    push_history!(role: 'user', content: user_text.to_s, images: images,
+                  author_user_id: author_user_id)
     DebugStream.emit(:agent, level: :info,
       message: "ask: #{user_text.to_s[0, 80]}", project_id: @project_id,
       meta: { conversation: @conversation_id[0, 8], chars: user_text.to_s.length,
@@ -400,7 +434,8 @@ class AgentSession
   # still stores plain text only — base64 payloads are too big for the
   # current text column, and conversation replay therefore loses image
   # context. Acceptable for v1.
-  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil, images: nil)
+  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil, images: nil,
+                   author_user_id: nil)
     entry =
       case role
       when 'tool'
@@ -435,7 +470,8 @@ class AgentSession
     persist_calls = tool_calls && !tool_calls.empty? ? tool_calls : nil
     @convo.append!(turn: @turn, role: role, content: content,
                    tool_calls: persist_calls,
-                   tool_call_id: tool_call_id, name: name)
+                   tool_call_id: tool_call_id, name: name,
+                   user_id: author_user_id)
     @turn += 1
   rescue => e
     # Persistence failure is logged but does not kill the conversation —

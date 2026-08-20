@@ -72,11 +72,12 @@ module AgentHandlers
     end
 
     # Replay messages in the wire-shape AgentPane already understands.
-    msgs = convo.agent_messages.order(:turn).to_a
+    # includes(:user) so per-message display-name resolution doesn't N+1.
+    msgs = convo.agent_messages.includes(:user).order(:turn).to_a
     items = msgs.flat_map do |m|
       case m.role
       when 'user'
-        [{ kind: 'user', text: m.content.to_s }]
+        [{ kind: 'user', text: m.content.to_s, user_id: m.user_id, name: m.user&.display_name }]
       when 'assistant'
         out = []
         out << { kind: 'assistant', text: m.content.to_s } if m.content.to_s.strip != ''
@@ -186,7 +187,25 @@ module AgentHandlers
     Command.reply(session, 'agent', 'started',
                   { conversation_id: conv, agent: agent.slug })
 
-    EM.defer { sess.ask(msg, images: images) }
+    # Resolve the display name from the authoritative user record rather than
+    # the JWT claim (session.name is user_email on new control-plane tokens).
+    author = User.find_by(id: session.user_id)
+    name   = author&.display_name || session.name || "user #{session.user_id}"
+
+    # Fan the user turn out to everyone else who is allowed to see this
+    # conversation. The sender pushed it locally already, so exclude only the
+    # originating socket (same user's other sessions still receive it).
+    sess.broadcast_user_turn(
+      user_id:   session.user_id,
+      name:      name,
+      text:      msg,
+      images:    images,
+      origin_ws: session.ws,
+    )
+
+    EM.defer do
+      sess.ask(msg, images: images, author_user_id: session.user_id)
+    end
   end
   register 'ask', :ask
 end
