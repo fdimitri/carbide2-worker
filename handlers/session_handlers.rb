@@ -134,12 +134,10 @@ module SessionHandlers
   register 'patch', :patch
 
   # --- resync (producer replaces the WHOLE doc) ------------------------------
-  # A diff-patch stream can never delete a key the current build doesn't know
-  # about, so a session authored by an older/foreign build accretes defunct keys
-  # forever. resync ships the producer's fully normalized doc (its loadDoc->toDoc
-  # round-trip has already dropped unknown keys and adopted the current shape),
-  # replacing the stored tree wholesale and re-stamping the signature. The client
-  # fires this after resuming a session whose signature differs from its own.
+  # Explicit full-doc replace, not the default resolution for a version/signature
+  # mismatch (that is patch-preserving). Whether this prunes unknown keys is the
+  # CLIENT's choice via its toDoc({sanitize}) flag — the worker just stores the
+  # doc it was sent and records the version write.
   def self.resync(session, payload)
     bs = find_session(session, payload, 'resync') or return
     unless owns?(session, bs)
