@@ -2,6 +2,7 @@ require 'net/http'
 require 'uri'
 require 'json'
 require 'securerandom'
+require 'thread'
 
 require_relative 'agent_tools'
 
@@ -57,6 +58,9 @@ class AgentSession
     @owner_user_id   = session.user_id
     @history         = []
     @turn            = 0  # monotonic AgentMessage row counter
+    @cancel_mutex    = Mutex.new
+    @cancel_requested = false
+    @active_http     = nil   # in-flight Net::HTTP, closed on Stop
 
     # Resume from DB if a conversation with this uuid exists, otherwise
     # create one and seed with the agent's system prompt. We persist
@@ -93,6 +97,21 @@ class AgentSession
   # message would be surprising and isn't reversible.
   def refresh_agent!(agent)
     @agent = agent if agent
+  end
+
+  # Request cancellation of the in-flight turn. Closes the active model HTTP
+  # connection so a mid-stream response aborts promptly, and flips the flag
+  # that the ask loop / shell_exec poll check between work items.
+  def request_cancel!
+    sock = @cancel_mutex.synchronize do
+      @cancel_requested = true
+      @active_http
+    end
+    sock&.finish rescue nil
+  end
+
+  def cancelled?
+    @cancel_mutex.synchronize { @cancel_requested }
   end
 
   # Broadcast a user turn to every other eligible session in the project so
@@ -138,6 +157,7 @@ class AgentSession
   # supports vision; non-vision models will return an HTTP error that the
   # caller surfaces via agent/error.
   def ask(user_text, images: nil, author_user_id: nil)
+    @cancel_mutex.synchronize { @cancel_requested = false }
     push_history!(role: 'user', content: user_text.to_s, images: images,
                   author_user_id: author_user_id)
     DebugStream.emit(:agent, level: :info,
@@ -153,12 +173,14 @@ class AgentSession
     end
     max_turns = agent_max_turns
     max_turns.times do |turn|
+      return emit_stopped(turn) if cancelled?
       response = post_chat_completion
       msg      = response.dig('choices', 0, 'message') || {}
       content  = msg['content']
       reasoning = msg['reasoning_content']
       calls    = msg['tool_calls'] || []
       finish   = response.dig('choices', 0, 'finish_reason')
+      return emit_stopped(turn) if cancelled?
 
       # One-line per-turn trace so we can see exactly what the model did.
       content_preview = content.to_s.gsub(/\s+/, ' ').strip[0, 80]
@@ -193,20 +215,37 @@ class AgentSession
 
       # Execute every tool the model asked for this turn, append the results,
       # and loop back so the model can read them and continue.
-      calls.each { |call| run_tool_call(call) }
+      calls.each do |call|
+        return emit_stopped(turn) if cancelled?
+        run_tool_call(call)
+      end
     end
     emit('error', { message: "agent exceeded max_turns=#{max_turns}" })
     nil
   rescue => e
-    emit('error', { message: "#{e.class}: #{e.message}" })
-    DebugStream.emit(:agent, level: :error,
-      message: "error: #{e.class}: #{e.message}", project_id: @project_id,
-      meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
+    if cancelled?
+      emit_stopped(nil)
+    else
+      emit('error', { message: "#{e.class}: #{e.message}" })
+      DebugStream.emit(:agent, level: :error,
+        message: "error: #{e.class}: #{e.message}", project_id: @project_id,
+        meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
+    end
     nil
   end
 
   # ─────────────────────────────────────────────────────────────────────
   private
+
+  # Broadcast a cancellation of the current turn to the same audience as
+  # other agent events. turn is informational (nil when we bailed mid-HTTP).
+  def emit_stopped(turn)
+    emit('stopped', { reason: 'cancelled', turn: turn }.compact)
+    DebugStream.emit(:agent, level: :info,
+      message: "stopped turn=#{turn.inspect}", project_id: @project_id,
+      meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
+    nil
+  end
 
   # Tool-call loop budget for this agent: the per-agent agents.max_turns
   # override, falling back to the MAX_TURNS default. This is orchestration,
@@ -288,6 +327,7 @@ class AgentSession
     http.use_ssl = uri.scheme == 'https'
     http.open_timeout = 10
     http.read_timeout = TIMEOUT_S
+    @cancel_mutex.synchronize { @active_http = http }
 
     content   = +''
     reasoning = +''
@@ -296,51 +336,55 @@ class AgentSession
     buffer    = +''
     saw_sse   = false
 
-    http.request(req) do |resp|
-      unless resp.is_a?(Net::HTTPSuccess)
-        errbody = (resp.read_body rescue '')
-        raise "model server #{resp.code}: #{errbody.to_s[0, 300]}"
-      end
+    begin
+      http.request(req) do |resp|
+        unless resp.is_a?(Net::HTTPSuccess)
+          errbody = (resp.read_body rescue '')
+          raise "model server #{resp.code}: #{errbody.to_s[0, 300]}"
+        end
 
-      resp.read_body do |chunk|
-        buffer << chunk
-        while (nl = buffer.index("\n"))
-          line = buffer.slice!(0..nl).chomp
-          next if line.empty? || line.start_with?(':')   # blank or SSE comment
-          next unless line.start_with?('data:')
-          saw_sse = true
-          data = line.sub(/\Adata:\s*/, '')
-          next if data == '[DONE]'
-          begin
-            json = JSON.parse(data)
-          rescue JSON::ParserError
-            next
-          end
-          choice = (json['choices'] || [])[0] || {}
-          delta  = choice['delta'] || {}
-          finish = choice['finish_reason'] if choice['finish_reason']
+        resp.read_body do |chunk|
+          buffer << chunk
+          while (nl = buffer.index("\n"))
+            line = buffer.slice!(0..nl).chomp
+            next if line.empty? || line.start_with?(':')   # blank or SSE comment
+            next unless line.start_with?('data:')
+            saw_sse = true
+            data = line.sub(/\Adata:\s*/, '')
+            next if data == '[DONE]'
+            begin
+              json = JSON.parse(data)
+            rescue JSON::ParserError
+              next
+            end
+            choice = (json['choices'] || [])[0] || {}
+            delta  = choice['delta'] || {}
+            finish = choice['finish_reason'] if choice['finish_reason']
 
-          if (c = delta['content']) && !c.empty?
-            content << c
-            emit('stream', { delta: c })
-          end
-          if (r = delta['reasoning_content']) && !r.empty?
-            reasoning << r
-            emit('stream', { reasoning_delta: r })
-          end
-          Array(delta['tool_calls']).each do |tc|
-            idx = tc['index'] || 0
-            acc = (tool_acc[idx] ||= {
-              'id' => nil, 'type' => 'function',
-              'function' => { 'name' => +'', 'arguments' => +'' },
-            })
-            acc['id'] = tc['id'] if tc['id']
-            fn = tc['function'] || {}
-            acc['function']['name']      << fn['name']      if fn['name']
-            acc['function']['arguments'] << fn['arguments'] if fn['arguments']
+            if (c = delta['content']) && !c.empty?
+              content << c
+              emit('stream', { delta: c })
+            end
+            if (r = delta['reasoning_content']) && !r.empty?
+              reasoning << r
+              emit('stream', { reasoning_delta: r })
+            end
+            Array(delta['tool_calls']).each do |tc|
+              idx = tc['index'] || 0
+              acc = (tool_acc[idx] ||= {
+                'id' => nil, 'type' => 'function',
+                'function' => { 'name' => +'', 'arguments' => +'' },
+              })
+              acc['id'] = tc['id'] if tc['id']
+              fn = tc['function'] || {}
+              acc['function']['name']      << fn['name']      if fn['name']
+              acc['function']['arguments'] << fn['arguments'] if fn['arguments']
+            end
           end
         end
       end
+    ensure
+      @cancel_mutex.synchronize { @active_http = nil }
     end
 
     # Fallback: server ignored stream=true and returned a whole JSON body.
@@ -377,6 +421,7 @@ class AgentSession
       project_id:    @project_id,
       args:          args,
       agent:         @agent,
+      cancel_check:  -> { cancelled? },
     )
 
     emit('tool_result', { tool: fn_name, call_id: call_id, result: result })

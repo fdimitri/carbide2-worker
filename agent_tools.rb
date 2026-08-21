@@ -52,14 +52,15 @@ module AgentTools
   # `agent:` is the Agent record — passed to callables that need per-agent
   # capability gates beyond the allowed_slugs list (currently: shell_exec
   # also requires agent.shell_exec_enabled).
-  def self.invoke(slug, allowed_slugs:, session:, project_id:, args:, agent: nil)
+  def self.invoke(slug, allowed_slugs:, session:, project_id:, args:, agent: nil,
+                  cancel_check: nil)
     unless allowed_slugs.include?(slug)
       raise ArgumentError, "tool #{slug.inspect} not allowed for this agent"
     end
     entry = REGISTRY[slug] or raise ArgumentError, "unknown tool #{slug.inspect}"
     begin
       entry[:callable].call(session: session, project_id: project_id,
-                            args: args, agent: agent)
+                            args: args, agent: agent, cancel_check: cancel_check)
     rescue => e
       { error: "#{e.class}: #{e.message}" }
     end
@@ -426,7 +427,7 @@ module AgentTools
         },
       },
     }
-  ) do |session:, project_id:, args:, agent:|
+  ) do |session:, project_id:, args:, agent:, cancel_check:|
     # Two-layer gate: allowed_slugs already passed (we're inside the block);
     # also require the per-agent boolean.
     unless agent&.shell_exec_enabled
@@ -499,7 +500,13 @@ module AgentTools
 
       deadline  = Time.now + timeout_s
       timed_out = true
+      interrupted = false
       while Time.now < deadline
+        if cancel_check&.call
+          term.agent_interrupt!
+          interrupted = true
+          break
+        end
         sleep SHELL_EXEC_POLL_S
         done = mutex.synchronize do
           last_osc_at && (Time.now - last_osc_at) >= SHELL_EXEC_QUIET_S
@@ -533,7 +540,10 @@ module AgentTools
       end
       truncated ||= hit
 
-      if timed_out
+      if interrupted
+        { terminal_id: tid, exit_code: nil, output: clean,
+          truncated: truncated, interrupted: true }
+      elsif timed_out
         { terminal_id: tid, exit_code: nil, output: clean,
           truncated: truncated, timed_out: true,
           error: "command did not finish within #{timeout_s}s" }

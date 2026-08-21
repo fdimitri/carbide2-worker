@@ -140,6 +140,25 @@ module AgentHandlers
   end
   register 'set_visibility', :set_visibility
 
+  # Interrupt an in-flight turn. Any project member who can see the
+  # conversation may stop it (project-visible => all members; private => owner
+  # only) — matches the existing "any member may post" rule for shared threads.
+  def self.stop(session, payload)
+    conv = payload['conversation_id'].to_s
+    sess = AgentSession.find(conv)
+    unless sess && sess.convo&.project_id == session.project_id
+      Command.error(session, 'agent/stop: conversation not found in this project')
+      return
+    end
+    unless sess.convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/stop: conversation is private')
+      return
+    end
+    sess.request_cancel!
+    Command.reply(session, 'agent', 'stopping', { conversation_id: conv })
+  end
+  register 'stop', :stop
+
   def self.ask(session, payload)
     slug   = payload['agent_slug'].to_s
     msg    = payload['message'].to_s
