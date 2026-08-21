@@ -59,6 +59,27 @@ module AgentHandlers
   end
   register 'recent', :recent
 
+  # Create a conversation WITHOUT a message (#85): the client gets the
+  # worker-minted UUID up front, writes its tab as agent:<uuid>, then sends the
+  # first ask against that id. This avoids any temp-key → real-id promotion of an
+  # optimistic first message.
+  def self.create(session, payload)
+    slug = payload['agent_slug'].to_s
+    agent = Agent.enabled.find_by(slug: slug)
+    unless agent
+      Command.error(session, "agent/create: no enabled agent with slug=#{slug}")
+      return
+    end
+    conv = SecureRandom.uuid
+    AgentSession.start(session: session, agent: agent,
+                       project_id: session.project_id,
+                       conversation_id: conv)
+    AgentSession.subscribe(session, conv)
+    session.agent_subs << conv unless session.agent_subs.include?(conv)
+    Command.reply(session, 'agent', 'created', { conversation_id: conv, agent: agent.slug })
+  end
+  register 'create', :create
+
   def self.load(session, payload)
     conv  = payload['conversation_id'].to_s
     convo = AgentConversation.find_by(uuid: conv)
