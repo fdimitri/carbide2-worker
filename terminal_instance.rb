@@ -217,8 +217,13 @@ class TerminalInstance
   end
 
   def add_client(ws)
+    already = @clients.key?(ws.object_id)
     @clients[ws.object_id] = ws
-    replay_to_client(ws)
+    # One WebSocket per project means two panes viewing the same terminal are
+    # the SAME client entry (keyed by ws.object_id). Replay only on the first
+    # add — a second join for the same ws must not re-send the full scrollback,
+    # otherwise the already-visible pane appends it a second time (#89).
+    replay_to_client(ws) unless already
   end
 
   def remove_client(ws)
