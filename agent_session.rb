@@ -39,8 +39,56 @@ class AgentSession
   # conversation. Keyed by conversation_id (client-provided UUID).
   @@sessions = {}
 
+  # Delivery membership (#85): conversation_id => { ws => Session }.
+  # Authorization happens at subscribe time (agent/subscribe checks
+  # visible_to?); emit then fans out to subscribers ONLY — no project-wide
+  # broadcast, no visibility branch in the hot path.
+  @@subscribers = {}
+
   def self.find(conversation_id)
     @@sessions[conversation_id]
+  end
+
+  def self.subscribers(conversation_id)
+    @@subscribers[conversation_id] ||= {}
+  end
+
+  def self.subscribe(session, conversation_id)
+    subscribers(conversation_id)[session.ws] = session
+  end
+
+  def self.unsubscribe(session, conversation_id)
+    subs = @@subscribers[conversation_id]
+    return unless subs
+    subs.delete(session.ws)
+    @@subscribers.delete(conversation_id) if subs.empty?
+  end
+
+  # Drop subscribers who are no longer allowed to see this conversation
+  # (e.g. after a project → private visibility flip).
+  def self.prune_unauthorized(conversation_id)
+    subs = @@subscribers[conversation_id]
+    return unless subs
+    convo = AgentConversation.find_by(uuid: conversation_id)
+    subs.delete_if { |_ws, s| convo && !convo.visible_to?(s.user_id) }
+    @@subscribers.delete(conversation_id) if subs.empty?
+  end
+
+  # Send an `agent` frame to this conversation's subscribers (optionally
+  # excluding the originating socket). Used for scoped notifications such as
+  # visibility_changed.
+  def self.broadcast(conversation_id, cmd, payload, origin_ws: nil)
+    msg = { cs: 'agent', cmd: cmd, payload: payload }.to_json
+    targets = subscribers(conversation_id).values
+    targets = targets.reject { |s| s.ws == origin_ws } if origin_ws
+    targets.each do |s|
+      next unless s.ws
+      begin
+        s.ws.send(msg)
+      rescue => e
+        puts "[AgentSession.broadcast] ws send failed: #{e.class} #{e.message}"
+      end
+    end
   end
 
   def self.start(session:, agent:, project_id:, conversation_id:)
@@ -114,11 +162,11 @@ class AgentSession
     @cancel_mutex.synchronize { @cancel_requested }
   end
 
-  # Broadcast a user turn to every other eligible session in the project so
-  # shared conversations stay in sync (#80). The sender has already pushed the
-  # message locally, so exclude only the originating socket — NOT all of the
-  # user's sessions — so the same account on another device still sees it.
-  # Identity is injected from the worker session; the client is never trusted.
+  # Broadcast a user turn to the conversation's other subscribers (#80/#85).
+  # The sender has already pushed the message locally, so exclude only the
+  # originating socket — NOT all of the user's sessions — so the same account
+  # on another device still sees it. Identity is injected from the worker
+  # session; the client is never trusted.
   def broadcast_user_turn(user_id:, name:, text:, images: nil, origin_ws: nil)
     full = {
       conversation_id: @conversation_id,
@@ -128,17 +176,7 @@ class AgentSession
     }
     full[:images] = images if images && !images.empty?
 
-    sessions =
-      if defined?(SESSIONS_BY_PROJECT)
-        (SESSIONS_BY_PROJECT[@project_id] || []).select do |s|
-          s.ws && s.ws != origin_ws &&
-            (@convo.visibility == 'project' || s.user_id == @owner_user_id)
-        end
-      else
-        []
-      end
-
-    sessions.each do |s|
+    delivery_sessions(origin_ws: origin_ws).each do |s|
       begin
         s.ws.send({ cs: 'agent', cmd: 'user_turn', payload: full }.to_json)
       rescue => e
@@ -160,10 +198,10 @@ class AgentSession
     @cancel_mutex.synchronize { @cancel_requested = false }
     push_history!(role: 'user', content: user_text.to_s, images: images,
                   author_user_id: author_user_id)
-    DebugStream.emit(:agent, level: :info,
-      message: "ask: #{user_text.to_s[0, 80]}", project_id: @project_id,
+    debug_agent(level: :info,
+      message: "ask: #{user_text.to_s[0, 80]}",
       meta: { conversation: @conversation_id[0, 8], chars: user_text.to_s.length,
-              images: images&.size.to_i, agent: @agent.name }) if defined?(DebugStream)
+              images: images&.size.to_i, agent: @agent.name })
     # Auto-title from first user message so the recent-conversations
     # dropdown shows something useful. Owner can rename later.
     if @convo.title.blank?
@@ -204,12 +242,11 @@ class AgentSession
           finish_reason: finish,
           reasoning:     reasoning,
         }.compact)
-        DebugStream.emit(:agent, level: finish == 'length' ? :warn : :info,
+        debug_agent(level: finish == 'length' ? :warn : :info,
           message: "done turn=#{turn} finish=#{finish} chars=#{content.to_s.length}",
-          project_id: @project_id,
           meta: { conversation: @conversation_id[0, 8], turn: turn,
                   finish_reason: finish, chars: content.to_s.length,
-                  reasoning_chars: reasoning.to_s.length }) if defined?(DebugStream)
+                  reasoning_chars: reasoning.to_s.length })
         return content.to_s
       end
 
@@ -227,9 +264,9 @@ class AgentSession
       emit_stopped(nil)
     else
       emit('error', { message: "#{e.class}: #{e.message}" })
-      DebugStream.emit(:agent, level: :error,
-        message: "error: #{e.class}: #{e.message}", project_id: @project_id,
-        meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
+      debug_agent(level: :error,
+        message: "error: #{e.class}: #{e.message}",
+        meta: { conversation: @conversation_id[0, 8] })
     end
     nil
   end
@@ -241,9 +278,9 @@ class AgentSession
   # other agent events. turn is informational (nil when we bailed mid-HTTP).
   def emit_stopped(turn)
     emit('stopped', { reason: 'cancelled', turn: turn }.compact)
-    DebugStream.emit(:agent, level: :info,
-      message: "stopped turn=#{turn.inspect}", project_id: @project_id,
-      meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
+    debug_agent(level: :info,
+      message: "stopped turn=#{turn.inspect}",
+      meta: { conversation: @conversation_id[0, 8] })
     nil
   end
 
@@ -441,33 +478,40 @@ class AgentSession
     { '_raw' => raw }
   end
 
-  # Fan agent events out to every client in the project who is allowed to
-  # see this conversation. 'project'-visibility conversations broadcast to
-  # all project sessions; 'private' conversations only go to the owner's
-  # sessions. Falls back to the originating ws if SESSIONS_BY_PROJECT is
-  # missing (e.g. in tests).
+  # Fan agent events out to this conversation's subscribers only (#85).
+  # Falls back to the originating session when nothing is subscribed yet
+  # (e.g. tests).
   def emit(cmd, payload)
     full = payload.merge(conversation_id: @conversation_id, agent: @agent.slug)
     msg  = { cs: 'agent', cmd: cmd, payload: full }.to_json
 
-    sessions =
-      if defined?(SESSIONS_BY_PROJECT)
-        (SESSIONS_BY_PROJECT[@project_id] || []).select do |s|
-          @convo.visibility == 'project' || s.user_id == @owner_user_id
-        end
-      else
-        []
-      end
-    sessions = [@session] if sessions.empty? && @session
-
-    sessions.each do |s|
-      next unless s.ws
+    delivery_sessions.each do |s|
       begin
         s.ws.send(msg)
       rescue => e
         puts "[AgentSession.emit] ws send failed: #{e.class} #{e.message}"
       end
     end
+  end
+
+  private
+
+  # Subscriber sessions for delivery, optionally excluding an origin socket.
+  def delivery_sessions(origin_ws: nil)
+    subs = self.class.subscribers(@conversation_id).values
+    subs = [@session] if subs.empty? && @session
+    subs = subs.reject { |s| s.ws == origin_ws } if origin_ws
+    subs.select { |s| s.ws }
+  end
+
+  # Agent debug events are only project-visible (private conversations must not
+  # leak ask text / turn metadata to project debug subscribers). Suppress
+  # entirely for private conversations; project-visible is safe project-wide.
+  def debug_agent(level:, message:, meta: {})
+    return unless defined?(DebugStream)
+    return unless @convo&.visibility == 'project'
+    DebugStream.emit(:agent, level: level, message: message,
+                     project_id: @project_id, meta: meta)
   end
 
   # Append a message to both the in-memory @history and the persistent

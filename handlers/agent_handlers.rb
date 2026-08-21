@@ -112,6 +112,36 @@ module AgentHandlers
   end
   register 'load', :load
 
+  # --- subscribe (delivery membership, #85) ---------------------------------
+  # Authorization lives here: a client may subscribe only to a conversation it
+  # is allowed to see. Once subscribed, AgentSession#emit fans out to
+  # subscribers only — no project-wide broadcast, no visibility branch at emit.
+  def self.subscribe(session, payload)
+    conv = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/subscribe: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/subscribe: conversation is private')
+      return
+    end
+    AgentSession.subscribe(session, conv)
+    session.agent_subs << conv unless session.agent_subs.include?(conv)
+    Command.reply(session, 'agent', 'subscribed', { conversation_id: conv })
+  end
+  register 'subscribe', :subscribe
+
+  def self.unsubscribe(session, payload)
+    conv = payload['conversation_id'].to_s
+    return if conv.empty?
+    AgentSession.unsubscribe(session, conv)
+    session.agent_subs.delete(conv)
+    Command.reply(session, 'agent', 'unsubscribed', { conversation_id: conv })
+  end
+  register 'unsubscribe', :unsubscribe
+
   def self.set_visibility(session, payload)
     conv = payload['conversation_id'].to_s
     vis  = payload['visibility'].to_s
@@ -130,9 +160,16 @@ module AgentHandlers
       return
     end
     convo.update!(visibility: vis)
-    # Tell every project client to refresh their dropdown (visibility
-    # changes can grant or revoke access).
-    Command.broadcast_project(session.project_id, 'agent', 'visibility_changed', {
+    # Prune subscribers who lost access (project → private), then notify only
+    # the authorized audience. Never project-wide for a private thread;
+    # private → project is discovered manually via `recent` (no push).
+    AgentSession.prune_unauthorized(conv)
+    AgentSession.broadcast(conv, 'visibility_changed', {
+      conversation_id: conv,
+      visibility:      vis,
+      owner_user_id:   convo.user_id,
+    }, origin_ws: session.ws)
+    Command.reply(session, 'agent', 'visibility_changed', {
       conversation_id: conv,
       visibility:      vis,
       owner_user_id:   convo.user_id,
@@ -202,6 +239,11 @@ module AgentHandlers
                                 project_id: session.project_id,
                                 conversation_id: conv)
     end
+    # The asker is an implicit subscriber (delivery membership). Explicit
+    # subscribe is also available for opening/loading a conversation without
+    # asking.
+    AgentSession.subscribe(session, conv)
+    session.agent_subs << conv unless session.agent_subs.include?(conv)
     # Ack immediately so the UI can show the conversation id.
     Command.reply(session, 'agent', 'started',
                   { conversation_id: conv, agent: agent.slug })
