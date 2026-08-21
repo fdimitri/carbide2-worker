@@ -56,26 +56,32 @@ module SessionHandlers
     from_uuid = payload['from_uuid'].to_s
     bs =
       if from_uuid.empty?
+        dv = payload['doc_version']
         BrowserSession.create!(user: user, name: payload['name'],
                                client_version: payload['client_version'],
                                client_sha: payload['client_sha'],
-                               doc_version: payload['doc_version'],
+                               doc_version: dv,
+                               # Fresh doc was just written by this build.
+                               version_history: (dv ? [dv.to_i] : []),
                                doc: payload['doc'].is_a?(Hash) ? payload['doc'] : {})
       else
         src = BrowserSession.find_by(session_uuid: from_uuid)
         return Command.error(session, "cannot fork unknown session: #{from_uuid}") unless src
         forked = src.fork_for(user)
-        # A fork adopts the FORKING client's build fingerprints (its doc will now
-        # be driven by this build), not the source's.
+        # A fork adopts the FORKING client's build fingerprints (its doc will
+        # now be driven by this build), not the source's. doc_version and
+        # version_history stay FAITHFUL to the parent (copied by fork_for) so the
+        # clone still describes the content it inherited.
         forked.update!(client_version: payload['client_version'],
-                       client_sha: payload['client_sha'],
-                       doc_version: payload['doc_version'])
+                       client_sha: payload['client_sha'])
         forked
       end
 
     subscribe_ws(session, bs, role: 'producer')
     Command.reply(session, 'session', 'created',
                   { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc,
+                    client_sha: bs.client_sha, doc_version: bs.doc_version,
+                    version_history: bs.version_history,
                     forked_from: bs.forked_from&.session_uuid })
   end
   register 'create', :create
@@ -90,7 +96,9 @@ module SessionHandlers
     subscribe_ws(session, bs, role: 'producer')
     Command.reply(session, 'session', 'resumed',
                   { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc,
-                    client_sha: bs.client_sha, doc_version: bs.doc_version })
+                    client_sha: bs.client_sha, doc_version: bs.doc_version,
+                    version_history: bs.version_history,
+                    forked_from: bs.forked_from&.session_uuid })
   end
   register 'resume', :resume
 
@@ -111,8 +119,10 @@ module SessionHandlers
     # Re-stamp the LAST-WRITER signature: the fingerprint describes the bytes on
     # disk, and the producer that just wrote them is the honest author. Only
     # overwrite when the producer supplied a value (nil payload leaves it as-is).
+    # doc_version is last-writer-wins AND appends to version_history via
+    # record_version! (sequential-duplicate collapsed).
     bs.client_sha  = payload['client_sha']  if payload.key?('client_sha')
-    bs.doc_version = payload['doc_version'] if payload.key?('doc_version')
+    bs.record_version!(payload['doc_version']) if payload.key?('doc_version')
     bs.save!              # persist on every patch (settled: save every update)
 
     # Live relay to WATCHERS (not the producer that sent it). The in-memory
@@ -141,7 +151,7 @@ module SessionHandlers
 
     bs.doc         = doc
     bs.client_sha  = payload['client_sha']  if payload.key?('client_sha')
-    bs.doc_version = payload['doc_version'] if payload.key?('doc_version')
+    bs.record_version!(payload['doc_version']) if payload.key?('doc_version')
     bs.save!
 
     # Watchers get a full snapshot (not path ops) since the whole tree changed.
@@ -160,7 +170,9 @@ module SessionHandlers
     bs = find_session(session, payload, 'subscribe') or return
     subscribe_ws(session, bs, role: 'watcher')
     Command.reply(session, 'session', 'snapshot',
-                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc,
+                    doc_version: bs.doc_version, version_history: bs.version_history,
+                    forked_from: bs.forked_from&.session_uuid })
   end
   register 'subscribe', :subscribe
 
@@ -199,7 +211,9 @@ module SessionHandlers
   def self.snapshot(session, payload)
     bs = find_session(session, payload, 'snapshot') or return
     Command.reply(session, 'session', 'snapshot',
-                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc })
+                  { session_uuid: bs.session_uuid, name: bs.name, doc: bs.doc,
+                    doc_version: bs.doc_version, version_history: bs.version_history,
+                    forked_from: bs.forked_from&.session_uuid })
   end
   register 'snapshot', :snapshot
 
@@ -224,6 +238,8 @@ module SessionHandlers
                       client_version: bs.client_version,
                       client_sha: bs.client_sha,
                       doc_version: bs.doc_version,
+                      version_history: bs.version_history,
+                      forked_from: bs.forked_from&.session_uuid,
                       updated_at: bs.updated_at, created_at: bs.created_at,
                       in_use: in_use?(bs.session_uuid) } } })
   end
