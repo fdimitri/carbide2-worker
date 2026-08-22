@@ -109,6 +109,11 @@ class AgentSession
     @cancel_mutex    = Mutex.new
     @cancel_requested = false
     @active_http     = nil   # in-flight Net::HTTP, closed on Stop
+    # Serializes the tool-call loop per conversation. agent/ask runs on
+    # EM.defer, so without this a second ask could interleave @history/@turn and
+    # clear the cancel flag for an in-flight turn.
+    @turn_mutex      = Mutex.new
+    @turn_in_progress = false
 
     # Resume from DB if a conversation with this uuid exists, otherwise
     # create one and seed with the agent's system prompt. We persist
@@ -160,6 +165,24 @@ class AgentSession
 
   def cancelled?
     @cancel_mutex.synchronize { @cancel_requested }
+  end
+
+  # Acquire the per-conversation turn lock. Returns true if this caller may
+  # begin a turn; false if one is already in flight. agent/ask checks this on
+  # the reactor thread BEFORE EM.defer so a second ask (or Stop + quick
+  # resend) is rejected rather than interleaving @history/@turn.
+  def try_begin_turn!
+    @turn_mutex.synchronize do
+      return false if @turn_in_progress
+      @turn_in_progress = true
+      true
+    end
+  end
+
+  # Release the turn lock. Called from an ensure on the deferred ask so it runs
+  # even if the model call raises.
+  def finish_turn!
+    @turn_mutex.synchronize { @turn_in_progress = false }
   end
 
   # Broadcast a user turn to the conversation's other subscribers (#80/#85).

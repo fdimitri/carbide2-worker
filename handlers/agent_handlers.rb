@@ -260,6 +260,15 @@ module AgentHandlers
                                 project_id: session.project_id,
                                 conversation_id: conv)
     end
+
+    # Serialize turns per conversation. agent/ask runs on EM.defer, so without
+    # this a second ask (or Stop then a quick resend) could clear the cancel
+    # flag for an in-flight loop and interleave @history/@turn.
+    unless sess.try_begin_turn!
+      Command.error(session, 'agent/ask: a turn is already in progress for this conversation')
+      return
+    end
+
     # The asker is an implicit subscriber (delivery membership). Explicit
     # subscribe is also available for opening/loading a conversation without
     # asking.
@@ -286,7 +295,11 @@ module AgentHandlers
     )
 
     EM.defer do
-      sess.ask(msg, images: images, author_user_id: session.user_id)
+      begin
+        sess.ask(msg, images: images, author_user_id: session.user_id)
+      ensure
+        sess.finish_turn!
+      end
     end
   end
   register 'ask', :ask

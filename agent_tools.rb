@@ -213,6 +213,11 @@ module AgentTools
   # Returns the stored FileChange rows.
   def self.commit_changes!(project_id:, entry:, specs:, user_id:)
     return [] if specs.empty?
+
+    # Hydrate the live buffer BEFORE persisting so a cache miss replays only
+    # pre-write rows; apply! then advances by exactly the rows just written.
+    cached = defined?(Document) ? Document.for(entry) : nil
+
     stored = ActiveRecord::Base.transaction do
       specs.map do |ch|
         FileChange.append!(
@@ -230,7 +235,6 @@ module AgentTools
 
     # Advance the in-memory buffer with the same changes (JSON form, so the
     # cache replays them through the exact path calc_current uses).
-    cached = defined?(Document) ? Document.for(entry) : nil
     specs.each { |ch| cached&.apply!(ch[:change_type], ch[:change_data].to_json) }
 
     key   = "#{project_id}:#{entry.srcpath}"
