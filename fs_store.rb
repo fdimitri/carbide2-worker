@@ -77,7 +77,7 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if entry.binary?
 
-    content = entry.calc_current
+    content = entry.get_content
     send_fn.call(session.ws, 'fs', 'content', {
       path:    entry.srcpath,
       content: content
@@ -188,6 +188,12 @@ module FsStore
     entry = find_entry!(session.project_id, path)
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
 
+    # Hydrate the live buffer BEFORE persisting so a cache miss replays only
+    # pre-write rows. apply! then advances it by exactly the rows just written.
+    # (Order matters: hydrate-after-persist would replay the new rows during
+    # cache construction and then apply! them a second time.)
+    cached = Document.for(entry)
+
     stored = ActiveRecord::Base.transaction do
       changes.map do |ch|
         FileChange.append!(
@@ -207,6 +213,9 @@ module FsStore
       path:      entry.srcpath,
       revisions: stored.map(&:revision)
     })
+
+    # Advance the in-memory buffer with the same changes we just persisted.
+    changes.each { |ch| cached&.apply!(ch['change_type'], ch['change_data']) }
 
     # Broadcast only to clients that have this file open
     key   = "#{session.project_id}:#{entry.srcpath}"
@@ -235,6 +244,9 @@ module FsStore
     content = payload['content'].to_s
     entry   = find_entry!(session.project_id, path)
 
+    # Hydrate the live buffer BEFORE persisting (see handle_write for why).
+    cached = Document.for(entry)
+
     fc = ActiveRecord::Base.transaction do
       FileChange.append!(
         directory_entry_id: entry.id,
@@ -247,6 +259,7 @@ module FsStore
     end
 
     send_fn.call(session.ws, 'fs', 'written', { path: entry.srcpath, revisions: [fc.revision] })
+    cached&.apply!('setContents', content)
     key   = "#{session.project_id}:#{entry.srcpath}"
     doc   = OPEN_DOCUMENTS[key]
     peers = doc ? doc.others(session.ws) : []
@@ -301,6 +314,8 @@ module FsStore
     entry    = find_entry!(session.project_id, path)
     old_path = entry.srcpath
     entry.rename!(new_name)
+    Document.forget(old_path)
+    Document.forget(entry.srcpath)
 
     send_fn.call(session.ws, 'fs', 'renamed', { old_path: old_path, new_path: entry.srcpath, id: entry.id })
     peers = other_project_sessions(session, sessions_by_project)
@@ -317,25 +332,33 @@ module FsStore
     entry = find_entry!(session.project_id, path)
     entry_path = entry.srcpath
 
-    # Collect every descendant srcpath FIRST, then destroy the DB row. After
-    # destroy ActiveRecord's dependent: :destroy has already cascaded, so we
-    # need the list in advance. Mark each abs path in the suppress-set so the
-    # VfsWatcher doesn't try to handle the resulting :delete inotify event as
-    # an external mutation. Fixes #12 in May30-Questions.md.
-    flusher  = VFS_FLUSHERS[session.project_id]
-    root     = flusher&.root_path
-    abs_path = root ? File.join(root, entry_path) : nil
+    # Collect every descendant srcpath BEFORE destroying the DB row. After
+    # destroy, ActiveRecord's dependent: :destroy has already cascaded, so we
+    # need the list in advance to (a) forget each live Document buffer the DB
+    # cascade never touches, and (b) suppress each resulting inotify :delete as
+    # an external mutation. Fixes #12 in May30-Questions.md + Cursor PR #5.
+    descendant_paths =
+      DirectoryEntry.where(project_id: session.project_id)
+        .where('srcpath = ? OR srcpath LIKE ?', entry_path, "#{entry_path.chomp('/')}/%")
+        .pluck(:srcpath)
+
+    flusher = VFS_FLUSHERS[session.project_id]
+    root    = flusher&.root_path
 
     entry.destroy!
+    descendant_paths.each { |p| Document.forget(p) }
 
-    if root && abs_path
-      flusher.suppress_set&.add(abs_path)
-      begin
-        FileUtils.rm_rf(abs_path)
-      rescue => e
-        puts "[FsStore] disk delete failed for #{abs_path}: #{e.class}: #{e.message}"
-      ensure
-        EM.add_timer(1) { flusher.suppress_set&.delete(abs_path) }
+    if root
+      descendant_paths.each do |p|
+        abs_path = File.join(root, p)
+        flusher.suppress_set&.add(abs_path)
+        begin
+          FileUtils.rm_rf(abs_path)
+        rescue => e
+          puts "[FsStore] disk delete failed for #{abs_path}: #{e.class}: #{e.message}"
+        ensure
+          EM.add_timer(1) { flusher.suppress_set&.delete(abs_path) }
+        end
       end
     end
 

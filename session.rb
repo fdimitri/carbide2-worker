@@ -1,6 +1,6 @@
 # Session tracks per-connection identity and subscriptions.
 class Session
-  attr_reader :ws, :user_id, :name, :project_id, :terminals, :rooms, :open_files, :session_subs
+  attr_reader :ws, :user_id, :name, :project_id, :terminals, :rooms, :open_files, :session_subs, :agent_subs
   # Unix timestamp (seconds) at which the presenting JWT expires. The socket is
   # forcibly closed once this lapses (plus a small grace) unless the client
   # presents a fresh token via system/reauth first. nil means "no exp claim"
@@ -19,6 +19,7 @@ class Session
     @rooms      = []  # room_ids joined
     @open_files = []  # normalized paths currently open
     @session_subs = []  # browser-session uuids this ws is subscribed to
+    @agent_subs   = []  # agent conversation ids this ws is subscribed to (#85)
   end
 
   # Adopt a freshly-minted token (already validated) without dropping the
@@ -65,5 +66,9 @@ class Session
       SESSION_SUBSCRIBERS.delete(uuid) if subs.empty?
     end
     @session_subs.clear
+    @agent_subs.dup.each do |conversation_id|
+      AgentSession.unsubscribe(self, conversation_id)
+    end
+    @agent_subs.clear
   end
 end

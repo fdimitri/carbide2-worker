@@ -2,6 +2,7 @@ require 'net/http'
 require 'uri'
 require 'json'
 require 'securerandom'
+require 'thread'
 
 require_relative 'agent_tools'
 
@@ -38,8 +39,56 @@ class AgentSession
   # conversation. Keyed by conversation_id (client-provided UUID).
   @@sessions = {}
 
+  # Delivery membership (#85): conversation_id => { ws => Session }.
+  # Authorization happens at subscribe time (agent/subscribe checks
+  # visible_to?); emit then fans out to subscribers ONLY — no project-wide
+  # broadcast, no visibility branch in the hot path.
+  @@subscribers = {}
+
   def self.find(conversation_id)
     @@sessions[conversation_id]
+  end
+
+  def self.subscribers(conversation_id)
+    @@subscribers[conversation_id] ||= {}
+  end
+
+  def self.subscribe(session, conversation_id)
+    subscribers(conversation_id)[session.ws] = session
+  end
+
+  def self.unsubscribe(session, conversation_id)
+    subs = @@subscribers[conversation_id]
+    return unless subs
+    subs.delete(session.ws)
+    @@subscribers.delete(conversation_id) if subs.empty?
+  end
+
+  # Drop subscribers who are no longer allowed to see this conversation
+  # (e.g. after a project → private visibility flip).
+  def self.prune_unauthorized(conversation_id)
+    subs = @@subscribers[conversation_id]
+    return unless subs
+    convo = AgentConversation.find_by(uuid: conversation_id)
+    subs.delete_if { |_ws, s| convo && !convo.visible_to?(s.user_id) }
+    @@subscribers.delete(conversation_id) if subs.empty?
+  end
+
+  # Send an `agent` frame to this conversation's subscribers (optionally
+  # excluding the originating socket). Used for scoped notifications such as
+  # visibility_changed.
+  def self.broadcast(conversation_id, cmd, payload, origin_ws: nil)
+    msg = { cs: 'agent', cmd: cmd, payload: payload }.to_json
+    targets = subscribers(conversation_id).values
+    targets = targets.reject { |s| s.ws == origin_ws } if origin_ws
+    targets.each do |s|
+      next unless s.ws
+      begin
+        s.ws.send(msg)
+      rescue => e
+        puts "[AgentSession.broadcast] ws send failed: #{e.class} #{e.message}"
+      end
+    end
   end
 
   def self.start(session:, agent:, project_id:, conversation_id:)
@@ -57,6 +106,14 @@ class AgentSession
     @owner_user_id   = session.user_id
     @history         = []
     @turn            = 0  # monotonic AgentMessage row counter
+    @cancel_mutex    = Mutex.new
+    @cancel_requested = false
+    @active_http     = nil   # in-flight Net::HTTP, closed on Stop
+    # Serializes the tool-call loop per conversation. agent/ask runs on
+    # EM.defer, so without this a second ask could interleave @history/@turn and
+    # clear the cancel flag for an in-flight turn.
+    @turn_mutex      = Mutex.new
+    @turn_in_progress = false
 
     # Resume from DB if a conversation with this uuid exists, otherwise
     # create one and seed with the agent's system prompt. We persist
@@ -86,6 +143,71 @@ class AgentSession
   def owner_user_id ; @owner_user_id ; end
   def convo         ; @convo         ; end
 
+  # Re-point an in-memory session at the latest Agent record so config edits
+  # made mid-conversation (model, provider_url, api_key, tools, sampling) take
+  # effect on the next turn. The system prompt already seeded into @history is
+  # intentionally left as-is — rewriting an in-flight transcript's system
+  # message would be surprising and isn't reversible.
+  def refresh_agent!(agent)
+    @agent = agent if agent
+  end
+
+  # Request cancellation of the in-flight turn. Closes the active model HTTP
+  # connection so a mid-stream response aborts promptly, and flips the flag
+  # that the ask loop / shell_exec poll check between work items.
+  def request_cancel!
+    sock = @cancel_mutex.synchronize do
+      @cancel_requested = true
+      @active_http
+    end
+    sock&.finish rescue nil
+  end
+
+  def cancelled?
+    @cancel_mutex.synchronize { @cancel_requested }
+  end
+
+  # Acquire the per-conversation turn lock. Returns true if this caller may
+  # begin a turn; false if one is already in flight. agent/ask checks this on
+  # the reactor thread BEFORE EM.defer so a second ask (or Stop + quick
+  # resend) is rejected rather than interleaving @history/@turn.
+  def try_begin_turn!
+    @turn_mutex.synchronize do
+      return false if @turn_in_progress
+      @turn_in_progress = true
+      true
+    end
+  end
+
+  # Release the turn lock. Called from an ensure on the deferred ask so it runs
+  # even if the model call raises.
+  def finish_turn!
+    @turn_mutex.synchronize { @turn_in_progress = false }
+  end
+
+  # Broadcast a user turn to the conversation's other subscribers (#80/#85).
+  # The sender has already pushed the message locally, so exclude only the
+  # originating socket — NOT all of the user's sessions — so the same account
+  # on another device still sees it. Identity is injected from the worker
+  # session; the client is never trusted.
+  def broadcast_user_turn(user_id:, name:, text:, images: nil, origin_ws: nil)
+    full = {
+      conversation_id: @conversation_id,
+      user_id:         user_id,
+      name:            name,
+      text:            text,
+    }
+    full[:images] = images if images && !images.empty?
+
+    delivery_sessions(origin_ws: origin_ws).each do |s|
+      begin
+        s.ws.send({ cs: 'agent', cmd: 'user_turn', payload: full }.to_json)
+      rescue => e
+        puts "[AgentSession.broadcast_user_turn] ws send failed: #{e.class} #{e.message}"
+      end
+    end
+  end
+
   # Send a user message into the loop. Runs until the model returns a plain
   # assistant reply (no tool calls) or MAX_TURNS is exceeded.
   #
@@ -95,12 +217,14 @@ class AgentSession
   # encoded as a data: URL). Per #4 in May30-Questions, we assume the model
   # supports vision; non-vision models will return an HTTP error that the
   # caller surfaces via agent/error.
-  def ask(user_text, images: nil)
-    push_history!(role: 'user', content: user_text.to_s, images: images)
-    DebugStream.emit(:agent, level: :info,
-      message: "ask: #{user_text.to_s[0, 80]}", project_id: @project_id,
+  def ask(user_text, images: nil, author_user_id: nil)
+    @cancel_mutex.synchronize { @cancel_requested = false }
+    push_history!(role: 'user', content: user_text.to_s, images: images,
+                  author_user_id: author_user_id)
+    debug_agent(level: :info,
+      message: "ask: #{user_text.to_s[0, 80]}",
       meta: { conversation: @conversation_id[0, 8], chars: user_text.to_s.length,
-              images: images&.size.to_i, agent: @agent.name }) if defined?(DebugStream)
+              images: images&.size.to_i, agent: @agent.name })
     # Auto-title from first user message so the recent-conversations
     # dropdown shows something useful. Owner can rename later.
     if @convo.title.blank?
@@ -108,13 +232,16 @@ class AgentSession
       t = '(image)' if t.empty? && images && !images.empty?
       @convo.update_column(:title, t) unless t.empty?
     end
-    MAX_TURNS.times do |turn|
+    max_turns = agent_max_turns
+    max_turns.times do |turn|
+      return emit_stopped(turn) if cancelled?
       response = post_chat_completion
       msg      = response.dig('choices', 0, 'message') || {}
       content  = msg['content']
       reasoning = msg['reasoning_content']
       calls    = msg['tool_calls'] || []
       finish   = response.dig('choices', 0, 'finish_reason')
+      return emit_stopped(turn) if cancelled?
 
       # One-line per-turn trace so we can see exactly what the model did.
       content_preview = content.to_s.gsub(/\s+/, ' ').strip[0, 80]
@@ -138,41 +265,115 @@ class AgentSession
           finish_reason: finish,
           reasoning:     reasoning,
         }.compact)
-        DebugStream.emit(:agent, level: finish == 'length' ? :warn : :info,
+        debug_agent(level: finish == 'length' ? :warn : :info,
           message: "done turn=#{turn} finish=#{finish} chars=#{content.to_s.length}",
-          project_id: @project_id,
           meta: { conversation: @conversation_id[0, 8], turn: turn,
                   finish_reason: finish, chars: content.to_s.length,
-                  reasoning_chars: reasoning.to_s.length }) if defined?(DebugStream)
+                  reasoning_chars: reasoning.to_s.length })
         return content.to_s
       end
 
       # Execute every tool the model asked for this turn, append the results,
       # and loop back so the model can read them and continue.
-      calls.each { |call| run_tool_call(call) }
+      calls.each do |call|
+        return emit_stopped(turn) if cancelled?
+        run_tool_call(call)
+      end
     end
-    emit('error', { message: "agent exceeded MAX_TURNS=#{MAX_TURNS}" })
+    emit('error', { message: "agent exceeded max_turns=#{max_turns}" })
     nil
   rescue => e
-    emit('error', { message: "#{e.class}: #{e.message}" })
-    DebugStream.emit(:agent, level: :error,
-      message: "error: #{e.class}: #{e.message}", project_id: @project_id,
-      meta: { conversation: @conversation_id[0, 8] }) if defined?(DebugStream)
+    if cancelled?
+      emit_stopped(nil)
+    else
+      emit('error', { message: "#{e.class}: #{e.message}" })
+      debug_agent(level: :error,
+        message: "error: #{e.class}: #{e.message}",
+        meta: { conversation: @conversation_id[0, 8] })
+    end
     nil
   end
 
   # ─────────────────────────────────────────────────────────────────────
   private
 
+  # Broadcast a cancellation of the current turn to the same audience as
+  # other agent events. turn is informational (nil when we bailed mid-HTTP).
+  def emit_stopped(turn)
+    emit('stopped', { reason: 'cancelled', turn: turn }.compact)
+    debug_agent(level: :info,
+      message: "stopped turn=#{turn.inspect}",
+      meta: { conversation: @conversation_id[0, 8] })
+    nil
+  end
+
+  # Tool-call loop budget for this agent: the per-agent agents.max_turns
+  # override, falling back to the MAX_TURNS default. This is orchestration,
+  # not a sampling param — it is never sent to the model API. See #73.
+  def agent_max_turns
+    v = @agent.respond_to?(:max_turns) ? @agent.max_turns.to_i : 0
+    v.positive? ? v : MAX_TURNS
+  end
+
+  # Maximum AGENTS.md size we inject, in characters. A runaway AGENTS.md
+  # shouldn't be able to crowd out the actual conversation; oversized files
+  # are truncated with a marker.
+  AGENTS_MD_MAX_CHARS = 32_000
+
+  # The messages array sent for inference: @history with the project's
+  # AGENTS.md injected as a system message directly behind the agent's own
+  # system prompt, exactly once. Read fresh each turn so edits made via
+  # agents_md_write (or by the user) take effect immediately. AGENTS.md is
+  # NEVER persisted into @history — it's re-derived on every send.
+  def outgoing_messages
+    md = agents_md_content
+    return @history if md.nil?
+
+    banner = { role: 'system',
+               content: "# AGENTS.md — project instructions (always in effect)\n\n#{md}" }
+    if @history[0] && @history[0][:role] == 'system'
+      [@history[0], banner, *@history[1..]]
+    else
+      [banner, *@history]
+    end
+  end
+
+  # Current project AGENTS.md text, or nil when absent/empty. Truncated to
+  # AGENTS_MD_MAX_CHARS. Never raises into the inference path.
+  def agents_md_content
+    entry = DirectoryEntry.find_by_project_and_path(@project_id, AgentTools::AGENTS_MD_PATH)
+    return nil unless entry && entry.ftype == 'file' && !entry.binary?
+    txt = entry.get_content.to_s
+    return nil if txt.strip.empty?
+    if txt.length > AGENTS_MD_MAX_CHARS
+      txt = txt[0, AGENTS_MD_MAX_CHARS] + "\n\n[AGENTS.md truncated at #{AGENTS_MD_MAX_CHARS} chars]"
+    end
+    txt
+  rescue => e
+    puts "[AgentSession] AGENTS.md load failed: #{e.class} #{e.message}"
+    nil
+  end
+
+  # POST one chat-completion turn. Uses SSE streaming (stream=true) so we can
+  # forward partial assistant text and reasoning to the client as it arrives
+  # via emit('stream', ...). Accumulates the deltas and returns a hash shaped
+  # exactly like a non-streaming response so the ask() loop is unchanged:
+  #   { 'choices' => [ { 'message' => {...}, 'finish_reason' => ... } ] }
+  #
+  # Tool-call fragments stream as partial pieces keyed by index; we reassemble
+  # id/name/arguments before returning. If the server ignores stream=true and
+  # returns a normal JSON body, we fall back to parsing it whole.
   def post_chat_completion
     uri = URI.parse(File.join(@agent.provider_url, 'chat/completions'))
     req = Net::HTTP::Post.new(uri)
     req['Content-Type']  = 'application/json'
+    req['Accept']        = 'text/event-stream'
     req['Authorization'] = @agent.auth_header if @agent.auth_header
 
     body = {
       model:    @agent.model,
-      messages: @history,
+      messages: outgoing_messages,
+      stream:   true,
     }
     body.merge!(@agent.sampling_params)
     tools = AgentTools.openai_tools_for(@agent.allowed_tool_slugs)
@@ -186,12 +387,83 @@ class AgentSession
     http.use_ssl = uri.scheme == 'https'
     http.open_timeout = 10
     http.read_timeout = TIMEOUT_S
+    @cancel_mutex.synchronize { @active_http = http }
 
-    resp = http.request(req)
-    unless resp.is_a?(Net::HTTPSuccess)
-      raise "model server #{resp.code}: #{resp.body.to_s[0, 300]}"
+    content   = +''
+    reasoning = +''
+    tool_acc  = {}   # index => { 'id', 'type', 'function' => { 'name', 'arguments' } }
+    finish    = nil
+    buffer    = +''
+    saw_sse   = false
+
+    begin
+      http.request(req) do |resp|
+        unless resp.is_a?(Net::HTTPSuccess)
+          errbody = (resp.read_body rescue '')
+          raise "model server #{resp.code}: #{errbody.to_s[0, 300]}"
+        end
+
+        resp.read_body do |chunk|
+          buffer << chunk
+          while (nl = buffer.index("\n"))
+            line = buffer.slice!(0..nl).chomp
+            next if line.empty? || line.start_with?(':')   # blank or SSE comment
+            next unless line.start_with?('data:')
+            saw_sse = true
+            data = line.sub(/\Adata:\s*/, '')
+            next if data == '[DONE]'
+            begin
+              json = JSON.parse(data)
+            rescue JSON::ParserError
+              next
+            end
+            choice = (json['choices'] || [])[0] || {}
+            delta  = choice['delta'] || {}
+            finish = choice['finish_reason'] if choice['finish_reason']
+
+            if (c = delta['content']) && !c.empty?
+              content << c
+              emit('stream', { delta: c })
+            end
+            if (r = delta['reasoning_content']) && !r.empty?
+              reasoning << r
+              emit('stream', { reasoning_delta: r })
+            end
+            Array(delta['tool_calls']).each do |tc|
+              idx = tc['index'] || 0
+              acc = (tool_acc[idx] ||= {
+                'id' => nil, 'type' => 'function',
+                'function' => { 'name' => +'', 'arguments' => +'' },
+              })
+              acc['id'] = tc['id'] if tc['id']
+              fn = tc['function'] || {}
+              acc['function']['name']      << fn['name']      if fn['name']
+              acc['function']['arguments'] << fn['arguments'] if fn['arguments']
+            end
+          end
+        end
+      end
+    ensure
+      @cancel_mutex.synchronize { @active_http = nil }
     end
-    JSON.parse(resp.body)
+
+    # Fallback: server ignored stream=true and returned a whole JSON body.
+    if !saw_sse && !buffer.strip.empty?
+      whole = JSON.parse(buffer) rescue nil
+      return whole if whole.is_a?(Hash) && whole['choices']
+    end
+
+    tool_calls = tool_acc.keys.sort.map { |k| tool_acc[k] }
+    {
+      'choices' => [{
+        'message' => {
+          'content'           => content,
+          'reasoning_content' => (reasoning.empty? ? nil : reasoning),
+          'tool_calls'        => (tool_calls.empty? ? nil : tool_calls),
+        }.compact,
+        'finish_reason' => finish,
+      }],
+    }
   end
 
   def run_tool_call(call)
@@ -209,6 +481,7 @@ class AgentSession
       project_id:    @project_id,
       args:          args,
       agent:         @agent,
+      cancel_check:  -> { cancelled? },
     )
 
     emit('tool_result', { tool: fn_name, call_id: call_id, result: result })
@@ -228,33 +501,40 @@ class AgentSession
     { '_raw' => raw }
   end
 
-  # Fan agent events out to every client in the project who is allowed to
-  # see this conversation. 'project'-visibility conversations broadcast to
-  # all project sessions; 'private' conversations only go to the owner's
-  # sessions. Falls back to the originating ws if SESSIONS_BY_PROJECT is
-  # missing (e.g. in tests).
+  # Fan agent events out to this conversation's subscribers only (#85).
+  # Falls back to the originating session when nothing is subscribed yet
+  # (e.g. tests).
   def emit(cmd, payload)
     full = payload.merge(conversation_id: @conversation_id, agent: @agent.slug)
     msg  = { cs: 'agent', cmd: cmd, payload: full }.to_json
 
-    sessions =
-      if defined?(SESSIONS_BY_PROJECT)
-        (SESSIONS_BY_PROJECT[@project_id] || []).select do |s|
-          @convo.visibility == 'project' || s.user_id == @owner_user_id
-        end
-      else
-        []
-      end
-    sessions = [@session] if sessions.empty? && @session
-
-    sessions.each do |s|
-      next unless s.ws
+    delivery_sessions.each do |s|
       begin
         s.ws.send(msg)
       rescue => e
         puts "[AgentSession.emit] ws send failed: #{e.class} #{e.message}"
       end
     end
+  end
+
+  private
+
+  # Subscriber sessions for delivery, optionally excluding an origin socket.
+  def delivery_sessions(origin_ws: nil)
+    subs = self.class.subscribers(@conversation_id).values
+    subs = [@session] if subs.empty? && @session
+    subs = subs.reject { |s| s.ws == origin_ws } if origin_ws
+    subs.select { |s| s.ws }
+  end
+
+  # Agent debug events are only project-visible (private conversations must not
+  # leak ask text / turn metadata to project debug subscribers). Suppress
+  # entirely for private conversations; project-visible is safe project-wide.
+  def debug_agent(level:, message:, meta: {})
+    return unless defined?(DebugStream)
+    return unless @convo&.visibility == 'project'
+    DebugStream.emit(:agent, level: level, message: message,
+                     project_id: @project_id, meta: meta)
   end
 
   # Append a message to both the in-memory @history and the persistent
@@ -266,7 +546,8 @@ class AgentSession
   # still stores plain text only — base64 payloads are too big for the
   # current text column, and conversation replay therefore loses image
   # context. Acceptable for v1.
-  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil, images: nil)
+  def push_history!(role:, content: nil, tool_calls: nil, tool_call_id: nil, name: nil, images: nil,
+                   author_user_id: nil)
     entry =
       case role
       when 'tool'
@@ -301,7 +582,8 @@ class AgentSession
     persist_calls = tool_calls && !tool_calls.empty? ? tool_calls : nil
     @convo.append!(turn: @turn, role: role, content: content,
                    tool_calls: persist_calls,
-                   tool_call_id: tool_call_id, name: name)
+                   tool_call_id: tool_call_id, name: name,
+                   user_id: author_user_id)
     @turn += 1
   rescue => e
     # Persistence failure is logged but does not kill the conversation —

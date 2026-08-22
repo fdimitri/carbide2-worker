@@ -23,6 +23,14 @@ module AgentHandlers
   end
   register 'list', :list
 
+  # Advertise the tools this worker can make available, so the client builds
+  # its per-agent allowlist UI from the live registry rather than a hardcoded
+  # list. See fdimitri/carbide2#73.
+  def self.tools(session, _payload)
+    Command.reply(session, 'agent', 'tools', { tools: AgentTools.catalog })
+  end
+  register 'tools', :tools
+
   # Conversations visible to the requesting user in this project:
   # all 'project'-visibility threads + this user's own 'private' threads.
   def self.recent(session, payload)
@@ -51,6 +59,27 @@ module AgentHandlers
   end
   register 'recent', :recent
 
+  # Create a conversation WITHOUT a message (#85): the client gets the
+  # worker-minted UUID up front, writes its tab as agent:<uuid>, then sends the
+  # first ask against that id. This avoids any temp-key → real-id promotion of an
+  # optimistic first message.
+  def self.create(session, payload)
+    slug = payload['agent_slug'].to_s
+    agent = Agent.enabled.find_by(slug: slug)
+    unless agent
+      Command.error(session, "agent/create: no enabled agent with slug=#{slug}")
+      return
+    end
+    conv = SecureRandom.uuid
+    AgentSession.start(session: session, agent: agent,
+                       project_id: session.project_id,
+                       conversation_id: conv)
+    AgentSession.subscribe(session, conv)
+    session.agent_subs << conv unless session.agent_subs.include?(conv)
+    Command.reply(session, 'agent', 'created', { conversation_id: conv, agent: agent.slug })
+  end
+  register 'create', :create
+
   def self.load(session, payload)
     conv  = payload['conversation_id'].to_s
     convo = AgentConversation.find_by(uuid: conv)
@@ -64,11 +93,12 @@ module AgentHandlers
     end
 
     # Replay messages in the wire-shape AgentPane already understands.
-    msgs = convo.agent_messages.order(:turn).to_a
+    # includes(:user) so per-message display-name resolution doesn't N+1.
+    msgs = convo.agent_messages.includes(:user).order(:turn).to_a
     items = msgs.flat_map do |m|
       case m.role
       when 'user'
-        [{ kind: 'user', text: m.content.to_s }]
+        [{ kind: 'user', text: m.content.to_s, user_id: m.user_id, name: m.user&.display_name }]
       when 'assistant'
         out = []
         out << { kind: 'assistant', text: m.content.to_s } if m.content.to_s.strip != ''
@@ -103,6 +133,36 @@ module AgentHandlers
   end
   register 'load', :load
 
+  # --- subscribe (delivery membership, #85) ---------------------------------
+  # Authorization lives here: a client may subscribe only to a conversation it
+  # is allowed to see. Once subscribed, AgentSession#emit fans out to
+  # subscribers only — no project-wide broadcast, no visibility branch at emit.
+  def self.subscribe(session, payload)
+    conv = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/subscribe: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/subscribe: conversation is private')
+      return
+    end
+    AgentSession.subscribe(session, conv)
+    session.agent_subs << conv unless session.agent_subs.include?(conv)
+    Command.reply(session, 'agent', 'subscribed', { conversation_id: conv })
+  end
+  register 'subscribe', :subscribe
+
+  def self.unsubscribe(session, payload)
+    conv = payload['conversation_id'].to_s
+    return if conv.empty?
+    AgentSession.unsubscribe(session, conv)
+    session.agent_subs.delete(conv)
+    Command.reply(session, 'agent', 'unsubscribed', { conversation_id: conv })
+  end
+  register 'unsubscribe', :unsubscribe
+
   def self.set_visibility(session, payload)
     conv = payload['conversation_id'].to_s
     vis  = payload['visibility'].to_s
@@ -121,15 +181,41 @@ module AgentHandlers
       return
     end
     convo.update!(visibility: vis)
-    # Tell every project client to refresh their dropdown (visibility
-    # changes can grant or revoke access).
-    Command.broadcast_project(session.project_id, 'agent', 'visibility_changed', {
+    # Prune subscribers who lost access (project → private), then notify only
+    # the authorized audience. Never project-wide for a private thread;
+    # private → project is discovered manually via `recent` (no push).
+    AgentSession.prune_unauthorized(conv)
+    AgentSession.broadcast(conv, 'visibility_changed', {
+      conversation_id: conv,
+      visibility:      vis,
+      owner_user_id:   convo.user_id,
+    }, origin_ws: session.ws)
+    Command.reply(session, 'agent', 'visibility_changed', {
       conversation_id: conv,
       visibility:      vis,
       owner_user_id:   convo.user_id,
     })
   end
   register 'set_visibility', :set_visibility
+
+  # Interrupt an in-flight turn. Any project member who can see the
+  # conversation may stop it (project-visible => all members; private => owner
+  # only) — matches the existing "any member may post" rule for shared threads.
+  def self.stop(session, payload)
+    conv = payload['conversation_id'].to_s
+    sess = AgentSession.find(conv)
+    unless sess && sess.convo&.project_id == session.project_id
+      Command.error(session, 'agent/stop: conversation not found in this project')
+      return
+    end
+    unless sess.convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/stop: conversation is private')
+      return
+    end
+    sess.request_cancel!
+    Command.reply(session, 'agent', 'stopping', { conversation_id: conv })
+  end
+  register 'stop', :stop
 
   def self.ask(session, payload)
     slug   = payload['agent_slug'].to_s
@@ -164,15 +250,57 @@ module AgentHandlers
       end
     end
 
-    sess = AgentSession.find(conv) ||
-           AgentSession.start(session: session, agent: agent,
-                              project_id: session.project_id,
-                              conversation_id: conv)
+    sess = AgentSession.find(conv)
+    if sess
+      # Existing in-memory conversation: adopt the freshly-loaded agent so
+      # runtime config edits (model, provider_url, tools, sampling) propagate.
+      sess.refresh_agent!(agent)
+    else
+      sess = AgentSession.start(session: session, agent: agent,
+                                project_id: session.project_id,
+                                conversation_id: conv)
+    end
+
+    # Serialize turns per conversation. agent/ask runs on EM.defer, so without
+    # this a second ask (or Stop then a quick resend) could clear the cancel
+    # flag for an in-flight loop and interleave @history/@turn.
+    unless sess.try_begin_turn!
+      Command.error(session, 'agent/ask: a turn is already in progress for this conversation')
+      return
+    end
+
+    # The asker is an implicit subscriber (delivery membership). Explicit
+    # subscribe is also available for opening/loading a conversation without
+    # asking.
+    AgentSession.subscribe(session, conv)
+    session.agent_subs << conv unless session.agent_subs.include?(conv)
     # Ack immediately so the UI can show the conversation id.
     Command.reply(session, 'agent', 'started',
                   { conversation_id: conv, agent: agent.slug })
 
-    EM.defer { sess.ask(msg, images: images) }
+    # Resolve the display name from the authoritative user record rather than
+    # the JWT claim (session.name is user_email on new control-plane tokens).
+    author = User.find_by(id: session.user_id)
+    name   = author&.display_name || session.name || "user #{session.user_id}"
+
+    # Fan the user turn out to everyone else who is allowed to see this
+    # conversation. The sender pushed it locally already, so exclude only the
+    # originating socket (same user's other sessions still receive it).
+    sess.broadcast_user_turn(
+      user_id:   session.user_id,
+      name:      name,
+      text:      msg,
+      images:    images,
+      origin_ws: session.ws,
+    )
+
+    EM.defer do
+      begin
+        sess.ask(msg, images: images, author_user_id: session.user_id)
+      ensure
+        sess.finish_turn!
+      end
+    end
   end
   register 'ask', :ask
 end

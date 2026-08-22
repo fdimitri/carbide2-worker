@@ -94,6 +94,7 @@ require_relative 'terminal_instance'
 require_relative 'terminal_recorder'
 require_relative 'chat_room'
 require_relative 'open_document'
+require_relative 'document'
 require_relative 'project_container'
 require_relative 'project_pod'
 require_relative 'session'
@@ -133,7 +134,10 @@ ALGORITHM     = 'HS256'
 # frames are unaffected).
 # PROTOCOL 3: session/delete + client_version on session create/list, and a
 # stable per-terminal uuid in term/created + term/list. All additive.
-PROTOCOL   = 3
+# PROTOCOL 4: agent/user_turn broadcast (shared conversations, #80) + per-message
+# author on agent user messages (#79). Additive — MIN_CLIENT stays 1.
+# PROTOCOL 5: agent/stop + agent/stopping + agent/stopped (#83). Additive.
+PROTOCOL   = 5
 MIN_CLIENT = 1
 
 # Load worker/carbide.yml if present; allows per-machine config without env vars.
@@ -217,6 +221,7 @@ end
 TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
 OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
+DOCUMENTS           = {}        # srcpath => Document (in-memory rendered buffer)
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
 PROJECT_PODS        = {}        # project_id (int)  => ProjectPod

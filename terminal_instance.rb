@@ -149,6 +149,17 @@ class TerminalInstance
     puts "[PTY:#{@terminal_id}] agent_write failed: #{e.class} #{e.message}"
   end
 
+  # Send SIGINT (^C) to the foreground process group of the agent-owned shell.
+  # Used by Stop to interrupt a long-running command ASAP. Best-effort: a
+  # command that ignores/overrides SIGINT may keep running — normal PTY
+  # semantics; we do not kill the whole shell out from under the user.
+  def agent_interrupt!
+    raise 'terminal not claimed by agent' unless @agent_busy
+    @slave.write("\x03")
+  rescue Errno::EIO, Errno::EPIPE, IOError => e
+    puts "[PTY:#{@terminal_id}] agent_interrupt failed: #{e.class} #{e.message}"
+  end
+
   # Run a block with the slave PTY's ECHO disabled so anything we write via
   # agent_write isn't echoed back to xterm character-by-character. Used by
   # the prompt-marker installer to hide a one-time bash export line; no
@@ -206,8 +217,13 @@ class TerminalInstance
   end
 
   def add_client(ws)
+    already = @clients.key?(ws.object_id)
     @clients[ws.object_id] = ws
-    replay_to_client(ws)
+    # One WebSocket per project means two panes viewing the same terminal are
+    # the SAME client entry (keyed by ws.object_id). Replay only on the first
+    # add — a second join for the same ws must not re-send the full scrollback,
+    # otherwise the already-visible pane appends it a second time (#89).
+    replay_to_client(ws) unless already
   end
 
   def remove_client(ws)
