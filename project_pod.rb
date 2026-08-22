@@ -180,7 +180,7 @@ class ProjectPod
           stdin: true,
           resources: {
             requests: { cpu: '50m', memory: '128Mi' },
-            limits:   { cpu: '1',   memory: '1Gi'   },
+            limits:   { cpu: '6',   memory: '8Gi'   },
           },
           volumeMounts: pvc_mounts,
         }],
