@@ -7,19 +7,36 @@ class Session
   # (legacy tokens) — those are not expiry-enforced.
   attr_reader :token_exp
 
+  # A socket that has connected but not yet authenticated (ADR-018). It holds
+  # no principal and may only send system/auth until it is promoted.
+  def self.unauthenticated(ws)
+    new(ws, nil)
+  end
+
   def initialize(ws, payload)
     @ws         = ws
-    # Accept both the new control-plane JWT format (user_id/project_id) and
-    # the legacy server-minted format (user/project). See JWT_CLAIMS.md.
-    @user_id    = payload['user_id']    || payload['user']
-    @name       = payload['user_email'] || payload['name'] || "user_#{@user_id}"
-    @project_id = payload['project_id'] || payload['project']
-    @token_exp  = payload['exp']
     @terminals  = []  # terminal_ids joined
     @rooms      = []  # room_ids joined
     @open_files = []  # normalized paths currently open
     @session_subs = []  # browser-session uuids this ws is subscribed to
     @agent_subs   = []  # agent conversation ids this ws is subscribed to (#85)
+    pin_principal(payload) if payload
+  end
+
+  # True once a validated token has been pinned (via system/auth or the legacy
+  # ?token= URI path). An unauthenticated session has no project yet.
+  def authenticated?
+    !@project_id.nil?
+  end
+
+  # Pin identity from a validated JWT payload. Accepts both the new
+  # control-plane JWT format (user_id/project_id) and the legacy
+  # server-minted format (user/project). See JWT_CLAIMS.md.
+  def pin_principal(payload)
+    @user_id    = payload['user_id']    || payload['user']
+    @name       = payload['user_email'] || payload['name'] || "user_#{@user_id}"
+    @project_id = payload['project_id'] || payload['project']
+    @token_exp  = payload['exp']
   end
 
   # Adopt a freshly-minted token (already validated) without dropping the

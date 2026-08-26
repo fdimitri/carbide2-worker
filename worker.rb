@@ -117,6 +117,12 @@ require 'set'
 WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
 ALGORITHM     = 'HS256'
 
+# In-band first-message authentication (ADR-018). An unauthenticated socket has
+# AUTH_TIMEOUT_SECONDS to send system/auth before it is disconnected, and the
+# worker holds at most MAX_PENDING_AUTH unauthenticated sockets at once.
+AUTH_TIMEOUT_SECONDS = Integer(ENV.fetch('CARBIDE_AUTH_TIMEOUT_SECONDS', '10'))
+MAX_PENDING_AUTH     = Integer(ENV.fetch('CARBIDE_MAX_PENDING_AUTH', '100'))
+
 # ---------------------------------------------------------------------------
 # Wire-protocol versioning
 # ---------------------------------------------------------------------------
@@ -230,6 +236,68 @@ SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
 VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
 VFS_FLUSHERS        = {}        # project_id => VfsFlusher
 VFS_WATCHERS        = {}        # project_id => VfsWatcher
+PENDING_AUTH        = {}        # ws.object_id => Session (unauthenticated, awaiting system/auth)
+AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
+
+# ---------------------------------------------------------------------------
+# First-message authentication (ADR-018)
+# ---------------------------------------------------------------------------
+# A session is ALWAYS created unauthenticated at onopen. It becomes
+# authenticated by one of two paths that share a single establishment call:
+#   - legacy:  ?token= in the upgrade URI (deprecated, logs a warning)
+#   - new:     the client's first frame, system/auth { token }
+# On success the ONE promotion path pins the principal, joins the project,
+# cancels the auth deadline, and delivers the post-auth state.
+def establish!(token)
+  return nil unless token.is_a?(String) && !token.empty?
+  validate_token(token)
+end
+
+def handle_auth(session, payload)
+  principal = establish!(payload['token'])
+  principal ? promote(session, principal) : reject_auth(session)
+end
+
+def reject_auth(session)
+  send_msg(session.ws, 'system', 'error', { message: 'invalid or missing token' })
+  session.ws.close_connection_after_writing
+end
+
+def promote(session, principal)
+  session.pin_principal(principal)
+  cancel_auth_deadline(session)
+  PENDING_AUTH.delete(session.ws.object_id)
+
+  SESSIONS_BY_PROJECT[session.project_id] ||= []
+  SESSIONS_BY_PROJECT[session.project_id] << session
+
+  send_msg(session.ws, 'system', 'connected', {
+    user_id:    session.user_id,
+    project_id: session.project_id,
+    protocol:   PROTOCOL,
+    min_client: MIN_CLIENT,
+    token_exp:  session.token_exp
+  })
+
+  terminals = get_project_terminals(session.project_id)
+  send_msg(session.ws, 'term', 'list', { project_id: session.project_id, terminals: terminals })
+
+  puts "Client connected: user=#{session.user_id} project=#{session.project_id}"
+end
+
+def arm_auth_deadline(session)
+  timer = EM.add_timer(AUTH_TIMEOUT_SECONDS) do
+    if AUTH_DEADLINES.delete(session)
+      puts '[auth] deadline exceeded before system/auth; disconnecting'
+      session.ws.close_connection_after_writing
+    end
+  end
+  AUTH_DEADLINES[session] = timer
+end
+
+def cancel_auth_deadline(session)
+  AUTH_DEADLINES.delete(session)&.cancel
+end
 
 # ---------------------------------------------------------------------------
 # Message router
@@ -266,6 +334,12 @@ end
 module SystemHandlers
   def self.dispatch(cmd, session, payload)
     case cmd
+    when 'auth'
+      # system/auth is only valid on an unauthenticated session. Reaching here
+      # means the session is already authenticated: refuse rather than
+      # re-establishing (a second establishment would be a principal-change
+      # path around system/reauth's identity pin).
+      send_msg(session.ws, 'system', 'error', { message: 'already authenticated' })
     when 'ping'
       send_msg(session.ws, 'system', 'pong', { t: payload['t'] })
     when 'reauth'
@@ -489,52 +563,51 @@ EM.run do
       params = URI.decode_www_form(handshake.query_string || '').to_h
       token  = params['token']
 
-      # Wire-protocol handshake (advisory). A client that predates versioning
-      # sends neither param: treat it as proto=0 / min_server=0 so the floor
-      # comparison still runs and we warn rather than crash.
-      client_proto      = params['proto'].to_i
-      client_min_server = params['min_server'].to_i
-      proto_ok = client_proto >= MIN_CLIENT && PROTOCOL >= client_min_server
-
-      payload = validate_token(token)
-      if payload
-        session = Session.new(ws, payload)
-        
-        # Track session by project for terminal broadcasts
-        SESSIONS_BY_PROJECT[session.project_id] ||= []
-        SESSIONS_BY_PROJECT[session.project_id] << session
-
-        unless proto_ok
-          puts "[proto] version mismatch: client(proto=#{client_proto} min_server=#{client_min_server}) " \
-               "server(proto=#{PROTOCOL} min_client=#{MIN_CLIENT}) — serving anyway (advisory)"
-        end
-
-        send_msg(ws, 'system', 'connected', {
-          user_id:    session.user_id,
-          project_id: session.project_id,
-          # Wire-protocol advertisement so the client can compare against its
-          # own floor and surface a mismatch banner. See PROTOCOL/MIN_CLIENT.
-          protocol:   PROTOCOL,
-          min_client: MIN_CLIENT,
-          # Token expiry (unix seconds) so the client can refresh in-band before
-          # it lapses. nil for legacy tokens with no exp claim.
-          token_exp:  session.token_exp
-        })
-        
-        # Send initial terminal list
-        terminals = get_project_terminals(session.project_id)
-        send_msg(ws, 'term', 'list', { project_id: session.project_id, terminals: terminals })
-        
-        puts "Client connected: user=#{session.user_id} project=#{session.project_id}"
-      else
-        send_msg(ws, 'system', 'error', { message: 'invalid or missing token' })
+      if PENDING_AUTH.size >= MAX_PENDING_AUTH
+        puts "[auth] max pending auth sessions (#{MAX_PENDING_AUTH}) reached; rejecting connection"
         ws.close_connection_after_writing
+      else
+        # A session is ALWAYS created unauthenticated. The legacy ?token= URI
+        # path promotes it immediately; otherwise it waits for system/auth.
+        session = Session.unauthenticated(ws)
+        PENDING_AUTH[ws.object_id] = session
+        arm_auth_deadline(session)
+
+        if token && !token.empty?
+          warn '[auth] token-in-uri is deprecated; use system/auth'
+
+          # Wire-protocol handshake (advisory) — legacy URI path only.
+          client_proto      = params['proto'].to_i
+          client_min_server = params['min_server'].to_i
+          proto_ok = client_proto >= MIN_CLIENT && PROTOCOL >= client_min_server
+          unless proto_ok
+            puts "[proto] version mismatch: client(proto=#{client_proto} min_server=#{client_min_server}) " \
+                 "server(proto=#{PROTOCOL} min_client=#{MIN_CLIENT}) — serving anyway (advisory)"
+          end
+
+          principal = establish!(token)
+          principal ? promote(session, principal) : reject_auth(session)
+        end
+        # No token: wait for system/auth (or the deadline).
       end
     end
 
     ws.onmessage do |msg|
       begin
-        route(session, msg) if session
+        if session.authenticated?
+          route(session, msg)
+        else
+          # Unauthenticated: exactly one command is allowed — system/auth.
+          # Anything else (even a malformed frame) closes the socket; retry
+          # belongs to the client's reconnect loop.
+          parsed = (JSON.parse(msg) rescue nil)
+          if parsed.is_a?(Hash) && parsed['cs'] == 'system' && parsed['cmd'] == 'auth'
+            handle_auth(session, parsed['payload'] || {})
+          else
+            puts '[auth] frame before system/auth; closing'
+            ws.close_connection_after_writing
+          end
+        end
       rescue => e
         puts "[route] error: #{e.class} #{e.message}\n#{e.backtrace.first(3).join("\n")}"
         send_msg(ws, 'system', 'error', { message: e.message })
@@ -542,18 +615,25 @@ EM.run do
     end
 
     ws.onclose do
+      cancel_auth_deadline(session) if session
+      PENDING_AUTH.delete(ws.object_id)
+
       if session
-        puts "Client disconnected: user=#{session.user_id}"
+        if session.authenticated?
+          puts "Client disconnected: user=#{session.user_id}"
 
-        # Drop any debug-stream subscription this session held
-        DebugStream.unsubscribe(session)
+          # Drop any debug-stream subscription this session held
+          DebugStream.unsubscribe(session)
 
-        # Remove session from project tracking
-        if SESSIONS_BY_PROJECT[session.project_id]
-          SESSIONS_BY_PROJECT[session.project_id].delete(session)
+          # Remove session from project tracking
+          if SESSIONS_BY_PROJECT[session.project_id]
+            SESSIONS_BY_PROJECT[session.project_id].delete(session)
+          end
+
+          session.cleanup
+        else
+          puts 'Client disconnected before authentication'
         end
-        
-        session.cleanup
         session = nil
       end
     end
