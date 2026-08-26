@@ -20,23 +20,31 @@ class Session
     @open_files = []  # normalized paths currently open
     @session_subs = []  # browser-session uuids this ws is subscribed to
     @agent_subs   = []  # agent conversation ids this ws is subscribed to (#85)
+    @authenticated = false
     pin_principal(payload) if payload
   end
 
   # True once a validated token has been pinned (via system/auth or the legacy
-  # ?token= URI path). An unauthenticated session has no project yet.
+  # ?token= URI path). A dedicated flag, not @project_id: "was promoted" is the
+  # semantic that matters, and it does not depend on the token carrying a
+  # project claim.
   def authenticated?
-    !@project_id.nil?
+    @authenticated
   end
 
-  # Pin identity from a validated JWT payload. Accepts both the new
-  # control-plane JWT format (user_id/project_id) and the legacy
-  # server-minted format (user/project). See JWT_CLAIMS.md.
+  # Pin identity from a validated JWT payload. Establishment is one-shot: once
+  # a session is authenticated, a second pin would be a principal-change path
+  # around system/reauth's identity pin, so it is refused rather than silently
+  # re-pinning. Accepts both the new control-plane JWT format (user_id/
+  # project_id) and the legacy server-minted format (user/project). See
+  # JWT_CLAIMS.md.
   def pin_principal(payload)
+    raise 'session already authenticated' if @authenticated
     @user_id    = payload['user_id']    || payload['user']
     @name       = payload['user_email'] || payload['name'] || "user_#{@user_id}"
     @project_id = payload['project_id'] || payload['project']
     @token_exp  = payload['exp']
+    @authenticated = true
   end
 
   # Adopt a freshly-minted token (already validated) without dropping the

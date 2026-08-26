@@ -250,7 +250,14 @@ AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
 # cancels the auth deadline, and delivers the post-auth state.
 def establish!(token)
   return nil unless token.is_a?(String) && !token.empty?
-  validate_token(token)
+  payload = validate_token(token)
+  return nil unless payload
+  # A session without a project is useless: every handler keys on project_id,
+  # and validate_token only enforces the project claim when WORKSPACE_PROJECT_ID
+  # is set. Reject project-less tokens here rather than creating a session that
+  # joins SESSIONS_BY_PROJECT[nil].
+  return nil if (payload['project_id'] || payload['project']).nil?
+  payload
 end
 
 def handle_auth(session, payload)
