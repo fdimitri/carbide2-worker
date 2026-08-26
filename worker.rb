@@ -123,6 +123,16 @@ ALGORITHM     = 'HS256'
 AUTH_TIMEOUT_SECONDS = Integer(ENV.fetch('CARBIDE_AUTH_TIMEOUT_SECONDS', '10'))
 MAX_PENDING_AUTH     = Integer(ENV.fetch('CARBIDE_MAX_PENDING_AUTH', '100'))
 
+# ADR-019 §4 — transport capabilities, namespaced `wire.*` caps with no single
+# wire version scalar. Advertised pre-auth (system/wirecaps) and again post-auth
+# inside system/connected's `caps` field. Function caps (commands/events) join
+# this same shape after the registry migration (later slice).
+WIRE_CAPS = {
+  'frame'    => '1.0.0',
+  'uriauth'  => '1.0.0',
+  'anonauth' => '1.0.0',
+}.freeze
+
 # ---------------------------------------------------------------------------
 # Wire-protocol versioning
 # ---------------------------------------------------------------------------
@@ -288,7 +298,8 @@ def promote(session, principal)
     project_id: session.project_id,
     protocol:   PROTOCOL,
     min_client: MIN_CLIENT,
-    token_exp:  session.token_exp
+    token_exp:  session.token_exp,
+    caps:       { wire: WIRE_CAPS },
   })
 
   terminals = get_project_terminals(session.project_id)
@@ -584,6 +595,11 @@ EM.run do
         session = Session.unauthenticated(ws)
         PENDING_AUTH[ws.object_id] = session
         arm_auth_deadline(session)
+
+        # ADR-019 §6: one unsolicited, per-socket wire-caps frame at open (not a
+        # broadcast) so the client can choose an auth carrier before committing
+        # a token. Sent on both the anon and legacy URI paths.
+        send_msg(ws, 'system', 'wirecaps', { wire: WIRE_CAPS })
 
         # Presence of the param (even empty) means the legacy URI carrier was
         # chosen; only its absence means "wait for system/auth". An empty token
