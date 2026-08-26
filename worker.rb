@@ -259,6 +259,8 @@ def handle_auth(session, payload)
 end
 
 def reject_auth(session)
+  cancel_auth_deadline(session)
+  PENDING_AUTH.delete(session.ws.object_id)
   send_msg(session.ws, 'system', 'error', { message: 'invalid or missing token' })
   session.ws.close_connection_after_writing
 end
@@ -561,7 +563,7 @@ EM.run do
 
     ws.onopen do |handshake|
       params = URI.decode_www_form(handshake.query_string || '').to_h
-      token  = params['token']
+      token  = params['token']  # nil when absent; '' when ?token= present-but-empty
 
       if PENDING_AUTH.size >= MAX_PENDING_AUTH
         puts "[auth] max pending auth sessions (#{MAX_PENDING_AUTH}) reached; rejecting connection"
@@ -573,7 +575,11 @@ EM.run do
         PENDING_AUTH[ws.object_id] = session
         arm_auth_deadline(session)
 
-        if token && !token.empty?
+        # Presence of the param (even empty) means the legacy URI carrier was
+        # chosen; only its absence means "wait for system/auth". An empty token
+        # therefore fails fast (establish! returns nil) instead of hanging the
+        # socket for the auth deadline.
+        if params.key?('token')
           warn '[auth] token-in-uri is deprecated; use system/auth'
 
           # Wire-protocol handshake (advisory) — legacy URI path only.
@@ -588,20 +594,20 @@ EM.run do
           principal = establish!(token)
           principal ? promote(session, principal) : reject_auth(session)
         end
-        # No token: wait for system/auth (or the deadline).
+        # No token param: wait for system/auth (or the deadline).
       end
     end
 
     ws.onmessage do |msg|
       begin
-        if session.authenticated?
+        if session&.authenticated?
           route(session, msg)
         else
-          # Unauthenticated: exactly one command is allowed — system/auth.
-          # Anything else (even a malformed frame) closes the socket; retry
-          # belongs to the client's reconnect loop.
+          # Unauthenticated (or a rejected connection where session is nil):
+          # exactly one command is allowed — system/auth. Anything else closes;
+          # retry belongs to the client's reconnect loop.
           parsed = (JSON.parse(msg) rescue nil)
-          if parsed.is_a?(Hash) && parsed['cs'] == 'system' && parsed['cmd'] == 'auth'
+          if session && parsed.is_a?(Hash) && parsed['cs'] == 'system' && parsed['cmd'] == 'auth'
             handle_auth(session, parsed['payload'] || {})
           else
             puts '[auth] frame before system/auth; closing'
