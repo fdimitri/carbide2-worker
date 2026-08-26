@@ -43,7 +43,7 @@ module FsHandlers
     tree = DirectoryEntry.tree_for_project(session.project_id)
     send_msg(session.ws, 'fs', 'tree', { tree: tree })
   end
-  register 'tree', :handle_tree
+  register 'tree', :handle_tree, cap: { dir: :in, ver: '1.0.0' }
 
   def self.handle_read(session, payload)
     path  = payload['path'].to_s.strip
@@ -57,7 +57,7 @@ module FsHandlers
       content: content
     })
   end
-  register 'read', :handle_read
+  register 'read', :handle_read, cap: { dir: :in, ver: '1.0.0' }
 
   # read_binary — stream a chunk of a binary file from disk.
   # Payload: { path:, offset: 0, length: 65536 }
@@ -96,7 +96,7 @@ module FsHandlers
       data:   Base64.strict_encode64(bytes)
     })
   end
-  register 'read_binary', :handle_read_binary
+  register 'read_binary', :handle_read_binary, cap: { dir: :in, ver: '1.0.0' }
 
   # stat — metadata snapshot for the explorer Properties panel (#5).
   def self.handle_stat(session, payload)
@@ -104,7 +104,7 @@ module FsHandlers
     entry = find_entry!(session.project_id, path)
     send_msg(session.ws, 'fs', 'stat', entry.stat_hash)
   end
-  register 'stat', :handle_stat
+  register 'stat', :handle_stat, cap: { dir: :in, ver: '1.0.0' }
 
   # open — register this session as viewing a file; receive its peer viewer list
   def self.handle_open(session, payload)
@@ -120,7 +120,7 @@ module FsHandlers
 
     send_msg(session.ws, 'fs', 'opened', { path: norm, viewers: doc.viewers })
   end
-  register 'open', :handle_open
+  register 'open', :handle_open, cap: { dir: :in, ver: '1.0.0' }
 
   # close — unregister this session from a file
   def self.handle_close(session, payload)
@@ -134,7 +134,7 @@ module FsHandlers
     session.close_file(norm)
     OPEN_DOCUMENTS.delete(key) if doc.empty?
   end
-  register 'close', :handle_close
+  register 'close', :handle_close, cap: { dir: :in, ver: '1.0.0' }
 
   # cursor — update this session's cursor position and broadcast to co-viewers
   def self.handle_cursor(session, payload)
@@ -156,7 +156,7 @@ module FsHandlers
       char:    char
     })
   end
-  register 'cursor', :handle_cursor
+  register 'cursor', :handle_cursor, cap: { dir: :in, ver: '1.0.0' }
 
   # write — accepts { path:, changes: [...] }
   # Each change in the array: { change_type:, change_data:, start_line:, start_char:, end_line:, end_char: }
@@ -218,7 +218,7 @@ module FsHandlers
     data_bytes = changes.sum { |ch| ch['change_data'].to_s.bytesize }
     VFS_FLUSHERS[session.project_id]&.record_write(entry.id, data_bytes)
   end
-  register 'write', :handle_write
+  register 'write', :handle_write, cap: { dir: :in, ver: '1.0.0' }
 
   def self.handle_set_contents(session, payload)
     path    = payload['path'].to_s.strip
@@ -253,7 +253,7 @@ module FsHandlers
 
     VFS_FLUSHERS[session.project_id]&.record_write(entry.id, content.bytesize)
   end
-  register 'set_contents', :handle_set_contents
+  register 'set_contents', :handle_set_contents, cap: { dir: :in, ver: '1.0.0' }
 
   def self.handle_create_file(session, payload)
     path    = payload['path'].to_s.strip
@@ -275,7 +275,7 @@ module FsHandlers
       user_id: session.user_id
     })
   end
-  register 'create_file', :handle_create_file
+  register 'create_file', :handle_create_file, cap: { dir: :in, ver: '1.0.0' }
 
   def self.handle_create_dir(session, payload)
     path  = payload['path'].to_s.strip
@@ -290,7 +290,7 @@ module FsHandlers
       user_id: session.user_id
     })
   end
-  register 'create_dir', :handle_create_dir
+  register 'create_dir', :handle_create_dir, cap: { dir: :in, ver: '1.0.0' }
 
   def self.handle_rename(session, payload)
     path     = payload['path'].to_s.strip
@@ -310,7 +310,7 @@ module FsHandlers
       user_id:  session.user_id
     })
   end
-  register 'rename', :handle_rename
+  register 'rename', :handle_rename, cap: { dir: :in, ver: '1.0.0' }
 
   def self.handle_delete(session, payload)
     path  = payload['path'].to_s.strip
@@ -354,7 +354,7 @@ module FsHandlers
       message: "deleted #{entry_path}", project_id: session.project_id,
       meta: { path: entry_path, user_id: session.user_id, source: 'ws' }) if defined?(DebugStream)
   end
-  register 'delete', :handle_delete
+  register 'delete', :handle_delete, cap: { dir: :in, ver: '1.0.0' }
 
   # -------------------------------------------------------------------------
   # Import a public git repo into this project's on-disk root, then walk the
@@ -408,7 +408,7 @@ module FsHandlers
       end
     )
   end
-  register 'import_git', :handle_import_git
+  register 'import_git', :handle_import_git, cap: { dir: :in, ver: '1.0.0' }
 
   # Blocking worker for handle_import_git. Runs on a deferred thread with its
   # own AR connection checked out. Returns a result hash.

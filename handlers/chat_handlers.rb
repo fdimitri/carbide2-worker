@@ -29,7 +29,7 @@ module ChatHandlers
     Command.reply(session, 'chat', 'joined',
                   { channel_id: cid, room_id: rid, already_joined: already_joined })
   end
-  register 'join', :join
+  register 'join', :join, cap: { dir: :in, ver: '1.0.0' }
 
   def self.message(session, payload)
     cid  = channel_id_or_error(session, payload, 'message') or return
@@ -41,7 +41,7 @@ module ChatHandlers
     end
     room.handle_message(session.ws, payload['text'].to_s)
   end
-  register 'message', :message
+  register 'message', :message, cap: { dir: :in, ver: '1.0.0' }
 
   def self.typing(session, payload)
     cid = Integer(payload['channel_id']) rescue nil
@@ -50,7 +50,7 @@ module ChatHandlers
     rid = room_id_for(session, cid)
     CHAT_ROOMS[rid]&.handle_typing(session.ws)
   end
-  register 'typing', :typing
+  register 'typing', :typing, cap: { dir: :in, ver: '1.0.0' }
 
   def self.leave(session, payload)
     cid  = channel_id_or_error(session, payload, 'leave') or return
@@ -65,5 +65,5 @@ module ChatHandlers
     Command.reply(session, 'chat', 'left',
                   { channel_id: cid, room_id: rid })
   end
-  register 'leave', :leave
+  register 'leave', :leave, cap: { dir: :in, ver: '1.0.0' }
 end

@@ -132,6 +132,22 @@ WIRE_CAPS = {
   'anonauth' => '1.0.0',
 }.freeze
 
+# ADR-019 §5 — the full advertised capset, built from the dispatcher
+# registries. Commands are `:in` (client→worker); the `:out` (event) half is
+# deferred (no registry entry yet). Wire shape: flat direction-tagged keys
+# (`"fs.write:in"`), matching ADR-019 §1's notation. `set`/`cmd` are derived
+# from each module's namespace + the registered cmd rather than stored.
+def worker_capset
+  commands = {}
+  ROUTES.each do |cs, mod|
+    next unless mod.respond_to?(:caps) && mod.respond_to?(:namespace)
+    mod.caps.each do |cmd, cap|
+      commands["#{cs}.#{cmd}:#{cap[:dir]}"] = cap[:ver]
+    end
+  end
+  { wire: WIRE_CAPS, commands: commands }
+end
+
 # ---------------------------------------------------------------------------
 # Wire-protocol versioning
 # ---------------------------------------------------------------------------
@@ -298,7 +314,7 @@ def promote(session, principal)
     protocol:   PROTOCOL,
     min_client: MIN_CLIENT,
     token_exp:  session.token_exp,
-    caps:       { wire: WIRE_CAPS },
+    caps:       worker_capset,
   })
 
   terminals = get_project_terminals(session.project_id)

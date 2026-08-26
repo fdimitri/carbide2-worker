@@ -32,7 +32,7 @@ module RtcHandlers
     peers = room.add_call_client(session.ws)
     Command.reply(session, 'rtc', 'peers', { channel_id: cid, peers: peers })
   end
-  register 'join', :join
+  register 'join', :join, cap: { dir: :in, ver: '1.0.0' }
 
   def self.leave(session, payload)
     cid, room = room_for(session, payload, 'leave')
@@ -40,7 +40,7 @@ module RtcHandlers
     room&.remove_call_client(session.ws)
     Command.reply(session, 'rtc', 'left', { channel_id: cid })
   end
-  register 'leave', :leave
+  register 'leave', :leave, cap: { dir: :in, ver: '1.0.0' }
 
   def self.signal(session, payload)
     cid, room = room_for(session, payload, 'signal')
@@ -52,5 +52,5 @@ module RtcHandlers
     end
     room.relay_signal(session.ws, to, payload['data'])
   end
-  register 'signal', :signal
+  register 'signal', :signal, cap: { dir: :in, ver: '1.0.0' }
 end

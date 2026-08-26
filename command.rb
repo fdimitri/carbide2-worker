@@ -71,8 +71,16 @@ module Command
       @handlers ||= {}
     end
 
-    def register(cmd, method_name)
+    # Command capabilities (ADR-019). `cmd => { dir:, ver: }`. Registry
+    # entries are always `dir: :in` (client→worker); the `:out` (event) half
+    # has no registry entry yet (deferred — declared at emitters later).
+    def caps
+      @caps ||= {}
+    end
+
+    def register(cmd, method_name, cap: nil)
       handlers[cmd.to_s] = method_name
+      caps[cmd.to_s] = cap if cap
     end
 
     def dispatch(cmd, session, payload)

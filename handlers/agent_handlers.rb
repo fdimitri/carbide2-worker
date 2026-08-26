@@ -21,7 +21,7 @@ module AgentHandlers
     end
     Command.reply(session, 'agent', 'list', { agents: agents })
   end
-  register 'list', :list
+  register 'list', :list, cap: { dir: :in, ver: '1.0.0' }
 
   # Advertise the tools this worker can make available, so the client builds
   # its per-agent allowlist UI from the live registry rather than a hardcoded
@@ -29,7 +29,7 @@ module AgentHandlers
   def self.tools(session, _payload)
     Command.reply(session, 'agent', 'tools', { tools: AgentTools.catalog })
   end
-  register 'tools', :tools
+  register 'tools', :tools, cap: { dir: :in, ver: '1.0.0' }
 
   # Conversations visible to the requesting user in this project:
   # all 'project'-visibility threads + this user's own 'private' threads.
@@ -57,7 +57,7 @@ module AgentHandlers
     end
     Command.reply(session, 'agent', 'recent', { conversations: items })
   end
-  register 'recent', :recent
+  register 'recent', :recent, cap: { dir: :in, ver: '1.0.0' }
 
   # Create a conversation WITHOUT a message (#85): the client gets the
   # worker-minted UUID up front, writes its tab as agent:<uuid>, then sends the
@@ -78,7 +78,7 @@ module AgentHandlers
     session.agent_subs << conv unless session.agent_subs.include?(conv)
     Command.reply(session, 'agent', 'created', { conversation_id: conv, agent: agent.slug })
   end
-  register 'create', :create
+  register 'create', :create, cap: { dir: :in, ver: '1.0.0' }
 
   def self.load(session, payload)
     conv  = payload['conversation_id'].to_s
@@ -131,7 +131,7 @@ module AgentHandlers
       messages:        items,
     })
   end
-  register 'load', :load
+  register 'load', :load, cap: { dir: :in, ver: '1.0.0' }
 
   # --- subscribe (delivery membership, #85) ---------------------------------
   # Authorization lives here: a client may subscribe only to a conversation it
@@ -152,7 +152,7 @@ module AgentHandlers
     session.agent_subs << conv unless session.agent_subs.include?(conv)
     Command.reply(session, 'agent', 'subscribed', { conversation_id: conv })
   end
-  register 'subscribe', :subscribe
+  register 'subscribe', :subscribe, cap: { dir: :in, ver: '1.0.0' }
 
   def self.unsubscribe(session, payload)
     conv = payload['conversation_id'].to_s
@@ -161,7 +161,7 @@ module AgentHandlers
     session.agent_subs.delete(conv)
     Command.reply(session, 'agent', 'unsubscribed', { conversation_id: conv })
   end
-  register 'unsubscribe', :unsubscribe
+  register 'unsubscribe', :unsubscribe, cap: { dir: :in, ver: '1.0.0' }
 
   def self.set_visibility(session, payload)
     conv = payload['conversation_id'].to_s
@@ -196,7 +196,7 @@ module AgentHandlers
       owner_user_id:   convo.user_id,
     })
   end
-  register 'set_visibility', :set_visibility
+  register 'set_visibility', :set_visibility, cap: { dir: :in, ver: '1.0.0' }
 
   # Interrupt an in-flight turn. Any project member who can see the
   # conversation may stop it (project-visible => all members; private => owner
@@ -215,7 +215,7 @@ module AgentHandlers
     sess.request_cancel!
     Command.reply(session, 'agent', 'stopping', { conversation_id: conv })
   end
-  register 'stop', :stop
+  register 'stop', :stop, cap: { dir: :in, ver: '1.0.0' }
 
   def self.ask(session, payload)
     slug   = payload['agent_slug'].to_s
@@ -302,5 +302,5 @@ module AgentHandlers
       end
     end
   end
-  register 'ask', :ask
+  register 'ask', :ask, cap: { dir: :in, ver: '1.0.0' }
 end

@@ -87,7 +87,7 @@ module TermHandlers
       finish.call(cwd: cwd)
     end
   end
-  register 'create', :create
+  register 'create', :create, cap: { dir: :in, ver: '1.0.0' }
 
   def self.join(session, payload)
     tid  = payload['terminal_id'].to_i
@@ -104,14 +104,14 @@ module TermHandlers
                     { terminal_id: tid, code: nil, reason: 'gone' })
     end
   end
-  register 'join', :join
+  register 'join', :join, cap: { dir: :in, ver: '1.0.0' }
 
   def self.input(session, payload)
     tid  = payload['terminal_id'].to_i
     term = TERMINALS[tid]
     term.write_input(payload['data'].to_s) if term
   end
-  register 'input', :input
+  register 'input', :input, cap: { dir: :in, ver: '1.0.0' }
 
   def self.resize(session, payload)
     tid  = payload['terminal_id'].to_i
@@ -126,7 +126,7 @@ module TermHandlers
       user_id: session.user_id,
     })
   end
-  register 'resize', :resize
+  register 'resize', :resize, cap: { dir: :in, ver: '1.0.0' }
 
   def self.rename(session, payload)
     tid  = payload['terminal_id'].to_i
@@ -139,7 +139,7 @@ module TermHandlers
       Command.error(session, "terminal #{tid} rename failed")
     end
   end
-  register 'rename', :rename
+  register 'rename', :rename, cap: { dir: :in, ver: '1.0.0' }
 
   # Toggle whether this terminal can be claimed by an agent. The flag is
   # in-memory on TerminalInstance. Allowing toggle AFTER creation is
@@ -154,14 +154,14 @@ module TermHandlers
       Command.error(session, "terminal #{tid} not found or access denied")
     end
   end
-  register 'set_agent_accessible', :set_agent_accessible
+  register 'set_agent_accessible', :set_agent_accessible, cap: { dir: :in, ver: '1.0.0' }
 
   def self.leave(session, payload)
     tid = payload['terminal_id'].to_i
     TERMINALS[tid]&.remove_client(session.ws)
     session.terminals.delete(tid)
   end
-  register 'leave', :leave
+  register 'leave', :leave, cap: { dir: :in, ver: '1.0.0' }
 
   def self.destroy(session, payload)
     tid  = payload['terminal_id'].to_i
@@ -177,7 +177,7 @@ module TermHandlers
       Command.error(session, "terminal #{tid} not found or access denied")
     end
   end
-  register 'destroy', :destroy
+  register 'destroy', :destroy, cap: { dir: :in, ver: '1.0.0' }
 
   # ─── Recording ──────────────────────────────────────────────────────────
   # Start recording PTY output to an asciinema cast file. Idempotent: a
@@ -203,7 +203,7 @@ module TermHandlers
       Command.error(session, "failed to start recording for terminal #{tid}")
     end
   end
-  register 'record_start', :record_start
+  register 'record_start', :record_start, cap: { dir: :in, ver: '1.0.0' }
 
   def self.record_stop(session, payload)
     tid  = payload['terminal_id'].to_i
@@ -222,7 +222,7 @@ module TermHandlers
                     { terminal_id: tid, recording_id: nil, reason: 'not recording' })
     end
   end
-  register 'record_stop', :record_stop
+  register 'record_stop', :record_stop, cap: { dir: :in, ver: '1.0.0' }
 
   # List all recordings for the current project (most recent first). The
   # HTTP blob download lives in the Rails app (RecordingsController) — this
@@ -232,5 +232,5 @@ module TermHandlers
     rows = TerminalRecording.for_project(session.project_id).limit(200).map(&:to_list_entry)
     Command.reply(session, 'term', 'recordings', { recordings: rows })
   end
-  register 'list_recordings', :list_recordings
+  register 'list_recordings', :list_recordings, cap: { dir: :in, ver: '1.0.0' }
 end

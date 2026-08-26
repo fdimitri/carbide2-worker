@@ -84,7 +84,7 @@ module SessionHandlers
                     version_history: bs.version_history,
                     forked_from: bs.forked_from&.session_uuid })
   end
-  register 'create', :create
+  register 'create', :create, cap: { dir: :in, ver: '1.0.0' }
 
   # --- resume (own it again) -------------------------------------------------
   def self.resume(session, payload)
@@ -100,7 +100,7 @@ module SessionHandlers
                     version_history: bs.version_history,
                     forked_from: bs.forked_from&.session_uuid })
   end
-  register 'resume', :resume
+  register 'resume', :resume, cap: { dir: :in, ver: '1.0.0' }
 
   # --- patch (producer only) -------------------------------------------------
   def self.patch(session, payload)
@@ -131,7 +131,7 @@ module SessionHandlers
     Command.reply(session, 'session', 'patched',
                   { session_uuid: bs.session_uuid, rev: bs.updated_at.to_f })
   end
-  register 'patch', :patch
+  register 'patch', :patch, cap: { dir: :in, ver: '1.0.0' }
 
   # --- resync (producer replaces the WHOLE doc) ------------------------------
   # Explicit full-doc replace, not the default resolution for a version/signature
@@ -161,7 +161,7 @@ module SessionHandlers
     Command.reply(session, 'session', 'patched',
                   { session_uuid: bs.session_uuid, rev: bs.updated_at.to_f })
   end
-  register 'resync', :resync
+  register 'resync', :resync, cap: { dir: :in, ver: '1.0.0' }
 
   # --- subscribe (watch, read-only) -----------------------------------------
   def self.subscribe(session, payload)
@@ -172,7 +172,7 @@ module SessionHandlers
                     doc_version: bs.doc_version, version_history: bs.version_history,
                     forked_from: bs.forked_from&.session_uuid })
   end
-  register 'subscribe', :subscribe
+  register 'subscribe', :subscribe, cap: { dir: :in, ver: '1.0.0' }
 
   def self.unsubscribe(session, payload)
     uuid = payload['session_uuid'].to_s
@@ -180,7 +180,7 @@ module SessionHandlers
     unsubscribe_ws(session, uuid)
     Command.reply(session, 'session', 'unsubscribed', { session_uuid: uuid })
   end
-  register 'unsubscribe', :unsubscribe
+  register 'unsubscribe', :unsubscribe, cap: { dir: :in, ver: '1.0.0' }
 
   # --- delete (garbage-collect a session you own) ---------------------------
   # Tears down the in-memory subscriber registry for the session (so any live
@@ -203,7 +203,7 @@ module SessionHandlers
     # Reply to the requester too (they may not be in the subscriber set).
     Command.reply(session, 'session', 'deleted', { session_uuid: uuid })
   end
-  register 'delete', :delete
+  register 'delete', :delete, cap: { dir: :in, ver: '1.0.0' }
 
   # --- snapshot (fetch current doc) -----------------------------------------
   def self.snapshot(session, payload)
@@ -213,7 +213,7 @@ module SessionHandlers
                     doc_version: bs.doc_version, version_history: bs.version_history,
                     forked_from: bs.forked_from&.session_uuid })
   end
-  register 'snapshot', :snapshot
+  register 'snapshot', :snapshot, cap: { dir: :in, ver: '1.0.0' }
 
   # --- list (resume picker) --------------------------------------------------
   # `in_use` = the session currently has a live PRODUCER ws in the in-memory
@@ -241,7 +241,7 @@ module SessionHandlers
                       updated_at: bs.updated_at, created_at: bs.created_at,
                       in_use: in_use?(bs.session_uuid) } } })
   end
-  register 'list', :list
+  register 'list', :list, cap: { dir: :in, ver: '1.0.0' }
 
   # --- generic path-patch application (opaque doc) ---------------------------
   # Mutates `doc` in place. Missing intermediate keys are created as hashes.
