@@ -256,6 +256,9 @@ def establish!(token)
   # and validate_token only enforces the project claim when WORKSPACE_PROJECT_ID
   # is set. Reject project-less tokens here rather than creating a session that
   # joins SESSIONS_BY_PROJECT[nil].
+  # NOTE: this duplicates the claim-resolution in Session#pin_principal
+  # (payload['project_id'] || payload['project']); if a third token format ever
+  # lands, both places must learn it.
   return nil if (payload['project_id'] || payload['project']).nil?
   payload
 end
@@ -598,8 +601,17 @@ EM.run do
                  "server(proto=#{PROTOCOL} min_client=#{MIN_CLIENT}) — serving anyway (advisory)"
           end
 
-          principal = establish!(token)
-          principal ? promote(session, principal) : reject_auth(session)
+          # promote → Session#pin_principal can raise if the invariant is ever
+          # violated; this is the onopen callback (unlike onmessage), so rescue
+          # it here rather than letting it escape into EventMachine.
+          begin
+            principal = establish!(token)
+            principal ? promote(session, principal) : reject_auth(session)
+          rescue => e
+            puts "[auth] onopen establish/promote failed: #{e.class}: #{e.message}"
+            send_msg(ws, 'system', 'error', { message: 'internal auth error' })
+            ws.close_connection_after_writing
+          end
         end
         # No token param: wait for system/auth (or the deadline).
       end
