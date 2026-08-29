@@ -244,14 +244,26 @@ AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
 # project, cancels the auth deadline, and delivers the post-auth state. On
 # failure the socket is closed.
 
-# Pure: token -> principal-or-nil (validation only; identity pinned in promote).
+# Resolve the LOCAL User mirror for a validated control token, by email. The
+# workspace's own users table is authoritative for every *.user_id this pod
+# writes; the token's user_id is control's id space and must never be persisted.
+# Find-only: the REST path creates the mirror; if it's missing here, auth fails.
+def local_user_for(payload)
+  email = payload['user_email'].to_s.downcase.strip
+  email.empty? ? nil : User.find_by(email: email)
+end
+
+# Pure: token -> principal-or-nil (validation + local identity resolution).
 def establish!(token)
   return nil unless token.is_a?(String) && !token.empty?
   payload = validate_token(token)
   return nil unless payload
   # A session without a project is useless: every handler keys on project_id.
   return nil if payload['project_id'].nil?
-  payload
+  user = local_user_for(payload)
+  return nil unless user
+  # Carry the LOCAL id (and local email) into the session; never the control id.
+  payload.merge('user_id' => user.id, 'user_email' => user.email)
 end
 
 def handle_auth(session, payload)
@@ -348,10 +360,11 @@ module SystemHandlers
       send_msg(session.ws, 'system', 'pong', { t: payload['t'] })
     when 'reauth'
       new_payload = validate_token(payload['token'])
-      # Pin identity: a refreshed token must belong to the same user/project as
-      # the one that opened the socket. Anything else is rejected outright.
-      same_identity = new_payload &&
-        new_payload['user_id'].to_s == session.user_id.to_s &&
+      # Resolve the same local user and pin identity: a refreshed token must map
+      # to the same local user/project as the one that opened the socket.
+      new_user = new_payload && local_user_for(new_payload)
+      same_identity = new_user &&
+        new_user.id.to_s == session.user_id.to_s &&
         new_payload['project_id'].to_s == session.project_id.to_s
       if same_identity
         session.reauth(new_payload)

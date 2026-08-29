@@ -31,8 +31,9 @@ class Session
     @authenticated
   end
 
-  # Pin identity from a validated control-minted token payload (ADR-023:
-  # control format only — user_id / project_id / user_email).
+  # Pin identity from a validated token payload whose user_id has ALREADY been
+  # resolved to the LOCAL users.id (see worker.rb establish!). Never the
+  # control-plane user id.
   def pin_principal(payload)
     @user_id       = payload['user_id']
     @name          = payload['user_email'] || "user_#{@user_id}"
