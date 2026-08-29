@@ -312,7 +312,8 @@ def arm_auth_deadline(session)
 end
 
 def cancel_auth_deadline(session)
-  AUTH_DEADLINES.delete(session)&.cancel
+  timer = AUTH_DEADLINES.delete(session)
+  EM.cancel_timer(timer) if timer
 end
 
 # ---------------------------------------------------------------------------
