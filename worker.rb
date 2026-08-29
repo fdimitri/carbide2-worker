@@ -98,6 +98,7 @@ require_relative 'document'
 require_relative 'project_container'
 require_relative 'project_pod'
 require_relative 'session'
+require_relative 'jwt_verifier'
 require_relative 'ar_boot'
 require_relative 'fs_store'
 require_relative 'vfs_flusher'
@@ -114,8 +115,9 @@ require_relative 'handlers/rtc_handlers'
 require_relative 'handlers/session_handlers'
 require 'set'
 
-WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
-ALGORITHM     = 'HS256'
+# ADR-015 asymmetric signing: the worker verifies control-minted RS256 tokens
+# against public keys fetched from the JWKS endpoint. It holds NO signing secret.
+JwtVerifier.configure(jwks_url: ENV.fetch('CONTROL_JWKS_URL') { 'http://control-plane.carbide-system.svc.cluster.local:3001/.well-known/jwks.json' })
 
 # ADR-023 — first-message auth. An unauthenticated socket has
 # AUTH_TIMEOUT_SECONDS to send system/auth before it is disconnected, and the
@@ -160,12 +162,12 @@ puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT} (fallback only — overridden by p
 
 # Validate a worker JWT. ADR-023: control-plane-only — the only accepted format
 # is the control-minted one (iss=carbide-control, aud=workspace:<id>,
-# project_id, user_id, scope=workspace:rw). The legacy server-minted format is
-# gone; a token without the control issuer is rejected outright.
+# project_id, user_id, scope=workspace:rw). Signature is RS256, verified against
+# the JWKS public keys (ADR-015) — never a shared secret.
 #
 # See JWT_CLAIMS.md for the wire format.
 def validate_token(token)
-  payload, _ = JWT.decode(token, WORKER_SECRET, true, { algorithm: ALGORITHM })
+  payload = JwtVerifier.verify(token)
 
   return nil unless payload['iss'] == 'carbide-control'
 
