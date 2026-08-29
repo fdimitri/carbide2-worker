@@ -258,12 +258,17 @@ def establish!(token)
   return nil unless token.is_a?(String) && !token.empty?
   payload = validate_token(token)
   return nil unless payload
-  # A session without a project is useless: every handler keys on project_id.
-  return nil if payload['project_id'].nil?
+  # validate_token already enforced the token's CONTROL project_id/aud/scope.
+  # Resolve the LOCAL user mirror (by email) and the LOCAL canonical project
+  # (Model B: one project per pod, id 1). Neither local id is the token's.
   user = local_user_for(payload)
   return nil unless user
-  # Carry the LOCAL id (and local email) into the session; never the control id.
-  payload.merge('user_id' => user.id, 'user_email' => user.email)
+  project = Project.canonical
+  payload.merge(
+    'user_id'    => user.id,          # LOCAL users.id
+    'user_email' => user.email,
+    'project_id' => project.id        # LOCAL projects.id (1)
+  )
 end
 
 def handle_auth(session, payload)
@@ -361,12 +366,11 @@ module SystemHandlers
       send_msg(session.ws, 'system', 'pong', { t: payload['t'] })
     when 'reauth'
       new_payload = validate_token(payload['token'])
-      # Resolve the same local user and pin identity: a refreshed token must map
-      # to the same local user/project as the one that opened the socket.
+      # Pin identity: a refreshed token must map to the same LOCAL user. Project
+      # identity is invariant (one canonical project per pod), so only the user
+      # needs checking here.
       new_user = new_payload && local_user_for(new_payload)
-      same_identity = new_user &&
-        new_user.id.to_s == session.user_id.to_s &&
-        new_payload['project_id'].to_s == session.project_id.to_s
+      same_identity = new_user && new_user.id.to_s == session.user_id.to_s
       if same_identity
         session.reauth(new_payload)
         send_msg(session.ws, 'system', 'reauth_ok', { exp: session.token_exp })
