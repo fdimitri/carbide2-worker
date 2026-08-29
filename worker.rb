@@ -171,6 +171,14 @@ def validate_token(token)
 
   return nil unless payload['iss'] == 'carbide-control'
 
+  # Audience guard: the token must name THIS workspace (uuid), preventing a
+  # token minted for workspace A from being replayed against workspace B.
+  expected = ENV['WORKSPACE_PROJECT_UUID'].to_s
+  unless expected.empty? || payload['aud'] == "workspace:#{expected}"
+    puts "[validate_token] aud mismatch: got #{payload['aud'].inspect}, want workspace:#{expected}"
+    return nil
+  end
+
   unless %w[workspace:rw].include?(payload['scope'])
     puts "[validate_token] unsupported scope: #{payload['scope'].inspect}"
     return nil
