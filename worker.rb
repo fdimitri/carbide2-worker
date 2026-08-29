@@ -244,13 +244,25 @@ AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
 # project, cancels the auth deadline, and delivers the post-auth state. On
 # failure the socket is closed.
 
-# Resolve the LOCAL User mirror for a validated control token, by email. The
-# workspace's own users table is authoritative for every *.user_id this pod
-# writes; the token's user_id is control's id space and must never be persisted.
-# Find-only: the REST path creates the mirror; if it's missing here, auth fails.
+# Resolve the LOCAL User mirror for a validated control token. Prefer the
+# stable control uuid (users.control_uuid, ADR-015); fall back to email for
+# pods that haven't stamped control_uuid yet. The token's integer user_id is
+# control's id space and must never be persisted. Find-only: the REST path is
+# the creator/mirror-stamper.
 def local_user_for(payload)
+  uuid  = payload['user_uuid'].to_s.strip
   email = payload['user_email'].to_s.downcase.strip
-  email.empty? ? nil : User.find_by(email: email)
+  return nil if email.empty?
+  (uuid.empty? ? nil : User.find_by(control_uuid: uuid)) || User.find_by(email: email)
+end
+
+# Resolve the LOCAL project by its stable control-owned uuid (ADR-015). Under
+# 1:1 the token's project_uuid is the workspace uuid, mirrored into the pod as
+# WORKSPACE_PROJECT_UUID. Fall back to the single canonical project for local
+# dev without control.
+def local_project_for(payload)
+  uuid = payload['project_uuid'].to_s.strip
+  (uuid.empty? ? nil : Project.find_by(uuid: uuid)) || Project.canonical
 end
 
 # Pure: token -> principal-or-nil (validation + local identity resolution).
@@ -259,15 +271,15 @@ def establish!(token)
   payload = validate_token(token)
   return nil unless payload
   # validate_token already enforced the token's CONTROL project_id/aud/scope.
-  # Resolve the LOCAL user mirror (by email) and the LOCAL canonical project
-  # (Model B: one project per pod, id 1). Neither local id is the token's.
-  user = local_user_for(payload)
-  return nil unless user
-  project = Project.canonical
+  # Resolve the LOCAL user and LOCAL project by their stable uuids; neither
+  # local id is the token's integer id.
+  user    = local_user_for(payload)
+  project = local_project_for(payload)
+  return nil unless user && project
   payload.merge(
     'user_id'    => user.id,          # LOCAL users.id
     'user_email' => user.email,
-    'project_id' => project.id        # LOCAL projects.id (1)
+    'project_id' => project.id        # LOCAL projects.id
   )
 end
 
