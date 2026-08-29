@@ -120,11 +120,10 @@ class JwtVerifier
   end
 
   def rsa_public_key(jwk)
-    n = OpenSSL::BN.new(Base64.urlsafe_decode64(jwk['n']), 2)
-    e = OpenSSL::BN.new(Base64.urlsafe_decode64(jwk['e']), 2)
-    key = OpenSSL::PKey::RSA.new
-    key.set_key(n, e, nil)
-    key
+    # JWT::JWK.import handles the OpenSSL 3.0 (immutable pkey, DER path) vs
+    # older (set_key) split internally — never call OpenSSL::PKey::RSA.new with
+    # no args and set_key under OpenSSL 3.0.
+    JWT::JWK.import(jwk).verify_key
   end
 
   def monotonic_now
