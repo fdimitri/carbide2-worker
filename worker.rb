@@ -161,27 +161,15 @@ puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT} (fallback only — overridden by p
 # ---------------------------------------------------------------------------
 
 # Validate a worker JWT. ADR-023: control-plane-only — the only accepted format
-# is the control-minted one (iss=carbide-control, aud=workspace:<id>,
-# project_id, user_id, scope=workspace:rw). Signature is RS256, verified against
-# the JWKS public keys (ADR-015) — never a shared secret.
+# is the control-minted one (iss=carbide-control, scope=workspace:rw). Signature
+# is RS256, verified against the JWKS public keys (ADR-015) — never a shared
+# secret. Identity is uuid-only (ADR-015); no integer claims.
 #
 # See JWT_CLAIMS.md for the wire format.
 def validate_token(token)
   payload = JwtVerifier.verify(token)
 
   return nil unless payload['iss'] == 'carbide-control'
-
-  expected_project = ENV['WORKSPACE_PROJECT_ID']&.to_i
-  if expected_project && expected_project > 0
-    if payload['aud'] != "workspace:#{expected_project}"
-      puts "[validate_token] aud mismatch: got #{payload['aud'].inspect}, want workspace:#{expected_project}"
-      return nil
-    end
-    if payload['project_id'].to_i != expected_project
-      puts "[validate_token] project_id mismatch: got #{payload['project_id'].inspect}, want #{expected_project}"
-      return nil
-    end
-  end
 
   unless %w[workspace:rw].include?(payload['scope'])
     puts "[validate_token] unsupported scope: #{payload['scope'].inspect}"
