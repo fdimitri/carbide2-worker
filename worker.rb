@@ -242,13 +242,12 @@ AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
 # project, cancels the auth deadline, and delivers the post-auth state. On
 # failure the socket is closed.
 
-# Resolve the LOCAL User mirror for a validated control token. Prefer the
-# stable control uuid (users.control_uuid, ADR-015); fall back to email for
-# pods that haven't stamped control_uuid yet. The token's integer user_id is
-# control's id space and must never be persisted. Find-only: the REST path is
-# the creator/mirror-stamper.
+# Resolve the LOCAL User mirror for a validated control token. The subject is
+# typed (`sub: user:<uuid>`); fall back to email for pods that haven't stamped
+# control_uuid yet. Find-only: the REST path is the creator/mirror-stamper.
 def local_user_for(payload)
-  uuid  = payload['user_uuid'].to_s.strip
+  sub   = payload['sub'].to_s
+  uuid  = sub.start_with?('user:') ? sub.delete_prefix('user:') : ''
   email = payload['user_email'].to_s.downcase.strip
   return nil if email.empty?
   (uuid.empty? ? nil : User.find_by(control_uuid: uuid)) || User.find_by(email: email)
