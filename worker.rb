@@ -267,7 +267,7 @@ def establish!(token)
   return nil unless token.is_a?(String) && !token.empty?
   payload = validate_token(token)
   return nil unless payload
-  # validate_token already enforced the token's CONTROL project_id/aud/scope.
+  # validate_token already enforced the token's iss/aud/scope.
   # Resolve the LOCAL user and LOCAL project by their stable uuids; neither
   # local id is the token's integer id.
   user    = local_user_for(payload)
