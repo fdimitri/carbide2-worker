@@ -588,14 +588,22 @@ EM.run do
   end
 
   EM::WebSocket.start(host: host, port: port) do |ws|
-    session = nil
+    session  = nil
+    is_probe = false
 
     ws.onopen do |handshake|
       params = URI.decode_www_form(handshake.query_string || '').to_h
+      probe  = (params['probe'] == 'true')
 
       if PENDING_AUTH.size >= MAX_PENDING_AUTH
         puts "[auth] max pending auth sessions (#{MAX_PENDING_AUTH}) reached; rejecting connection"
         ws.close_connection_after_writing
+      elsif probe
+        # Health-probe connection: the control plane only checks that the WS
+        # upgrades (101). It never sends system/auth, so don't arm the auth
+        # deadline and don't treat the absent proto/min_server as a mismatch.
+        is_probe = true
+        session  = Session.unauthenticated(ws)
       else
         # Wire-protocol handshake (advisory). proto/min_server remain in the
         # query string — wire versioning is ADR-019's concern, not ADR-023's.
@@ -655,7 +663,7 @@ EM.run do
 
           session.cleanup
         else
-          puts 'Client disconnected before authentication'
+          puts 'Client disconnected before authentication' unless is_probe
         end
         session = nil
       end
