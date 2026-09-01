@@ -125,6 +125,13 @@ JwtVerifier.configure(jwks_url: ENV.fetch('CONTROL_JWKS_URL') { 'http://control-
 AUTH_TIMEOUT_SECONDS = Integer(ENV.fetch('CARBIDE_AUTH_TIMEOUT_SECONDS', '10'))
 MAX_PENDING_AUTH     = Integer(ENV.fetch('CARBIDE_MAX_PENDING_AUTH', '100'))
 
+# A ?probe=true connection exists only to prove the WS upgrade (101) succeeded.
+# Its command allowlist is empty today: probes may not route, auth, or promote.
+# If we later want probes to answer a lightweight query (e.g. worker status),
+# add the allowed [cs, cmd] pairs here — the onmessage probe branch consults
+# this list.
+PROBE_ALLOWED_COMMANDS = [].freeze
+
 # ---------------------------------------------------------------------------
 # Wire-protocol versioning
 # ---------------------------------------------------------------------------
@@ -625,7 +632,19 @@ EM.run do
 
     ws.onmessage do |msg|
       begin
-        if session&.authenticated?
+        if is_probe
+          # Probes may only send commands on PROBE_ALLOWED_COMMANDS (empty
+          # today). They are never promotable to a real session.
+          parsed = (JSON.parse(msg) rescue nil)
+          allowed = parsed.is_a?(Hash) &&
+                    PROBE_ALLOWED_COMMANDS.include?([parsed['cs'], parsed['cmd']])
+          if allowed
+            route(session, msg)
+          else
+            puts '[probe] frame not in probe allowlist; closing'
+            ws.close_connection_after_writing
+          end
+        elsif session&.authenticated?
           route(session, msg)
         else
           # Unauthenticated (or a rejected connection where session is nil):
