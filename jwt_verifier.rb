@@ -75,9 +75,12 @@ class JwtVerifier
         keys = @keys || []
       elsif now - @fetched_at >= STALE_CEILING
         refetch(now) if due?(@last_attempt_at, now, REFRESH_TTL)
-        keys = []   # past ceiling: fail closed
+        # Past ceiling: fail closed. Do NOT fall through to the unknown-kid
+        # fallback below, which searches @keys again and would keep serving
+        # stale (possibly rotated/revoked) keys.
+        return nil
       elsif now - @fetched_at >= REFRESH_TTL
-        refetch(now)
+        refetch(now) if due?(@last_attempt_at, now, REFETCH_THROTTLE)
         keys = @keys || []
       end
 
