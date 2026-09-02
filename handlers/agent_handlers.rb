@@ -269,37 +269,46 @@ module AgentHandlers
       return
     end
 
-    # The asker is an implicit subscriber (delivery membership). Explicit
-    # subscribe is also available for opening/loading a conversation without
-    # asking.
-    AgentSession.subscribe(session, conv)
-    session.agent_subs << conv unless session.agent_subs.include?(conv)
-    # Ack immediately so the UI can show the conversation id.
-    Command.reply(session, 'agent', 'started',
-                  { conversation_id: conv, agent: agent.slug })
+    begin
+      # The asker is an implicit subscriber (delivery membership). Explicit
+      # subscribe is also available for opening/loading a conversation without
+      # asking.
+      AgentSession.subscribe(session, conv)
+      session.agent_subs << conv unless session.agent_subs.include?(conv)
+      # Ack immediately so the UI can show the conversation id.
+      Command.reply(session, 'agent', 'started',
+                    { conversation_id: conv, agent: agent.slug })
 
-    # Resolve the display name from the authoritative user record rather than
-    # the JWT claim (session.name is user_email on new control-plane tokens).
-    author = User.find_by(id: session.user_id)
-    name   = author&.display_name || session.name || "user #{session.user_id}"
+      # Resolve the display name from the authoritative user record rather than
+      # the JWT claim (session.name is user_email on new control-plane tokens).
+      author = User.find_by(id: session.user_id)
+      name   = author&.display_name || session.name || "user #{session.user_id}"
 
-    # Fan the user turn out to everyone else who is allowed to see this
-    # conversation. The sender pushed it locally already, so exclude only the
-    # originating socket (same user's other sessions still receive it).
-    sess.broadcast_user_turn(
-      user_id:   session.user_id,
-      name:      name,
-      text:      msg,
-      images:    images,
-      origin_ws: session.ws,
-    )
+      # Fan the user turn out to everyone else who is allowed to see this
+      # conversation. The sender pushed it locally already, so exclude only the
+      # originating socket (same user's other sessions still receive it).
+      sess.broadcast_user_turn(
+        user_id:   session.user_id,
+        name:      name,
+        text:      msg,
+        images:    images,
+        origin_ws: session.ws,
+      )
 
-    EM.defer do
-      begin
-        sess.ask(msg, images: images, author_user_id: session.user_id)
-      ensure
-        sess.finish_turn!
+      EM.defer do
+        begin
+          sess.ask(msg, images: images, author_user_id: session.user_id)
+        ensure
+          sess.finish_turn!
+        end
       end
+    rescue StandardError
+      # A synchronous failure between try_begin_turn! and EM.defer must still
+      # release the turn lock, or the conversation is stuck in
+      # "a turn is already in progress" until the worker restarts (#93).
+      # Re-raise so Command.with_error_handling surfaces it.
+      sess.finish_turn!
+      raise
     end
   end
   register 'ask', :ask
