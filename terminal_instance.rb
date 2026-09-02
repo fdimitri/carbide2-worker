@@ -408,11 +408,21 @@ class TerminalInstance
   # shell_peek_buffer tool (#70). Never claims the terminal, never sets
   # @agent_busy, and never mutates the buffer — a pure peek. `tail_bytes`
   # defaults to 0 (whole buffer); a positive value returns the last N bytes.
+  #
+  # The PTY reader appends valid UTF-8, but a raw byteslice can cut a multi-byte
+  # character in half. Snap to a character boundary: if the slice starts
+  # mid-character, advance the start past the partial lead byte so the returned
+  # tail is always valid UTF-8 and JSON-serializable (#6).
   def scrollback_snapshot(tail_bytes: 0)
-    buf = @scrollback
+    buf = @scrollback.dup
     n   = tail_bytes.to_i
     return buf if n <= 0 || buf.bytesize <= n
-    buf.byteslice(-n, n) || +''
+
+    tail = buf.byteslice(-n, n) || +''
+    until tail.valid_encoding? || tail.empty?
+      tail = tail.byteslice(1, tail.bytesize - 1) || +''
+    end
+    tail
   end
 
   private
