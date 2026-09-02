@@ -69,7 +69,22 @@ class VfsWatcher
 
   def add_watches_recursive(dir)
     add_watch(dir)
-    Dir.glob("#{dir}/**/*/").each { |d| add_watch(d.chomp('/')) }
+    # Dotmatch-aware: hidden directories (.carbide, .gnupg, ...) are
+    # first-class workspace paths and must get watches too. Dir.glob without
+    # FNM_DOTMATCH silently skipped them, so writes inside dot-dirs never
+    # produced a close_write and never reached the DBFS (#77).
+    #
+    # Mirror FsLoader's traversal (Dir.foreach) and its prune set so the two
+    # can't drift: .git / node_modules / .bundle are excluded by the loader and
+    # therefore must not be watched (and watching .git's object store would
+    # otherwise risk exhausting inotify watches).
+    Dir.foreach(dir) do |name|
+      next if name == '.' || name == '..'
+      sub = File.join(dir, name)
+      next if File.symlink?(sub)          # don't follow/loop; inotify won't traverse them
+      next if FsLoader::PRUNE_DIR_NAMES.include?(name)
+      add_watches_recursive(sub) if File.directory?(sub)
+    end
   end
 
   def add_watch(dir)
