@@ -345,9 +345,10 @@ end
 
 # A probe socket never authenticates and isn't tracked in PENDING_AUTH, so it
 # needs its own lifetime bound (#6). Close it after PROBE_DEADLINE_SECONDS.
+# close_connection_after_writing is safe/idempotent on an already-closed
+# connection, so no closed? guard is needed (and em-websocket doesn't expose one).
 def arm_probe_deadline(session)
   EM.add_timer(PROBE_DEADLINE_SECONDS) do
-    next if session.ws.closed?
     puts '[probe] deadline exceeded; closing probe connection'
     session.ws.close_connection_after_writing
   end
