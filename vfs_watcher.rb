@@ -157,17 +157,15 @@ class VfsWatcher
     # in the explorer. Fixes #2 (May30-Questions.md) for new directories.
     if event.flags.include?(:isdir)
       if (event.flags.include?(:create) || event.flags.include?(:moved_to)) && File.directory?(abs_path)
-        if abs_path.start_with?(@root_path + '/')
-          # Create the DBFS entry and arm the reconcile sweep BEFORE adding
-          # watches, so a walk failure can't skip them and leave the subtree
-          # invisible with no #72 recovery (#101).
-          ensure_dir_entry(abs_path)
-          # Files may have been written into this directory before its watch
-          # went live (recursive-watch race). Queue an idempotent sweep of its
-          # contents. See fdimitri/carbide2#72.
-          mark_dirty(abs_path)
-        end
+        in_root = abs_path.start_with?(@root_path + '/')
+        # Arm the #72 reconcile sweep BEFORE the walk: it's a free timer-arm and
+        # a walk failure must not skip recovery (#101).
+        mark_dirty(abs_path) if in_root
         add_watches_recursive(abs_path)
+        # Create the DBFS entry AFTER the walk: ensure_dir_entry is self-rescuing,
+        # and its DB write + broadcast must not delay watch registration (which
+        # would widen the #72 window the sweep exists to protect) (#101).
+        ensure_dir_entry(abs_path) if in_root
       end
       return
     end
