@@ -161,7 +161,12 @@ class VfsWatcher
         # Arm the #72 reconcile sweep BEFORE the walk: it's a free timer-arm and
         # a walk failure must not skip recovery (#101).
         mark_dirty(abs_path) if in_root
-        add_watches_recursive(abs_path)
+        # Runtime prune: a directory created AFTER startup (git init, npm install)
+        # must respect the same .git / node_modules / .bundle exclusion as the
+        # startup traversal, or we watch pruned trees and can exhaust inotify (#6).
+        unless FsLoader::PRUNE_DIR_NAMES.include?(File.basename(abs_path))
+          add_watches_recursive(abs_path)
+        end
         # Create the DBFS entry AFTER the walk: ensure_dir_entry is self-rescuing,
         # and its DB write + broadcast must not delay watch registration (which
         # would widen the #72 window the sweep exists to protect) (#101).
