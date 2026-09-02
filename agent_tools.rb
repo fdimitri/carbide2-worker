@@ -573,9 +573,11 @@ module AgentTools
   # Gate: the terminal must be agent_accessible (peeking still exposes what
   # the user typed/ran), but it does NOT require agent.shell_exec_enabled —
   # reading is strictly less privileged than executing.
+  #
+  # Default tail: project_settings.agent_shell_peek_tail_bytes when present;
+  # an explicit tail_bytes always wins. Neither → whole buffer. No code
+  # constant, no env fallback.
   # ---------------------------------------------------------------------
-  SHELL_PEEK_DEFAULT_TAIL = 8 * 1024   # bytes returned to the model by default
-
   register('shell_peek_buffer',
     schema: {
       type: 'function',
@@ -585,8 +587,9 @@ module AgentTools
                      'on an agent-accessible terminal. Use list_terminals first ' \
                      "to find a terminal_id. This does not run a command and " \
                      'does not lock the user out; it only reads what is already ' \
-                     'on screen. Defaults to the last 8KB of scrollback, with ' \
-                     'ANSI control sequences stripped.',
+                     'on screen. Returns the configured default tail of ' \
+                     'scrollback (or the whole buffer when no default is set), ' \
+                     'with ANSI control sequences stripped.',
         parameters: {
           type: 'object',
           required: ['terminal_id'],
@@ -595,7 +598,7 @@ module AgentTools
                            description: 'ID from list_terminals' },
             tail_bytes:  { type: 'integer',
                            description: 'Number of trailing bytes to return ' \
-                                        "(default 8192; 0 = entire buffer)." },
+                                        "(overrides the project default; 0 = whole buffer)." },
             strip_ansi:  { type: 'boolean',
                            description: 'Strip ANSI/OSC/control sequences ' \
                                         '(default true).' },
@@ -614,8 +617,11 @@ module AgentTools
       next { error: "terminal #{tid} is not agent-accessible" }
     end
 
+    proj_setting = Project.find_by(id: project_id)&.project_setting
+    default_tail = proj_setting&.agent_shell_peek_tail_bytes
+
     tail = args['tail_bytes']
-    tail = SHELL_PEEK_DEFAULT_TAIL if tail.nil?
+    tail = default_tail if tail.nil?
     data = term.scrollback_snapshot(tail_bytes: tail.to_i)
 
     strip = args.key?('strip_ansi') ? !!args['strip_ansi'] : true
