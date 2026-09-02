@@ -565,9 +565,16 @@ EM.run do
 
             watcher = VfsWatcher.new(project_id: project_id, root_path: fs_root,
                                      suppress_set: VFS_FLUSH_SUPPRESS)
-            VFS_WATCHERS[project_id] = watcher
-            watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
-                           broadcast_fn: method(:broadcast))
+            if watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
+                              broadcast_fn: method(:broadcast))
+              VFS_WATCHERS[project_id] = watcher
+            else
+              puts "[startup] live FS sync DISABLED for project #{project_id} — DB→disk flush still active"
+              DebugStream.emit(:watcher, level: :warn,
+                message: "live FS sync disabled (watcher failed to start)",
+                project_id: project_id,
+                meta: { source: 'startup' }) if defined?(DebugStream)
+            end
           end
         end
       rescue => e
