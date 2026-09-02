@@ -38,6 +38,11 @@ class VfsWatcher
     @reconciling     = false
   end
 
+  # Returns true on success, false when the watcher could not be started. On
+  # failure it releases the notifier (and any kernel watches already allocated)
+  # so the caller can decline to register it (#101) instead of leaving a
+  # half-initialized watcher that holds fds/watch budget while never consuming
+  # events.
   def start!(sessions_by_project:, broadcast_fn:)
     @sessions_by_project = sessions_by_project
     @broadcast_fn        = broadcast_fn
@@ -53,8 +58,15 @@ class VfsWatcher
     @em_conn.notify_readable = true
 
     puts "[VfsWatcher:#{@project_id}] watching #{@root_path}"
+    true
   rescue => e
     puts "[VfsWatcher:#{@project_id}] start! failed: #{e.class}: #{e.message}"
+    if e.is_a?(Errno::ENOSPC)
+      puts "[VfsWatcher:#{@project_id}] inotify watch limit reached — raise " \
+           "fs.inotify.max_user_watches on the NODE (node sysctl, not pod-tunable) and restart the worker"
+    end
+    stop!
+    false
   end
 
   def stop!
@@ -69,7 +81,39 @@ class VfsWatcher
 
   def add_watches_recursive(dir)
     add_watch(dir)
-    Dir.glob("#{dir}/**/*/").each { |d| add_watch(d.chomp('/')) }
+    # Dotmatch-aware: hidden directories (.carbide, .gnupg, ...) are
+    # first-class workspace paths and must get watches too. Dir.glob without
+    # FNM_DOTMATCH silently skipped them, so writes inside dot-dirs never
+    # produced a close_write and never reached the DBFS (#77).
+    #
+    # Mirror FsLoader's prune set so the two can't drift: .git / node_modules /
+    # .bundle are excluded by the loader and therefore must not be watched (and
+    # watching .git's object store would otherwise risk exhausting inotify
+    # watches).
+    #
+    # Guarded on both the enumeration and the per-child stat (#101): a directory
+    # that vanishes or becomes unreadable mid-walk must skip that subtree, not
+    # kill the entire recursive walk (Dir.glob silently skipped these;
+    # Dir.children raises).
+    begin
+      entries = Dir.children(dir)
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ENAMETOOLONG
+      return
+    end
+
+    entries.each do |name|
+      next if FsLoader::PRUNE_DIR_NAMES.include?(name)
+      sub = File.join(dir, name)
+
+      begin
+        next if File.symlink?(sub)          # don't follow/loop; inotify won't traverse them
+        next unless File.directory?(sub)
+      rescue Errno::ENOENT, Errno::EACCES, Errno::ENAMETOOLONG
+        next
+      end
+
+      add_watches_recursive(sub)
+    end
   end
 
   def add_watch(dir)
@@ -113,14 +157,20 @@ class VfsWatcher
     # in the explorer. Fixes #2 (May30-Questions.md) for new directories.
     if event.flags.include?(:isdir)
       if (event.flags.include?(:create) || event.flags.include?(:moved_to)) && File.directory?(abs_path)
-        add_watches_recursive(abs_path)
-        if abs_path.start_with?(@root_path + '/')
-          ensure_dir_entry(abs_path)
-          # Files may have been written into this directory before its watch
-          # went live (recursive-watch race). Queue an idempotent sweep of its
-          # contents. See fdimitri/carbide2#72.
-          mark_dirty(abs_path)
+        in_root = abs_path.start_with?(@root_path + '/')
+        # Arm the #72 reconcile sweep BEFORE the walk: it's a free timer-arm and
+        # a walk failure must not skip recovery (#101).
+        mark_dirty(abs_path) if in_root
+        # Runtime prune: a directory created AFTER startup (git init, npm install)
+        # must respect the same .git / node_modules / .bundle exclusion as the
+        # startup traversal, or we watch pruned trees and can exhaust inotify (#6).
+        unless FsLoader::PRUNE_DIR_NAMES.include?(File.basename(abs_path))
+          add_watches_recursive(abs_path)
         end
+        # Create the DBFS entry AFTER the walk: ensure_dir_entry is self-rescuing,
+        # and its DB write + broadcast must not delay watch registration (which
+        # would widen the #72 window the sweep exists to protect) (#101).
+        ensure_dir_entry(abs_path) if in_root
       end
       return
     end

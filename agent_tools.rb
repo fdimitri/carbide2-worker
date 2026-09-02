@@ -562,6 +562,78 @@ module AgentTools
   end
 
   # ---------------------------------------------------------------------
+  # shell_peek_buffer(terminal_id, tail_bytes?, strip_ansi?) — read-only
+  # snapshot of a terminal's scrollback for the agent (#70).
+  #
+  # Does NOT claim the terminal, does NOT set @agent_busy, and does NOT lock
+  # the user out. It returns the current scrollback tail as text — the raw
+  # literal buffer, optionally ANSI-stripped. No rendered screen grid: that
+  # is the separate shell_get_rendered_screen (#71).
+  #
+  # Gate: the terminal must be agent_accessible (peeking still exposes what
+  # the user typed/ran), but it does NOT require agent.shell_exec_enabled —
+  # reading is strictly less privileged than executing.
+  #
+  # Default tail: project_settings.agent_shell_peek_tail_bytes (seeded, always
+  # present); an explicit tail_bytes always wins. No code constant, no env
+  # fallback.
+  # ---------------------------------------------------------------------
+  register('shell_peek_buffer',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'shell_peek_buffer',
+        description: 'Return a read-only snapshot of the most recent output ' \
+                     'on an agent-accessible terminal. Use list_terminals first ' \
+                     "to find a terminal_id. This does not run a command and " \
+                     'does not lock the user out; it only reads what is already ' \
+                     'on screen. Returns the project-configured default tail ' \
+                     'of scrollback, with ANSI control sequences stripped.',
+        parameters: {
+          type: 'object',
+          required: ['terminal_id'],
+          properties: {
+            terminal_id: { type: 'integer',
+                           description: 'ID from list_terminals' },
+            tail_bytes:  { type: 'integer',
+                           description: 'Number of trailing bytes to return ' \
+                                        "(overrides the project default; 0 = whole buffer)." },
+            strip_ansi:  { type: 'boolean',
+                           description: 'Strip ANSI/OSC/control sequences ' \
+                                        '(default true).' },
+          },
+          additionalProperties: false,
+        },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    tid = args['terminal_id'].to_i
+    term = TERMINALS[tid]
+    unless term && term.project_id == project_id
+      next { error: "terminal #{tid} not found in this project" }
+    end
+    unless term.agent_accessible
+      next { error: "terminal #{tid} is not agent-accessible" }
+    end
+
+    proj_setting = Project.find_by(id: project_id)&.project_setting
+    next { error: "project #{project_id} has no project settings" } unless proj_setting
+
+    tail = args['tail_bytes']
+    tail = proj_setting.agent_shell_peek_tail_bytes if tail.nil?
+    data = term.scrollback_snapshot(tail_bytes: tail.to_i)
+
+    strip = args.key?('strip_ansi') ? !!args['strip_ansi'] : true
+    clean = strip ? data.gsub(SHELL_EXEC_ANSI_RX, '') : data
+
+    {
+      terminal_id: tid,
+      bytes:       clean.bytesize,
+      content:     clean,
+    }
+  end
+
+  # ---------------------------------------------------------------------
   # file_edit_anchored(path, edits[], base_revision?) — anchored find/replace.
   #
   # Each edit locates old_string in the current file content and swaps it for

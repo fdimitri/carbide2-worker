@@ -98,6 +98,7 @@ require_relative 'document'
 require_relative 'project_container'
 require_relative 'project_pod'
 require_relative 'session'
+require_relative 'jwt_verifier'
 require_relative 'ar_boot'
 require_relative 'fs_store'
 require_relative 'vfs_flusher'
@@ -114,8 +115,25 @@ require_relative 'handlers/rtc_handlers'
 require_relative 'handlers/session_handlers'
 require 'set'
 
-WORKER_SECRET = ENV.fetch('WORKER_JWT_SECRET', 'replace_me')
-ALGORITHM     = 'HS256'
+# ADR-015 asymmetric signing: the worker verifies control-minted RS256 tokens
+# against public keys fetched from the JWKS endpoint. It holds NO signing secret.
+JwtVerifier.configure(jwks_url: ENV.fetch('CONTROL_JWKS_URL') { 'http://control-plane.carbide-system.svc.cluster.local:3001/.well-known/jwks.json' })
+
+# ADR-023 — first-message auth. An unauthenticated socket has
+# AUTH_TIMEOUT_SECONDS to send system/auth before it is disconnected, and the
+# worker holds at most MAX_PENDING_AUTH unauthenticated sockets at once.
+AUTH_TIMEOUT_SECONDS = Integer(ENV.fetch('CARBIDE_AUTH_TIMEOUT_SECONDS', '10'))
+MAX_PENDING_AUTH     = Integer(ENV.fetch('CARBIDE_MAX_PENDING_AUTH', '100'))
+
+# A ?probe=true connection exists only to prove the WS upgrade (101) succeeded.
+# Its command allowlist is empty today: probes may not route, auth, or promote.
+# If we later want probes to answer a lightweight query (e.g. worker status),
+# add the allowed [cs, cmd] pairs here — the onmessage probe branch consults
+# this list.
+PROBE_ALLOWED_COMMANDS = [].freeze
+# Probe sockets are 101-then-close, so this is a generous upper bound; it
+# prevents an attacker from holding ?probe connections open indefinitely.
+PROBE_DEADLINE_SECONDS = 5
 
 # ---------------------------------------------------------------------------
 # Wire-protocol versioning
@@ -152,36 +170,28 @@ puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT} (fallback only — overridden by p
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Validate a worker JWT. Accepts two formats:
-#   1. New (carbide2-control-minted): iss=carbide-control, aud=workspace:<id>,
-#      project_id, user_id, scope=workspace:rw. Audience + iss + project_id
-#      enforced when ENV['WORKSPACE_PROJECT_ID'] is set.
-#   2. Legacy (server-minted by WorkerTokenIssuer): no iss/aud, claims
-#      named project/user/name. Accepted for backward compat during the
-#      control-plane rollout; remove once everything mints via the new path.
+# Validate a worker JWT. ADR-023: control-plane-only — the only accepted format
+# is the control-minted one (iss=carbide-control, scope=workspace:rw). Signature
+# is RS256, verified against the JWKS public keys (ADR-015) — never a shared
+# secret. Identity is uuid-only (ADR-015); no integer claims.
 #
 # See JWT_CLAIMS.md for the wire format.
 def validate_token(token)
-  payload, _ = JWT.decode(token, WORKER_SECRET, true, { algorithm: ALGORITHM })
+  payload = JwtVerifier.verify(token)
 
-  expected_project = ENV['WORKSPACE_PROJECT_ID']&.to_i
+  return nil unless payload['iss'] == 'carbide-control'
 
-  if payload['iss'] == 'carbide-control'
-    # --- new format ---
-    if expected_project && expected_project > 0
-      if payload['aud'] != "workspace:#{expected_project}"
-        puts "[validate_token] aud mismatch: got #{payload['aud'].inspect}, want workspace:#{expected_project}"
-        return nil
-      end
-      if payload['project_id'].to_i != expected_project
-        puts "[validate_token] project_id mismatch: got #{payload['project_id'].inspect}, want #{expected_project}"
-        return nil
-      end
-    end
-    unless %w[workspace:rw].include?(payload['scope'])
-      puts "[validate_token] unsupported scope: #{payload['scope'].inspect}"
-      return nil
-    end
+  # Audience guard: the token must name THIS workspace (uuid), preventing a
+  # token minted for workspace A from being replayed against workspace B.
+  expected = ENV['WORKSPACE_PROJECT_UUID'].to_s
+  unless expected.empty? || payload['aud'] == "workspace:#{expected}"
+    puts "[validate_token] aud mismatch: got #{payload['aud'].inspect}, want workspace:#{expected}"
+    return nil
+  end
+
+  unless %w[workspace:rw].include?(payload['scope'])
+    puts "[validate_token] unsupported scope: #{payload['scope'].inspect}"
+    return nil
   end
 
   payload
@@ -230,6 +240,119 @@ SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
 VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
 VFS_FLUSHERS        = {}        # project_id => VfsFlusher
 VFS_WATCHERS        = {}        # project_id => VfsWatcher
+PENDING_AUTH        = {}        # ws.object_id => Session (unauthenticated, awaiting system/auth)
+AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
+
+# ---------------------------------------------------------------------------
+# First-message auth (ADR-023)
+# ---------------------------------------------------------------------------
+# A session is ALWAYS created unauthenticated at onopen. It becomes
+# authenticated by exactly one path: the client's first frame, system/auth
+# { token }. On success the ONE promotion path pins the principal, joins the
+# project, cancels the auth deadline, and delivers the post-auth state. On
+# failure the socket is closed.
+
+# Resolve the LOCAL User mirror for a validated control token. The subject is
+# typed (`sub: user:<uuid>`); email is a fallback ONLY for pods that haven't
+# stamped control_uuid yet. Find-only: the REST path is the creator/mirror-stamper.
+def local_user_for(payload)
+  sub   = payload['sub'].to_s
+  uuid  = sub.start_with?('user:') ? sub.delete_prefix('user:') : ''
+  user  = (uuid.empty? ? nil : User.find_by(control_uuid: uuid))
+  return user if user
+
+  email = payload['user_email'].to_s.downcase.strip
+  return nil if email.empty?
+  User.find_by(email: email)
+end
+
+# Resolve the LOCAL project by its stable control-owned uuid (ADR-015). Under
+# 1:1 the token's project_uuid is the workspace uuid, mirrored into the pod as
+# WORKSPACE_PROJECT_UUID. Fall back to the single canonical project for local
+# dev without control.
+def local_project_for(payload)
+  uuid = payload['project_uuid'].to_s.strip
+  (uuid.empty? ? nil : Project.find_by(uuid: uuid)) || Project.canonical
+end
+
+# Pure: token -> principal-or-nil (validation + local identity resolution).
+def establish!(token)
+  return nil unless token.is_a?(String) && !token.empty?
+  payload = validate_token(token)
+  return nil unless payload
+  # validate_token already enforced the token's iss/aud/scope.
+  # Resolve the LOCAL user and LOCAL project by their stable uuids; neither
+  # local id is the token's integer id.
+  user    = local_user_for(payload)
+  project = local_project_for(payload)
+  return nil unless user && project
+  payload.merge(
+    'user_id'    => user.id,          # LOCAL users.id
+    'user_email' => user.email,
+    'project_id' => project.id        # LOCAL projects.id
+  )
+end
+
+def handle_auth(session, payload)
+  principal = establish!(payload['token'])
+  principal ? promote(session, principal) : reject_auth(session)
+end
+
+def reject_auth(session)
+  cancel_auth_deadline(session)
+  PENDING_AUTH.delete(session.ws.object_id)
+  send_msg(session.ws, 'system', 'error', { message: 'invalid or missing token' })
+  session.ws.close_connection_after_writing
+end
+
+# The ONE promotion path: pin, join, cancel deadline, deliver post-auth state.
+def promote(session, principal)
+  session.pin_principal(principal)
+  cancel_auth_deadline(session)
+  PENDING_AUTH.delete(session.ws.object_id)
+
+  SESSIONS_BY_PROJECT[session.project_id] ||= []
+  SESSIONS_BY_PROJECT[session.project_id] << session
+
+  send_msg(session.ws, 'system', 'connected', {
+    user_id:    session.user_id,
+    project_id: session.project_id,
+    protocol:   PROTOCOL,
+    min_client: MIN_CLIENT,
+    token_exp:  session.token_exp
+  })
+
+  terminals = get_project_terminals(session.project_id)
+  send_msg(session.ws, 'term', 'list', { project_id: session.project_id, terminals: terminals })
+
+  puts "Client connected: user=#{session.user_id} project=#{session.project_id}"
+end
+
+def arm_auth_deadline(session)
+  timer = EM.add_timer(AUTH_TIMEOUT_SECONDS) do
+    if AUTH_DEADLINES.delete(session)
+      puts '[auth] deadline exceeded before system/auth; disconnecting'
+      session.ws.close_connection_after_writing
+    end
+  end
+  AUTH_DEADLINES[session] = timer
+end
+
+def cancel_auth_deadline(session)
+  timer = AUTH_DEADLINES.delete(session)
+  EM.cancel_timer(timer) if timer
+end
+
+# A probe socket never authenticates and isn't tracked in PENDING_AUTH, so it
+# needs its own lifetime bound (#6). Close it after PROBE_DEADLINE_SECONDS.
+# close_connection_after_writing is safe/idempotent on an already-closed
+# connection, so no closed? guard is needed (and em-websocket doesn't expose one).
+def arm_probe_deadline(session)
+  EM.add_timer(PROBE_DEADLINE_SECONDS) do
+    puts '[probe] deadline exceeded; closing probe connection'
+    session.ws.close_connection_after_writing
+  end
+end
 
 # ---------------------------------------------------------------------------
 # Message router
@@ -266,15 +389,21 @@ end
 module SystemHandlers
   def self.dispatch(cmd, session, payload)
     case cmd
+    when 'auth'
+      # system/auth is only valid on an unauthenticated session. Reaching here
+      # means the session is already authenticated: refuse rather than
+      # re-establishing (a second establishment would be a principal-change
+      # path around system/reauth's identity pin).
+      send_msg(session.ws, 'system', 'error', { message: 'already authenticated' })
     when 'ping'
       send_msg(session.ws, 'system', 'pong', { t: payload['t'] })
     when 'reauth'
       new_payload = validate_token(payload['token'])
-      # Pin identity: a refreshed token must belong to the same user/project as
-      # the one that opened the socket. Anything else is rejected outright.
-      same_identity = new_payload &&
-        (new_payload['user_id'] || new_payload['user']).to_s == session.user_id.to_s &&
-        (new_payload['project_id'] || new_payload['project']).to_s == session.project_id.to_s
+      # Pin identity: a refreshed token must map to the same LOCAL user. Project
+      # identity is invariant (one canonical project per pod), so only the user
+      # needs checking here.
+      new_user = new_payload && local_user_for(new_payload)
+      same_identity = new_user && new_user.id.to_s == session.user_id.to_s
       if same_identity
         session.reauth(new_payload)
         send_msg(session.ws, 'system', 'reauth_ok', { exp: session.token_exp })
@@ -453,9 +582,16 @@ EM.run do
 
             watcher = VfsWatcher.new(project_id: project_id, root_path: fs_root,
                                      suppress_set: VFS_FLUSH_SUPPRESS)
-            VFS_WATCHERS[project_id] = watcher
-            watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
-                           broadcast_fn: method(:broadcast))
+            if watcher.start!(sessions_by_project: SESSIONS_BY_PROJECT,
+                              broadcast_fn: method(:broadcast))
+              VFS_WATCHERS[project_id] = watcher
+            else
+              puts "[startup] live FS sync DISABLED for project #{project_id} — DB→disk flush still active"
+              DebugStream.emit(:watcher, level: :warn,
+                message: "live FS sync disabled (watcher failed to start)",
+                project_id: project_id,
+                meta: { source: 'startup' }) if defined?(DebugStream)
+            end
           end
         end
       rescue => e
@@ -483,58 +619,76 @@ EM.run do
   end
 
   EM::WebSocket.start(host: host, port: port) do |ws|
-    session = nil
+    session  = nil
+    is_probe = false
 
     ws.onopen do |handshake|
       params = URI.decode_www_form(handshake.query_string || '').to_h
-      token  = params['token']
+      probe  = (params['probe'] == 'true')
 
-      # Wire-protocol handshake (advisory). A client that predates versioning
-      # sends neither param: treat it as proto=0 / min_server=0 so the floor
-      # comparison still runs and we warn rather than crash.
-      client_proto      = params['proto'].to_i
-      client_min_server = params['min_server'].to_i
-      proto_ok = client_proto >= MIN_CLIENT && PROTOCOL >= client_min_server
-
-      payload = validate_token(token)
-      if payload
-        session = Session.new(ws, payload)
-        
-        # Track session by project for terminal broadcasts
-        SESSIONS_BY_PROJECT[session.project_id] ||= []
-        SESSIONS_BY_PROJECT[session.project_id] << session
-
-        unless proto_ok
+      if probe
+        # Health-probe connection: the control plane only checks that the WS
+        # upgrades (101). It never sends system/auth, so don't arm the auth
+        # deadline and don't treat the absent proto/min_server as a mismatch.
+        # Probes bypass the PENDING_AUTH cap: a full unauth queue must not make
+        # the workspace look down to the control plane.
+        # NOTE: external `?probe` should be blocked at the ingress/Traefik layer
+        # (probes are in-pod only); this worker-side handling is a backstop.
+        is_probe = true
+        session  = Session.unauthenticated(ws)
+        # Bound probe lifetime: a probe is a 101-then-close, so 5s is ample and
+        # prevents an attacker from holding probe sockets open indefinitely.
+        arm_probe_deadline(session)
+      elsif PENDING_AUTH.size >= MAX_PENDING_AUTH
+        puts "[auth] max pending auth sessions (#{MAX_PENDING_AUTH}) reached; rejecting connection"
+        ws.close_connection_after_writing
+      else
+        # Wire-protocol handshake (advisory). proto/min_server remain in the
+        # query string — wire versioning is ADR-019's concern, not ADR-023's.
+        # No token rides the URI (ADR-023 hard cutover).
+        client_proto      = params['proto'].to_i
+        client_min_server = params['min_server'].to_i
+        unless client_proto >= MIN_CLIENT && PROTOCOL >= client_min_server
           puts "[proto] version mismatch: client(proto=#{client_proto} min_server=#{client_min_server}) " \
                "server(proto=#{PROTOCOL} min_client=#{MIN_CLIENT}) — serving anyway (advisory)"
         end
 
-        send_msg(ws, 'system', 'connected', {
-          user_id:    session.user_id,
-          project_id: session.project_id,
-          # Wire-protocol advertisement so the client can compare against its
-          # own floor and surface a mismatch banner. See PROTOCOL/MIN_CLIENT.
-          protocol:   PROTOCOL,
-          min_client: MIN_CLIENT,
-          # Token expiry (unix seconds) so the client can refresh in-band before
-          # it lapses. nil for legacy tokens with no exp claim.
-          token_exp:  session.token_exp
-        })
-        
-        # Send initial terminal list
-        terminals = get_project_terminals(session.project_id)
-        send_msg(ws, 'term', 'list', { project_id: session.project_id, terminals: terminals })
-        
-        puts "Client connected: user=#{session.user_id} project=#{session.project_id}"
-      else
-        send_msg(ws, 'system', 'error', { message: 'invalid or missing token' })
-        ws.close_connection_after_writing
+        # A session is ALWAYS created unauthenticated. system/auth (the client's
+        # first frame) is what promotes it.
+        session = Session.unauthenticated(ws)
+        PENDING_AUTH[ws.object_id] = session
+        arm_auth_deadline(session)
       end
     end
 
     ws.onmessage do |msg|
       begin
-        route(session, msg) if session
+        if is_probe
+          # Probes may only send commands on PROBE_ALLOWED_COMMANDS (empty
+          # today). They are never promotable to a real session.
+          parsed = (JSON.parse(msg) rescue nil)
+          allowed = parsed.is_a?(Hash) &&
+                    PROBE_ALLOWED_COMMANDS.include?([parsed['cs'], parsed['cmd']])
+          if allowed
+            route(session, msg)
+          else
+            puts '[probe] frame not in probe allowlist; closing'
+            ws.close_connection_after_writing
+          end
+        elsif session&.authenticated?
+          route(session, msg)
+        else
+          # Unauthenticated (or a rejected connection where session is nil):
+          # exactly one command is allowed — system/auth. Anything else closes;
+          # retry belongs to the client's reconnect loop.
+          parsed = (JSON.parse(msg) rescue nil)
+          if session && parsed.is_a?(Hash) && parsed['cs'] == 'system' && parsed['cmd'] == 'auth'
+            handle_auth(session, parsed['payload'] || {})
+          else
+            puts '[auth] frame before system/auth; closing'
+            ws.close_connection_after_writing
+          end
+        end
       rescue => e
         puts "[route] error: #{e.class} #{e.message}\n#{e.backtrace.first(3).join("\n")}"
         send_msg(ws, 'system', 'error', { message: e.message })
@@ -542,18 +696,25 @@ EM.run do
     end
 
     ws.onclose do
+      cancel_auth_deadline(session) if session
+      PENDING_AUTH.delete(ws.object_id)
+
       if session
-        puts "Client disconnected: user=#{session.user_id}"
+        if session.authenticated?
+          puts "Client disconnected: user=#{session.user_id}"
 
-        # Drop any debug-stream subscription this session held
-        DebugStream.unsubscribe(session)
+          # Drop any debug-stream subscription this session held
+          DebugStream.unsubscribe(session)
 
-        # Remove session from project tracking
-        if SESSIONS_BY_PROJECT[session.project_id]
-          SESSIONS_BY_PROJECT[session.project_id].delete(session)
+          # Remove session from project tracking
+          if SESSIONS_BY_PROJECT[session.project_id]
+            SESSIONS_BY_PROJECT[session.project_id].delete(session)
+          end
+
+          session.cleanup
+        else
+          puts 'Client disconnected before authentication' unless is_probe
         end
-        
-        session.cleanup
         session = nil
       end
     end

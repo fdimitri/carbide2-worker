@@ -3,23 +3,43 @@ class Session
   attr_reader :ws, :user_id, :name, :project_id, :terminals, :rooms, :open_files, :session_subs, :agent_subs
   # Unix timestamp (seconds) at which the presenting JWT expires. The socket is
   # forcibly closed once this lapses (plus a small grace) unless the client
-  # presents a fresh token via system/reauth first. nil means "no exp claim"
-  # (legacy tokens) — those are not expiry-enforced.
+  # presents a fresh token via system/reauth first.
   attr_reader :token_exp
 
+  # ADR-023: a socket starts unauthenticated at onopen. Identity is pinned only
+  # when system/auth succeeds (see #pin_principal).
+  def self.unauthenticated(ws)
+    new(ws, nil)
+  end
+
   def initialize(ws, payload)
-    @ws         = ws
-    # Accept both the new control-plane JWT format (user_id/project_id) and
-    # the legacy server-minted format (user/project). See JWT_CLAIMS.md.
-    @user_id    = payload['user_id']    || payload['user']
-    @name       = payload['user_email'] || payload['name'] || "user_#{@user_id}"
-    @project_id = payload['project_id'] || payload['project']
-    @token_exp  = payload['exp']
-    @terminals  = []  # terminal_ids joined
-    @rooms      = []  # room_ids joined
-    @open_files = []  # normalized paths currently open
-    @session_subs = []  # browser-session uuids this ws is subscribed to
-    @agent_subs   = []  # agent conversation ids this ws is subscribed to (#85)
+    @ws            = ws
+    @authenticated = false
+    @user_id       = nil
+    @name          = nil
+    @project_id    = nil
+    @token_exp     = nil
+    @terminals     = []  # terminal_ids joined
+    @rooms         = []  # room_ids joined
+    @open_files    = []  # normalized paths currently open
+    @session_subs  = []  # browser-session uuids this ws is subscribed to
+    @agent_subs    = []  # agent conversation ids this ws is subscribed to (#85)
+    pin_principal(payload) if payload
+  end
+
+  def authenticated?
+    @authenticated
+  end
+
+  # Pin identity from a validated token payload whose user_id has ALREADY been
+  # resolved to the LOCAL users.id (see worker.rb establish!). Never the
+  # control-plane user id.
+  def pin_principal(payload)
+    @user_id       = payload['user_id']
+    @name          = payload['user_email'] || "user_#{@user_id}"
+    @project_id    = payload['project_id']
+    @token_exp     = payload['exp']
+    @authenticated = true
   end
 
   # Adopt a freshly-minted token (already validated) without dropping the
