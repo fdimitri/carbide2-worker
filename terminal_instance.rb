@@ -404,6 +404,17 @@ class TerminalInstance
     @slave.close  rescue nil
   end
 
+  # Read-only snapshot of the current scrollback tail, for the agent's
+  # shell_peek_buffer tool (#70). Never claims the terminal, never sets
+  # @agent_busy, and never mutates the buffer — a pure peek. `tail_bytes`
+  # defaults to 0 (whole buffer); a positive value returns the last N bytes.
+  def scrollback_snapshot(tail_bytes: 0)
+    buf = @scrollback
+    n   = tail_bytes.to_i
+    return buf if n <= 0 || buf.bytesize <= n
+    buf.byteslice(-n, n) || +''
+  end
+
   private
 
   def fire_state_change
