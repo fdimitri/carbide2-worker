@@ -574,9 +574,9 @@ module AgentTools
   # the user typed/ran), but it does NOT require agent.shell_exec_enabled —
   # reading is strictly less privileged than executing.
   #
-  # Default tail: project_settings.agent_shell_peek_tail_bytes when present;
-  # an explicit tail_bytes always wins. Neither → whole buffer. No code
-  # constant, no env fallback.
+  # Default tail: project_settings.agent_shell_peek_tail_bytes (seeded, always
+  # present); an explicit tail_bytes always wins. No code constant, no env
+  # fallback.
   # ---------------------------------------------------------------------
   register('shell_peek_buffer',
     schema: {
@@ -587,9 +587,8 @@ module AgentTools
                      'on an agent-accessible terminal. Use list_terminals first ' \
                      "to find a terminal_id. This does not run a command and " \
                      'does not lock the user out; it only reads what is already ' \
-                     'on screen. Returns the configured default tail of ' \
-                     'scrollback (or the whole buffer when no default is set), ' \
-                     'with ANSI control sequences stripped.',
+                     'on screen. Returns the project-configured default tail ' \
+                     'of scrollback, with ANSI control sequences stripped.',
         parameters: {
           type: 'object',
           required: ['terminal_id'],
@@ -618,10 +617,10 @@ module AgentTools
     end
 
     proj_setting = Project.find_by(id: project_id)&.project_setting
-    default_tail = proj_setting&.agent_shell_peek_tail_bytes
+    next { error: "project #{project_id} has no project settings" } unless proj_setting
 
     tail = args['tail_bytes']
-    tail = default_tail if tail.nil?
+    tail = proj_setting.agent_shell_peek_tail_bytes if tail.nil?
     data = term.scrollback_snapshot(tail_bytes: tail.to_i)
 
     strip = args.key?('strip_ansi') ? !!args['strip_ansi'] : true
