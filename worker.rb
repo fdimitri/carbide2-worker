@@ -131,6 +131,9 @@ MAX_PENDING_AUTH     = Integer(ENV.fetch('CARBIDE_MAX_PENDING_AUTH', '100'))
 # add the allowed [cs, cmd] pairs here — the onmessage probe branch consults
 # this list.
 PROBE_ALLOWED_COMMANDS = [].freeze
+# Probe sockets are 101-then-close, so this is a generous upper bound; it
+# prevents an attacker from holding ?probe connections open indefinitely.
+PROBE_DEADLINE_SECONDS = 5
 
 # ---------------------------------------------------------------------------
 # Wire-protocol versioning
@@ -250,14 +253,17 @@ AUTH_DEADLINES      = {}        # Session => EM::Timer (cancel on promote/close)
 # failure the socket is closed.
 
 # Resolve the LOCAL User mirror for a validated control token. The subject is
-# typed (`sub: user:<uuid>`); fall back to email for pods that haven't stamped
-# control_uuid yet. Find-only: the REST path is the creator/mirror-stamper.
+# typed (`sub: user:<uuid>`); email is a fallback ONLY for pods that haven't
+# stamped control_uuid yet. Find-only: the REST path is the creator/mirror-stamper.
 def local_user_for(payload)
   sub   = payload['sub'].to_s
   uuid  = sub.start_with?('user:') ? sub.delete_prefix('user:') : ''
+  user  = (uuid.empty? ? nil : User.find_by(control_uuid: uuid))
+  return user if user
+
   email = payload['user_email'].to_s.downcase.strip
   return nil if email.empty?
-  (uuid.empty? ? nil : User.find_by(control_uuid: uuid)) || User.find_by(email: email)
+  User.find_by(email: email)
 end
 
 # Resolve the LOCAL project by its stable control-owned uuid (ADR-015). Under
@@ -335,6 +341,16 @@ end
 def cancel_auth_deadline(session)
   timer = AUTH_DEADLINES.delete(session)
   EM.cancel_timer(timer) if timer
+end
+
+# A probe socket never authenticates and isn't tracked in PENDING_AUTH, so it
+# needs its own lifetime bound (#6). Close it after PROBE_DEADLINE_SECONDS.
+def arm_probe_deadline(session)
+  EM.add_timer(PROBE_DEADLINE_SECONDS) do
+    next if session.ws.closed?
+    puts '[probe] deadline exceeded; closing probe connection'
+    session.ws.close_connection_after_writing
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -609,15 +625,22 @@ EM.run do
       params = URI.decode_www_form(handshake.query_string || '').to_h
       probe  = (params['probe'] == 'true')
 
-      if PENDING_AUTH.size >= MAX_PENDING_AUTH
-        puts "[auth] max pending auth sessions (#{MAX_PENDING_AUTH}) reached; rejecting connection"
-        ws.close_connection_after_writing
-      elsif probe
+      if probe
         # Health-probe connection: the control plane only checks that the WS
         # upgrades (101). It never sends system/auth, so don't arm the auth
         # deadline and don't treat the absent proto/min_server as a mismatch.
+        # Probes bypass the PENDING_AUTH cap: a full unauth queue must not make
+        # the workspace look down to the control plane.
+        # NOTE: external `?probe` should be blocked at the ingress/Traefik layer
+        # (probes are in-pod only); this worker-side handling is a backstop.
         is_probe = true
         session  = Session.unauthenticated(ws)
+        # Bound probe lifetime: a probe is a 101-then-close, so 5s is ample and
+        # prevents an attacker from holding probe sockets open indefinitely.
+        arm_probe_deadline(session)
+      elsif PENDING_AUTH.size >= MAX_PENDING_AUTH
+        puts "[auth] max pending auth sessions (#{MAX_PENDING_AUTH}) reached; rejecting connection"
+        ws.close_connection_after_writing
       else
         # Wire-protocol handshake (advisory). proto/min_server remain in the
         # query string — wire versioning is ADR-019's concern, not ADR-023's.
