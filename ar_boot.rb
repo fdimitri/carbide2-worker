@@ -26,18 +26,6 @@ class ApplicationRecord < ActiveRecord::Base
   self.abstract_class = true
 end
 
-# Devise needs Devise.setup to have run before any `devise :...` macro fires
-# (the User model uses it). We don't boot Rails in the worker, so do the
-# bare minimum here: load the gem and configure secret_key so its modules
-# can register cleanly.
-require 'devise'
-require 'devise/orm/active_record'
-Devise.setup do |config|
-  config.secret_key = ENV.fetch('DEVISE_SECRET_KEY',
-                                ENV.fetch('SECRET_KEY_BASE', 'worker-devise-secret-placeholder'))
-  config.mailer_sender = ENV.fetch('DEVISE_MAILER_SENDER', 'noreply@example.com')
-end
-
 # Load every model under app/models. Worker never instantiates most of these,
 # but ActiveRecord needs the constants resolvable for belongs_to/has_many
 # validators (e.g. AgentConversation belongs_to :user).
