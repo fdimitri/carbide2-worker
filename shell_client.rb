@@ -64,7 +64,8 @@ class ShellClient
     end
 
     # PTY.spawn runs this through /bin/sh -c. Login shell so /etc/profile and
-    # ~/.profile load, matching what the user gets from a real terminal.
+    # ~/.profile load, matching what the user gets from a real terminal. The
+    # image's WORKDIR is the mounted project directory, so no cd is needed.
     def exec_cmd
       "kubectl --kubeconfig #{@kubeconfig} exec -n #{@namespace} --tty --stdin #{@pod} -- bash -l"
     end
@@ -81,9 +82,10 @@ class ShellClient
       true
     end
 
-    # The kubeconfig outlives the exec on purpose: kubectl re-reads nothing
-    # after startup, but a terminal that reconnects wants the same file. It is
-    # cleaned up when the handle is dropped.
+    # The kubeconfig outlives the exec on purpose: kubectl reads it once at
+    # startup, but the file is the only place the token lives, and dropping it
+    # while kubectl is still starting would race. Disposed when the terminal
+    # that acquired it exits.
     def dispose
       File.unlink(@kubeconfig)
     rescue Errno::ENOENT

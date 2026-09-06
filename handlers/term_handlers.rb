@@ -19,20 +19,17 @@ module TermHandlers
   PENDING_TERMINAL_IDS = []
 
   def self.create(session, payload)
-    # Create new terminal in current project — attach to (or start) the
-    # project's persistent Docker container.
+    # Create a new terminal in the current project: an exec into the
+    # workspace's control-owned shell pod (ADR-029).
     terminal_id    = ((TERMINALS.keys.map(&:to_i) + PENDING_TERMINAL_IDS).max || 0) + 1
     PENDING_TERMINAL_IDS << terminal_id
     requested_name = payload['name']
     agent_acc      = !!payload['agent_accessible']
     puts "[term/create] terminal=#{terminal_id} project=#{session.project_id}"
 
-    proj = Project.find_by(id: session.project_id)
-
     # Continuation that builds the PTY-backed terminal, registers it, and
-    # notifies clients. Runs on the EM reactor thread. `cmd` defaults to the
-    # local-shell default; kube/docker pass an exec command into the pod/container.
-    finish = lambda do |cmd: '/bin/bash', cwd: nil|
+    # notifies clients. Runs on the EM reactor thread.
+    finish = lambda do |cmd:|
       PENDING_TERMINAL_IDS.delete(terminal_id)
       term = TerminalInstance.new(
         terminal_id,
@@ -40,7 +37,6 @@ module TermHandlers
         cols: 80, rows: 24,
         name: requested_name,
         cmd:  cmd,
-        cwd:  cwd,
         agent_accessible: agent_acc
       )
       TERMINALS[terminal_id] = term
@@ -51,49 +47,39 @@ module TermHandlers
       broadcast_terminals_to_project(session.project_id)
     end
 
-    case ENV.fetch('CARBIDE_BACKEND', 'local')
-    when 'kube'
-      # The worker no longer creates the shell pod (ADR-029). It asks control
-      # for a handle; control scales the operator-owned StatefulSet up if it is
-      # cold and mints a short-lived, namespace-scoped exec token.
-      #
-      # Still off the reactor: acquire! blocks while a cold shell starts, and
-      # the single EM thread serves every WS command, so a slow start here
-      # would freeze fs/editor/chat for everyone.
-      EM.defer(
-        proc do
-          handle = SHELL_HANDLES[session.project_id]
-          if handle.nil? || handle.expired?
-            handle&.dispose
-            handle = SHELL_HANDLES[session.project_id] = ShellClient.acquire!
-          end
-          handle
-        rescue => e
-          e
-        end,
-        proc do |result|
-          if result.is_a?(ShellClient::Handle)
-            finish.call(cmd: result.exec_cmd, cwd: nil)
-            # After finish.call, so the new terminal is already in TERMINALS
-            # and the count we report is the real one.
-            report_shell_terminals(session.project_id)
-          else
-            PENDING_TERMINAL_IDS.delete(terminal_id)
-            warn "[term/create] ERROR: #{result.class} #{result.message}\n  " \
-                 "#{Array(result.backtrace).first(5).join("\n  ")}"
-            Command.error(session, "term/create failed: #{result.message}")
-          end
+    # The worker does not create the shell pod (ADR-029). It asks control for
+    # a handle; control scales the operator-owned StatefulSet up if it is cold
+    # and mints a short-lived, namespace-scoped exec token.
+    #
+    # One handle per terminal, acquired on EVERY create (§4): the POST is also
+    # the readiness gate, so a terminal opened mid-rollout or after a switch to
+    # disabled is refused cleanly instead of failing inside kubectl against a
+    # pod that is gone.
+    #
+    # Off the reactor: acquire! blocks while a cold shell starts, and the
+    # single EM thread serves every WS command, so a slow start here would
+    # freeze fs/editor/chat for everyone.
+    EM.defer(
+      proc do
+        ShellClient.acquire!
+      rescue => e
+        e
+      end,
+      proc do |result|
+        if result.is_a?(ShellClient::Handle)
+          SHELL_HANDLES[terminal_id] = result
+          finish.call(cmd: result.exec_cmd)
+          # After finish.call, so the new terminal is already in TERMINALS
+          # and the count we report is the real one.
+          report_shell_terminals
+        else
+          PENDING_TERMINAL_IDS.delete(terminal_id)
+          warn "[term/create] ERROR: #{result.class} #{result.message}\n  " \
+               "#{Array(result.backtrace).first(5).join("\n  ")}"
+          Command.error(session, "term/create failed: #{result.message}")
         end
-      )
-    when 'docker'
-      container = PROJECT_CONTAINERS[session.project_id] ||=
-        ProjectContainer.new(session.project_id, root_path: proj&.project_setting&.root_path.presence)
-      container.ensure_running!
-      finish.call(cmd: container.exec_cmd, cwd: nil)
-    else
-      cwd  = proj&.project_setting&.root_path.presence || PROJECT_ROOT
-      finish.call(cwd: cwd)
-    end
+      end
+    )
   end
   register 'create', :create
 

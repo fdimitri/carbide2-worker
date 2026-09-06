@@ -95,7 +95,6 @@ require_relative 'terminal_recorder'
 require_relative 'chat_room'
 require_relative 'open_document'
 require_relative 'document'
-require_relative 'project_container'
 require_relative 'shell_client'
 require_relative 'session'
 require_relative 'jwt_verifier'
@@ -157,14 +156,6 @@ PROBE_DEADLINE_SECONDS = 5
 # PROTOCOL 5: agent/stop + agent/stopping + agent/stopped (#83). Additive.
 PROTOCOL   = 5
 MIN_CLIENT = 1
-
-# Load worker/carbide.yml if present; allows per-machine config without env vars.
-_cfg_path = File.join(__dir__, 'carbide.yml')
-_cfg      = File.exist?(_cfg_path) ? (require 'yaml'; YAML.load_file(_cfg_path, permitted_classes: []) || {}) : {}
-PROJECT_ROOT = File.expand_path(
-  ENV['PROJECT_ROOT'] || _cfg['project_root'].to_s.then { |p| p.empty? ? Dir.pwd : p }
-).freeze
-puts "[worker] PROJECT_ROOT = #{PROJECT_ROOT} (fallback only — overridden by project.root_path from DB)"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -233,8 +224,7 @@ CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
 OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
 DOCUMENTS           = {}        # srcpath => Document (in-memory rendered buffer)
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
-PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
-SHELL_HANDLES       = {}        # project_id (int)  => ShellClient::Handle
+SHELL_HANDLES       = {}        # terminal_id (int) => ShellClient::Handle
 SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
 VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
 VFS_FLUSHERS        = {}        # project_id => VfsFlusher
@@ -456,28 +446,27 @@ def on_terminal_exit(tid, project_id)
   # ADR-029: the worker no longer deletes the shell. It reports how many
   # terminals are live and control decides -- which is what lets the shell
   # outlive a worker crash instead of being orphaned by one.
-  return unless ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube'
-
-  report_shell_terminals(project_id)
-  if remaining.zero? && (handle = SHELL_HANDLES.delete(project_id))
-    # Drop the on-disk kubeconfig now rather than leaving a bearer token
-    # sitting in /tmp until the pod restarts. A later terminal re-acquires.
-    handle.dispose
-  end
+  report_shell_terminals
+  # Each terminal acquired its own handle (§4). Drop the on-disk kubeconfig
+  # now rather than leaving a bearer token in /tmp until the pod restarts.
+  SHELL_HANDLES.delete(tid)&.dispose
 end
 
-# Report the live terminal count for a project to control. Derived from
-# TERMINALS rather than kept as its own counter: a separate counter drifts the
-# first time a PTY dies by a path that skips the decrement, and a drifted
-# refcount either pins a shell up forever or kills one out from under a user.
+# Report the live terminal count to control. Derived from TERMINALS rather than
+# kept as its own counter: a separate counter drifts the first time a PTY dies
+# by a path that skips the decrement, and a drifted refcount either pins a
+# shell up forever or kills one out from under a user.
+#
+# Counted across the whole pod, not per project: the shell is a workspace
+# resource and control keys the refcount by workspace, so the number it needs
+# is every live PTY that could be attached to that shell.
 #
 # Off the reactor -- this is a network call, and the reactor thread serves
 # every WS command.
-def report_shell_terminals(project_id)
-  return unless ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube'
+def report_shell_terminals
   return unless ShellClient.enabled?
 
-  count = get_project_terminals(project_id).size
+  count = TERMINALS.size
   EM.defer { ShellClient.report!(count) }
 end
 
@@ -519,15 +508,13 @@ EM.run do
     puts "[worker] heartbeat pid=#{Process.pid} sessions=#{SESSIONS_BY_PROJECT.values.sum(&:size)} " \
          "terminals=#{(defined?(TERMINALS) ? TERMINALS.size : 0)} rss_kb=#{(File.read("/proc/#{Process.pid}/statm").split[1].to_i * 4 rescue 0)}"
   end
-  puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
-  puts "[worker] Shell backend: #{ENV.fetch('CARBIDE_BACKEND', 'local')} (image=#{ENV['CARBIDE_SHELL_IMAGE'] || 'n/a'} ns=#{ENV['CARBIDE_NAMESPACE'] || 'n/a'})"
 
   # Big-hammer orphan cleanup is gone with ADR-029: the shell is an
   # operator-owned StatefulSet, not a pod this worker created, so a shell
   # outliving a worker incarnation is correct rather than garbage. The periodic
   # report below is what reclaims a shell whose worker never came back --
   # control scales it down once the reports stop.
-  if ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube' && ShellClient.enabled?
+  if ShellClient.enabled?
     interval = Integer(ENV.fetch('CARBIDE_SHELL_REPORT_INTERVAL', '60'))
     puts "[worker] shell refcount reporting every #{interval}s -> #{ShellClient::CONTROL_URL}"
 
@@ -535,48 +522,37 @@ EM.run do
     # control's sweep treats silence past max_report_time as "gone" -- which is
     # the only way an orphaned shell gets reclaimed, since a wedged worker will
     # never tell us its terminals went away.
-    EM.add_periodic_timer(interval) do
-      SESSIONS_BY_PROJECT.each_key { |pid| report_shell_terminals(pid) }
-    end
+    #
+    # Unconditional: NOT gated on a browser being connected. A worker with live
+    # PTYs and no sessions is healthy, and going silent would read as dead and
+    # get its shell scaled out from under those PTYs (§5).
+    EM.add_periodic_timer(interval) { report_shell_terminals }
+
+    # §5 "Worker restart": a restarted worker reports n: 0 with no terminals,
+    # which is the falling edge if the previous incarnation had any. Sending it
+    # now rather than after the first interval means the idle clock starts on
+    # time.
+    report_shell_terminals
   end
 
-  # Stop all project containers and VFS watchers cleanly when the worker shuts down.
+  # Stop VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do
     VFS_WATCHERS.each_value(&:stop)
-    PROJECT_CONTAINERS.each_value(&:stop)
-    puts '[worker] all project containers and VFS watchers stopped'
+    puts '[worker] VFS watchers stopped'
   end
 
   # Seed the filesystem for every project from its configured root on startup.
-  # FS_PROJECT_ID still works as a single-project override; FS_ROOT only
-  # applies in that single-project mode (it makes no sense to point every
-  # project at the same directory). Disable entirely with FS_SKIP_LOAD=1.
+  # Disable entirely with FS_SKIP_LOAD=1.
   unless ENV['FS_SKIP_LOAD'] == '1'
     EM.defer do
       begin
-        projects_root = ENV.fetch('PROJECTS_ROOT', '/srv/projects')
-        single_id     = ENV['FS_PROJECT_ID']
-        fs_root_env   = ENV['FS_ROOT'].presence
-
-        project_ids =
-          if single_id
-            [Integer(single_id)]
-          else
-            Project.pluck(:id)
-          end
-
-        project_ids.each do |project_id|
+        Project.pluck(:id).each do |project_id|
           proj    = Project.find_by(id: project_id)
           next unless proj
 
-          # Resolution order:
-          #   1. project.project_setting.root_path
-          #   2. FS_ROOT env (single-project mode only)
-          #   3. PROJECTS_ROOT/<project_id>
+          # project_setting.root_path, else PROJECTS_ROOT/<project uuid>.
           fs_root = File.expand_path(
-            proj.project_setting&.root_path.presence ||
-            (single_id ? fs_root_env : nil) ||
-            File.join(projects_root, project_id.to_s)
+            proj.project_setting&.root_path.presence || proj.default_root_path
           )
           FileUtils.mkdir_p(fs_root) rescue nil
           puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
