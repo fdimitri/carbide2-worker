@@ -35,6 +35,18 @@ class ShellClient
 
   WORKSPACE_ID = ENV.fetch('WORKSPACE_ID', '').freeze
 
+  # Both are set unconditionally by the operator on every workspace pod
+  # (ADR-029 §6, ADR-031). Kubernetes will happily start a pod without them,
+  # and the readiness probe is Rails' /up, so a pod built wrong would run for
+  # as long as it took someone to open a terminal. Fail here, where the log
+  # line lands next to the deploy that caused it.
+  if WORKSPACE_ID.empty?
+    abort "[ShellClient] WORKSPACE_ID is not set; this pod was not built by the control operator"
+  end
+  unless File.readable?(TOKEN_PATH)
+    abort "[ShellClient] control token not readable at #{TOKEN_PATH}; the projected volume is missing or mis-permissioned"
+  end
+
   # In-cluster API server coordinates for the kubeconfig we hand to kubectl.
   API_SERVER = ENV.fetch('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc').freeze
   API_PORT   = ENV.fetch('KUBERNETES_SERVICE_PORT', '443').freeze
@@ -49,6 +61,8 @@ class ShellClient
 
   class NotReady < StandardError; end
   class Error < StandardError; end
+  # A 5xx from control: retried inside acquire!'s deadline. 4xx stays Error.
+  class ServerError < Error; end
 
   # A grant, valid until expires_at. Owns the kubeconfig file holding the
   # token, so the token never appears in argv where `ps` would show it to
@@ -126,10 +140,6 @@ class ShellClient
   end
 
   class << self
-    def enabled?
-      !WORKSPACE_ID.empty? && File.exist?(TOKEN_PATH)
-    end
-
     # Ask for a handle, retrying while control reports the shell is still
     # starting. Blocking -- callers must run this off the EM reactor thread.
     #
@@ -141,7 +151,19 @@ class ShellClient
       last     = nil
 
       loop do
-        body = post('shell')
+        body = begin
+          post('shell')
+        rescue ServerError => e
+          # Control itself hiccupped (DB lock wait, kube read, mint). POST is
+          # idempotent (ADR-029 §4), so inside the deadline this is "not yet",
+          # not "never".
+          raise Error, "control unavailable after #{ACQUIRE_TIMEOUT}s: #{e.message}" if Time.now >= deadline
+
+          last = e.message
+          sleep delay
+          delay = [delay * 1.5, 3.0].min
+          next
+        end
 
         if body['ready']
           return Handle.new(
@@ -204,7 +226,9 @@ class ShellClient
       end
 
       unless res.is_a?(Net::HTTPSuccess)
-        raise Error, "control #{path} returned #{res.code}: #{body['error'] || body['reason'] || res.body.to_s[0, 200]}"
+        detail = body['error'] || body['reason'] || res.body.to_s[0, 200]
+        klass  = res.is_a?(Net::HTTPServerError) ? ServerError : Error
+        raise klass, "control #{path} returned #{res.code}: #{detail}"
       end
 
       body

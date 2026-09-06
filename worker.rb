@@ -464,8 +464,6 @@ end
 # Off the reactor -- this is a network call, and the reactor thread serves
 # every WS command.
 def report_shell_terminals
-  return unless ShellClient.enabled?
-
   count = TERMINALS.size
   EM.defer { ShellClient.report!(count) }
 end
@@ -479,17 +477,6 @@ def broadcast_terminals_to_project(project_id)
   terminals = get_project_terminals(project_id)
   puts "[broadcast_terminals_to_project] project=#{project_id}, clients=#{clients.length}, terminals=#{terminals.length}"
   broadcast(clients, 'term', 'list', { project_id: project_id, terminals: terminals })
-end
-
-# ---------------------------------------------------------------------------
-# HTTP API endpoint for Rails to create terminal instances
-# Used by POST /api/projects/:id/terminals
-# ---------------------------------------------------------------------------
-def create_terminal(terminal_id, project_id:, cols: 80, rows: 24)
-  term = TerminalInstance.new(terminal_id, project_id: project_id, cols: cols, rows: rows)
-  TERMINALS[terminal_id] = term
-  broadcast_terminals_to_project(project_id)
-  terminal_id
 end
 
 # ---------------------------------------------------------------------------
@@ -514,26 +501,24 @@ EM.run do
   # outliving a worker incarnation is correct rather than garbage. The periodic
   # report below is what reclaims a shell whose worker never came back --
   # control scales it down once the reports stop.
-  if ShellClient.enabled?
-    interval = Integer(ENV.fetch('CARBIDE_SHELL_REPORT_INTERVAL', '60'))
-    puts "[worker] shell refcount reporting every #{interval}s -> #{ShellClient::CONTROL_URL}"
+  interval = Integer(ENV.fetch('CARBIDE_SHELL_REPORT_INTERVAL', '60'))
+  puts "[worker] shell refcount reporting every #{interval}s -> #{ShellClient::CONTROL_URL}"
 
-    # Doubles as a liveness signal. A frozen worker stops reporting, and
-    # control's sweep treats silence past max_report_time as "gone" -- which is
-    # the only way an orphaned shell gets reclaimed, since a wedged worker will
-    # never tell us its terminals went away.
-    #
-    # Unconditional: NOT gated on a browser being connected. A worker with live
-    # PTYs and no sessions is healthy, and going silent would read as dead and
-    # get its shell scaled out from under those PTYs (§5).
-    EM.add_periodic_timer(interval) { report_shell_terminals }
+  # Doubles as a liveness signal. A frozen worker stops reporting, and
+  # control's sweep treats silence past max_report_time as "gone" -- which is
+  # the only way an orphaned shell gets reclaimed, since a wedged worker will
+  # never tell us its terminals went away.
+  #
+  # Unconditional: NOT gated on a browser being connected. A worker with live
+  # PTYs and no sessions is healthy, and going silent would read as dead and
+  # get its shell scaled out from under those PTYs (§5).
+  EM.add_periodic_timer(interval) { report_shell_terminals }
 
-    # §5 "Worker restart": a restarted worker reports n: 0 with no terminals,
-    # which is the falling edge if the previous incarnation had any. Sending it
-    # now rather than after the first interval means the idle clock starts on
-    # time.
-    report_shell_terminals
-  end
+  # §5 "Worker restart": a restarted worker reports n: 0 with no terminals,
+  # which is the falling edge if the previous incarnation had any. Sending it
+  # now rather than after the first interval means the idle clock starts on
+  # time.
+  report_shell_terminals
 
   # Stop VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do
