@@ -96,7 +96,7 @@ require_relative 'chat_room'
 require_relative 'open_document'
 require_relative 'document'
 require_relative 'project_container'
-require_relative 'project_pod'
+require_relative 'shell_client'
 require_relative 'session'
 require_relative 'jwt_verifier'
 require_relative 'ar_boot'
@@ -234,8 +234,7 @@ OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
 DOCUMENTS           = {}        # srcpath => Document (in-memory rendered buffer)
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 PROJECT_CONTAINERS  = {}        # project_id (int)  => ProjectContainer
-PROJECT_PODS        = {}        # project_id (int)  => ProjectPod
-POD_REFCOUNTS       = Hash.new(0)  # project_id => live terminal count
+SHELL_HANDLES       = {}        # project_id (int)  => ShellClient::Handle
 SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
 VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
 VFS_FLUSHERS        = {}        # project_id => VfsFlusher
@@ -454,15 +453,32 @@ def on_terminal_exit(tid, project_id)
   remaining = get_project_terminals(project_id).size
   puts "[on_terminal_exit] terminal=#{tid} project=#{project_id} pruned; #{remaining} remain"
 
-  # Ref-count the kube-backed pod; tear it down when the last terminal exits.
-  if ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube' && PROJECT_PODS.key?(project_id)
-    POD_REFCOUNTS[project_id] -= 1 if POD_REFCOUNTS[project_id] > 0
-    if POD_REFCOUNTS[project_id] <= 0
-      POD_REFCOUNTS.delete(project_id)
-      pod = PROJECT_PODS.delete(project_id)
-      Thread.new { pod.stop! } if pod  # don't block the EM reactor on kubectl delete
-    end
+  # ADR-029: the worker no longer deletes the shell. It reports how many
+  # terminals are live and control decides -- which is what lets the shell
+  # outlive a worker crash instead of being orphaned by one.
+  return unless ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube'
+
+  report_shell_terminals(project_id)
+  if remaining.zero? && (handle = SHELL_HANDLES.delete(project_id))
+    # Drop the on-disk kubeconfig now rather than leaving a bearer token
+    # sitting in /tmp until the pod restarts. A later terminal re-acquires.
+    handle.dispose
   end
+end
+
+# Report the live terminal count for a project to control. Derived from
+# TERMINALS rather than kept as its own counter: a separate counter drifts the
+# first time a PTY dies by a path that skips the decrement, and a drifted
+# refcount either pins a shell up forever or kills one out from under a user.
+#
+# Off the reactor -- this is a network call, and the reactor thread serves
+# every WS command.
+def report_shell_terminals(project_id)
+  return unless ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube'
+  return unless ShellClient.enabled?
+
+  count = get_project_terminals(project_id).size
+  EM.defer { ShellClient.report!(count) }
 end
 
 def get_project_terminals(project_id)
@@ -506,25 +522,21 @@ EM.run do
   puts "[worker] Docker container mode: #{ENV['CARBIDE_USE_DOCKER'] == '1' ? 'enabled' : 'disabled (set CARBIDE_USE_DOCKER=1 to enable)'}"
   puts "[worker] Shell backend: #{ENV.fetch('CARBIDE_BACKEND', 'local')} (image=#{ENV['CARBIDE_SHELL_IMAGE'] || 'n/a'} ns=#{ENV['CARBIDE_NAMESPACE'] || 'n/a'})"
 
-  # Big-hammer orphan cleanup: any carbide2-shell pods left in this
-  # workspace's namespace from a previous worker incarnation are dead to us
-  # (POD_REFCOUNTS lives in memory). Their PTYs are gone, no client is bound,
-  # and the pod is just consuming a node slot. Nuke them on startup. Other
-  # workspaces have their own namespaces, so this is scoped.
-  if ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube'
-    EM.defer do
-      ns = ENV.fetch('CARBIDE_NAMESPACE') { ProjectPod.read_namespace }
-      puts "[worker] pruning orphan carbide2-shell pods in ns=#{ns}"
-      out, err, status = Open3.capture3(
-        'kubectl', 'delete', 'pod', '-n', ns,
-        '-l', 'app.kubernetes.io/name=carbide2-shell',
-        '--ignore-not-found', '--wait=false', '--grace-period=5'
-      )
-      if status.success?
-        puts "[worker] orphan prune: #{out.strip.empty? ? 'nothing to delete' : out.strip}"
-      else
-        warn "[worker] orphan prune failed: #{err.strip}"
-      end
+  # Big-hammer orphan cleanup is gone with ADR-029: the shell is an
+  # operator-owned StatefulSet, not a pod this worker created, so a shell
+  # outliving a worker incarnation is correct rather than garbage. The periodic
+  # report below is what reclaims a shell whose worker never came back --
+  # control scales it down once the reports stop.
+  if ENV.fetch('CARBIDE_BACKEND', 'local') == 'kube' && ShellClient.enabled?
+    interval = Integer(ENV.fetch('CARBIDE_SHELL_REPORT_INTERVAL', '60'))
+    puts "[worker] shell refcount reporting every #{interval}s -> #{ShellClient::CONTROL_URL}"
+
+    # Doubles as a liveness signal. A frozen worker stops reporting, and
+    # control's sweep treats silence past max_report_time as "gone" -- which is
+    # the only way an orphaned shell gets reclaimed, since a wedged worker will
+    # never tell us its terminals went away.
+    EM.add_periodic_timer(interval) do
+      SESSIONS_BY_PROJECT.each_key { |pid| report_shell_terminals(pid) }
     end
   end
 

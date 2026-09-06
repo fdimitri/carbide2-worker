@@ -53,22 +53,30 @@ module TermHandlers
 
     case ENV.fetch('CARBIDE_BACKEND', 'local')
     when 'kube'
-      pod = PROJECT_PODS[session.project_id] ||= ProjectPod.new(session.project_id)
-      # ensure_running! does blocking kubectl polls (up to READY_TIMEOUT). Run it
-      # OFF the reactor so a slow/failing pod can't freeze fs/editor/other clients
-      # (the single EM reactor thread serves every WS command). Resume on the
-      # reactor once the pod is Ready, or surface an error to just this client.
+      # The worker no longer creates the shell pod (ADR-029). It asks control
+      # for a handle; control scales the operator-owned StatefulSet up if it is
+      # cold and mints a short-lived, namespace-scoped exec token.
+      #
+      # Still off the reactor: acquire! blocks while a cold shell starts, and
+      # the single EM thread serves every WS command, so a slow start here
+      # would freeze fs/editor/chat for everyone.
       EM.defer(
         proc do
-          pod.ensure_running!
-          :ok
+          handle = SHELL_HANDLES[session.project_id]
+          if handle.nil? || handle.expired?
+            handle&.dispose
+            handle = SHELL_HANDLES[session.project_id] = ShellClient.acquire!
+          end
+          handle
         rescue => e
           e
         end,
         proc do |result|
-          if result == :ok
-            POD_REFCOUNTS[session.project_id] += 1
-            finish.call(cmd: pod.exec_cmd, cwd: nil)
+          if result.is_a?(ShellClient::Handle)
+            finish.call(cmd: result.exec_cmd, cwd: nil)
+            # After finish.call, so the new terminal is already in TERMINALS
+            # and the count we report is the real one.
+            report_shell_terminals(session.project_id)
           else
             PENDING_TERMINAL_IDS.delete(terminal_id)
             warn "[term/create] ERROR: #{result.class} #{result.message}\n  " \
