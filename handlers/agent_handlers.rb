@@ -183,9 +183,48 @@ module AgentHandlers
       forked_from_conversation_id: convo.forked_from&.uuid,
       forked_at_turn:             convo.forked_at_turn,
       messages:        items,
+      usage:           usage_rows(convo),
     })
   end
   register 'load', :load
+
+  # ADR-033 phase 2: per-completion-request usage. Each row carries its logical
+  # AgentTurn id (via the assistant message) and the cached/uncached split so
+  # the client can compute per-turn cost and deltas (turn - last_turn).
+  def self.usage(session, payload)
+    conv  = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/usage: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/usage: conversation is private')
+      return
+    end
+    Command.reply(session, 'agent', 'usage', {
+      conversation_id: conv,
+      rows: usage_rows(convo),
+    })
+  end
+  register 'usage', :usage
+
+  # Usage rows for a conversation, ordered by request time. uncached is the
+  # prompt minus the cached prefix; completion is always full-price output.
+  def self.usage_rows(convo)
+    convo.agent_turn_usage.includes(:agent_message).order(:created_at).map do |u|
+      prompt = u.prompt_tokens.to_i
+      cached = u.cached_tokens.to_i
+      {
+        agent_turn_id:     u.agent_message&.agent_turn_id,
+        turn:              u.agent_message&.turn,
+        prompt_tokens:     prompt,
+        cached_tokens:     cached,
+        uncached_tokens:   [prompt - cached, 0].max,
+        completion_tokens: u.completion_tokens.to_i,
+      }
+    end
+  end
 
   # --- subscribe (delivery membership, #85) ---------------------------------
   # Authorization lives here: a client may subscribe only to a conversation it
