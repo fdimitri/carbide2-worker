@@ -296,6 +296,12 @@ class AgentSession
       record_usage!
 
       if calls.empty?
+        # Capture the completed turn's identity BEFORE close_turn! nulls it,
+        # so the live done frame can carry the same turn/agent_turn_id that
+        # load() would replay — the client needs them to render the per-turn
+        # fork marker without a re-fetch.
+        done_turn_id = @current_turn&.id
+        done_turn    = @turn - 1   # last persisted message turn
         close_turn!(status: 'done')
         # Pass finish_reason and reasoning_content through so the client can
         # distinguish "model genuinely had nothing to say" (stop, empty
@@ -305,7 +311,8 @@ class AgentSession
         # don't return the field don't get noise.
         emit('done', {
           content:       content.to_s,
-          turn:          turn,
+          turn:          done_turn,
+          agent_turn_id: done_turn_id,
           finish_reason: finish,
           reasoning:     reasoning,
         }.compact)

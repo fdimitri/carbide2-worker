@@ -291,6 +291,30 @@ module AgentHandlers
   end
   register 'set_visibility', :set_visibility
 
+  # Rename a conversation (owner-only). The title is otherwise auto-generated
+  # from the first user message; a fork inherits the ancestor's title, which
+  # reads poorly until the forker renames it.
+  def self.rename(session, payload)
+    conv  = payload['conversation_id'].to_s
+    title = payload['title'].to_s.strip
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/rename: conversation not found in this project')
+      return
+    end
+    unless convo.user_id == session.user_id
+      Command.error(session, 'agent/rename: only the owner can rename a conversation')
+      return
+    end
+    if title.empty?
+      Command.error(session, 'agent/rename: title must not be empty')
+      return
+    end
+    convo.update!(title: title)
+    Command.reply(session, 'agent', 'renamed', { conversation_id: conv, title: convo.title })
+  end
+  register 'rename', :rename
+
   # Interrupt an in-flight turn. Any project member who can see the
   # conversation may stop it (project-visible => all members; private => owner
   # only) — matches the existing "any member may post" rule for shared threads.
