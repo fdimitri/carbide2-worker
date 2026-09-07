@@ -398,6 +398,16 @@ module AgentHandlers
     candidates = clean_candidates(convo, scope)
     selected   = select_candidates(candidates, mode, payload)
 
+    # ADR-033 phase 2: the Resolver's cache-cost verdict on this trim.
+    # removed_tokens is a bytes→token estimate; prompt_tokens comes from the
+    # last recorded request. context_limit is nil for now (ceiling is an open
+    # question) so the verdict is :evict/:extend without :mandatory.
+    last_usage    = convo.agent_turn_usage.order(:created_at).last
+    prompt_tokens = last_usage&.prompt_tokens
+    removed_tokens = selected.sum { |m| (clean_size(m) / 4.0).ceil }
+    resolved = Resolver.resolve(removed_tokens: removed_tokens,
+                                prompt_tokens: prompt_tokens || 0)
+
     preview = {
       conversation_id: conv,
       total_results:   candidates.count { |m| m.role == 'tool' },
@@ -406,6 +416,13 @@ module AgentHandlers
       removed_results: selected.count { |m| m.role == 'tool' },
       removed_calls:   selected.count { |m| m.role == 'assistant' },
       bytes_reclaimed: selected.sum { |m| clean_size(m) },
+      prompt_tokens:      prompt_tokens,
+      removed_tokens_estimate: removed_tokens,
+      f:                  resolved.f,
+      surcharge:          resolved.surcharge,
+      break_even_turns:   resolved.break_even_turns,
+      recovery_turns:     resolved.recovery_turns,
+      verdict:            resolved.verdict.to_s,
     }
 
     if payload['dry_run']

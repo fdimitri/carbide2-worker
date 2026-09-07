@@ -1097,4 +1097,47 @@ module AgentTools
                             content: args['content'].to_s, user_id: session.user_id)
     res.is_a?(Hash) && res[:path] ? res.merge(name: File.basename(srcpath, '.md')) : res
   end
+
+  # ---------------------------------------------------------------------
+  # rehydrate_ttl(tool_call_id) — renew a tool result's lease before it expires.
+  #
+  # ADR-033 phase 2: tool results carry a turn-budget TTL (expires_at_turn).
+  # The agent calls this on a tool_call_id it still needs, which clears the
+  # expiry (keeps the result in the prompt). This is lease renewal BEFORE
+  # eviction — a tombstoned result is a flag, not a delete, so un-flagging is
+  # still the restore path; this tool is for keeping content that is merely
+  # *about to* expire.
+  # ---------------------------------------------------------------------
+  register('rehydrate_ttl',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'rehydrate_ttl',
+        description: 'Renew the expiry on a tool result the agent still ' \
+                     'needs, identified by its tool_call_id. Tool results are ' \
+                     'evicted from the prompt after a turn budget to save ' \
+                     'tokens; call this on any tool_call_id whose result you ' \
+                     'will need again so it is not removed.',
+        parameters: {
+          type: 'object',
+          required: ['tool_call_id'],
+          properties: {
+            tool_call_id: { type: 'string',
+                            description: 'The tool_call_id of the result to keep.' },
+          },
+          additionalProperties: false,
+        },
+      },
+    }
+  ) do |session:, project_id:, args:, **_|
+    tid = args['tool_call_id'].to_s
+    next { error: 'tool_call_id is required' } if tid.empty?
+    msgs = AgentMessage.joins(:agent_conversation)
+                       .where(agent_conversations: { project_id: project_id })
+                       .where(tool_call_id: tid, role: 'tool')
+    next { error: "no tool result with tool_call_id #{tid.inspect} in this project" } if msgs.empty?
+
+    msgs.each { |m| m.update_column(:expires_at_turn, nil) }
+    { tool_call_id: tid, rehydrated: msgs.size }
+  end
 end

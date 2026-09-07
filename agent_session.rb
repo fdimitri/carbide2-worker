@@ -115,6 +115,7 @@ class AgentSession
     @turn_mutex      = Mutex.new
     @turn_in_progress = false
     @current_turn    = nil   # ADR-032 AgentTurn open during ask
+    @last_usage      = nil   # ADR-033 usage from the final SSE chunk
 
     # Resume from DB if a conversation with this uuid exists, otherwise
     # create one and seed with the agent's system prompt. We persist
@@ -292,6 +293,7 @@ class AgentSession
 
       # Always append whatever the model said, even if empty (tool-only turn).
       push_history!(role: 'assistant', content: content, tool_calls: calls)
+      record_usage!
 
       if calls.empty?
         close_turn!(status: 'done')
@@ -419,6 +421,7 @@ class AgentSession
       model:    @agent.model,
       messages: outgoing_messages,
       stream:   true,
+      stream_options: { include_usage: true },
     }
     body.merge!(@agent.sampling_params)
     tools = AgentTools.openai_tools_for(@agent.allowed_tool_slugs)
@@ -438,6 +441,7 @@ class AgentSession
     reasoning = +''
     tool_acc  = {}   # index => { 'id', 'type', 'function' => { 'name', 'arguments' } }
     finish    = nil
+    usage     = nil
     buffer    = +''
     saw_sse   = false
 
@@ -465,6 +469,7 @@ class AgentSession
             choice = (json['choices'] || [])[0] || {}
             delta  = choice['delta'] || {}
             finish = choice['finish_reason'] if choice['finish_reason']
+            usage  = json['usage'] if json['usage']
 
             if (c = delta['content']) && !c.empty?
               content << c
@@ -499,6 +504,7 @@ class AgentSession
     end
 
     tool_calls = tool_acc.keys.sort.map { |k| tool_acc[k] }
+    @last_usage = usage
     {
       'choices' => [{
         'message' => {
@@ -509,6 +515,26 @@ class AgentSession
         'finish_reason' => finish,
       }],
     }
+  end
+
+  # ADR-033 phase 2: persist the usage returned on the final SSE chunk, keyed
+  # to the just-appended assistant message (the head of this completion
+  # request). Usage is per-request, not per-message.
+  def record_usage!
+    u = @last_usage
+    @last_usage = nil
+    return unless u.is_a?(Hash) && !u.empty?
+    last = @convo.agent_messages.order(:turn).last
+    return unless last
+    @convo.agent_turn_usage.create!(
+      agent_message:     last,
+      prompt_tokens:     u['prompt_tokens'],
+      completion_tokens: u['completion_tokens'],
+      total_tokens:      u['total_tokens'],
+      cached_tokens:     u.dig('prompt_tokens_details', 'cached_tokens'),
+    )
+  rescue => e
+    puts "[AgentSession] record_usage failed: #{e.class} #{e.message}"
   end
 
   def run_tool_call(call)
