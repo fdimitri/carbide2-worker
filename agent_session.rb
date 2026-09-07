@@ -114,6 +114,7 @@ class AgentSession
     # clear the cancel flag for an in-flight turn.
     @turn_mutex      = Mutex.new
     @turn_in_progress = false
+    @current_turn    = nil   # ADR-032 AgentTurn open during ask
 
     # Resume from DB if a conversation with this uuid exists, otherwise
     # create one and seed with the agent's system prompt. We persist
@@ -150,6 +151,24 @@ class AgentSession
   # message would be surprising and isn't reversible.
   def refresh_agent!(agent)
     @agent = agent if agent
+  end
+
+  # ADR-032: open an AgentTurn for the user exchange about to begin. start_turn
+  # is the message turn the user's question will occupy.
+  def open_turn!
+    @current_turn = @convo.agent_turns.create!(status: 'in_progress', start_turn: @turn)
+  end
+
+  # ADR-032: close the current AgentTurn, recording the last message turn it
+  # spans. end_turn defaults to the last persisted turn (@turn - 1).
+  def close_turn!(status:)
+    return unless @current_turn
+    end_turn = @turn - 1
+    @current_turn.update!(status: status, end_turn: end_turn)
+    @current_turn = nil
+  rescue => e
+    puts "[AgentSession] close_turn failed: #{e.class} #{e.message}"
+    @current_turn = nil
   end
 
   # ADR-033 phase 1: tombstone the given messages and reflect it in the live
@@ -240,6 +259,7 @@ class AgentSession
   # caller surfaces via agent/error.
   def ask(user_text, images: nil, author_user_id: nil)
     @cancel_mutex.synchronize { @cancel_requested = false }
+    open_turn!
     push_history!(role: 'user', content: user_text.to_s, images: images,
                   author_user_id: author_user_id)
     debug_agent(level: :info,
@@ -274,6 +294,7 @@ class AgentSession
       push_history!(role: 'assistant', content: content, tool_calls: calls)
 
       if calls.empty?
+        close_turn!(status: 'done')
         # Pass finish_reason and reasoning_content through so the client can
         # distinguish "model genuinely had nothing to say" (stop, empty
         # content) from "model was cut off mid-output by the context window"
@@ -301,12 +322,14 @@ class AgentSession
         run_tool_call(call)
       end
     end
+    close_turn!(status: 'error')
     emit('error', { message: "agent exceeded max_turns=#{max_turns}" })
     nil
   rescue => e
     if cancelled?
       emit_stopped(nil)
     else
+      close_turn!(status: 'error')
       emit('error', { message: "#{e.class}: #{e.message}" })
       debug_agent(level: :error,
         message: "error: #{e.class}: #{e.message}",
@@ -321,6 +344,7 @@ class AgentSession
   # Broadcast a cancellation of the current turn to the same audience as
   # other agent events. turn is informational (nil when we bailed mid-HTTP).
   def emit_stopped(turn)
+    close_turn!(status: 'stopped')
     emit('stopped', { reason: 'cancelled', turn: turn }.compact)
     debug_agent(level: :info,
       message: "stopped turn=#{turn.inspect}",
@@ -604,7 +628,8 @@ class AgentSession
     @convo.append!(turn: @turn, role: role, content: content,
                    tool_calls: persist_calls,
                    tool_call_id: tool_call_id, name: name,
-                   user_id: author_user_id)
+                   user_id: author_user_id,
+                   agent_turn: @current_turn)
     @turn += 1
   rescue => e
     # Persistence failure is logged but does not kill the conversation —

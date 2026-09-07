@@ -141,14 +141,17 @@ module AgentHandlers
 
     # Replay messages in the wire-shape AgentPane already understands.
     # includes(:user) so per-message display-name resolution doesn't N+1.
+    # Each item also carries turn + agent_turn_id (ADR-032) so the client can
+    # group messages into turns and offer per-turn fork points.
     msgs = convo.agent_messages.includes(:user).order(:turn).to_a
     items = msgs.flat_map do |m|
+      base = { turn: m.turn, agent_turn_id: m.agent_turn_id }
       case m.role
       when 'user'
-        [{ kind: 'user', text: m.content.to_s, user_id: m.user_id, name: m.user&.display_name }]
+        [{ kind: 'user', text: m.content.to_s, user_id: m.user_id, name: m.user&.display_name, **base }]
       when 'assistant'
         out = []
-        out << { kind: 'assistant', text: m.content.to_s } if m.content.to_s.strip != ''
+        out << { kind: 'assistant', text: m.content.to_s, **base } if m.content.to_s.strip != ''
         # tool_calls surface as their own UI rows; tool_call_id pairs with
         # the role=tool row that follows.
         (m.tool_calls || []).each do |tc|
@@ -157,12 +160,13 @@ module AgentHandlers
             id:   tc['id'],
             name: tc.dig('function', 'name'),
             args: (JSON.parse(tc.dig('function', 'arguments').to_s) rescue {}),
+            **base,
           }
         end
         out
       when 'tool'
         result = (JSON.parse(m.content.to_s) rescue m.content)
-        [{ kind: 'tool_result', id: m.tool_call_id, name: m.name, result: result }]
+        [{ kind: 'tool_result', id: m.tool_call_id, name: m.name, result: result, **base }]
       else
         [] # 'system' is hidden from UI
       end
