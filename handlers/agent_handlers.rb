@@ -55,6 +55,9 @@ module AgentHandlers
         owner_is_self:    (c.user_id == session.user_id),
         last_activity_at: c.last_activity_at&.iso8601,
         message_count:    c.agent_messages.count,
+        # ADR-032 fork lineage (nil for root conversations).
+        forked_from_conversation_id: c.forked_from&.uuid,
+        forked_at_turn:             c.forked_at_turn,
       }
     end
     Command.reply(session, 'agent', 'recent', { conversations: items })
@@ -81,6 +84,48 @@ module AgentHandlers
     Command.reply(session, 'agent', 'created', { conversation_id: conv, agent: agent.slug })
   end
   register 'create', :create
+
+  # ADR-032: fork a conversation at a turn boundary into a new, independent
+  # conversation (deep copy of the prefix). fork_at_turn defaults to the latest
+  # message turn. Authorization mirrors ask (any member for project threads,
+  # owner-only for private).
+  def self.fork_conversation(session, payload)
+    conv  = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/fork: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/fork: conversation is private')
+      return
+    end
+
+    latest = convo.agent_messages.order(:turn).last
+    unless latest
+      Command.error(session, 'agent/fork: conversation has no messages to fork')
+      return
+    end
+    fork_at_turn = payload['fork_at_turn'].to_i
+    fork_at_turn = latest.turn if fork_at_turn <= 0 || fork_at_turn > latest.turn
+
+    forker = User.find_by(id: session.user_id) || convo.user
+    fork = convo.fork_from!(forker: forker, fork_at_turn: fork_at_turn)
+
+    AgentSession.start(session: session, agent: fork.agent,
+                       project_id: fork.project_id,
+                       conversation_id: fork.uuid)
+    AgentSession.subscribe(session, fork.uuid)
+    session.agent_subs << fork.uuid unless session.agent_subs.include?(fork.uuid)
+
+    Command.reply(session, 'agent', 'forked', {
+      conversation_id:            fork.uuid,
+      agent:                      fork.agent.slug,
+      forked_from_conversation_id: conv,
+      forked_at_turn:             fork.forked_at_turn,
+    })
+  end
+  register 'fork', :fork_conversation
 
   def self.load(session, payload)
     conv  = payload['conversation_id'].to_s
@@ -130,6 +175,9 @@ module AgentHandlers
       visibility:      convo.visibility,
       owner_user_id:   convo.user_id,
       owner_is_self:   (convo.user_id == session.user_id),
+      # ADR-032 fork lineage.
+      forked_from_conversation_id: convo.forked_from&.uuid,
+      forked_at_turn:             convo.forked_at_turn,
       messages:        items,
     })
   end
