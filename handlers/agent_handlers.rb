@@ -4,6 +4,8 @@
 # Heavy lifting (HTTP to model server) runs in EM.defer; these handlers
 # return promptly.
 
+require 'time'
+
 module AgentHandlers
   extend Command::Dispatcher
   namespace 'agent'
@@ -312,4 +314,130 @@ module AgentHandlers
     end
   end
   register 'ask', :ask
+
+  # ADR-033 phase 1: soft-evict (tombstone) tool results and/or tool call text
+  # from a conversation's history, oldest-first. dry_run returns a preview
+  # without writing. Selected messages keep their rows and structural fields
+  # (turn/tool_call_id/name); only the payload leaves the prompt.
+  def self.clean(session, payload)
+    conv  = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/clean: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/clean: conversation is private')
+      return
+    end
+
+    scope = payload['scope'].to_s
+    scope = 'both' if scope.empty?
+    unless %w[results calls both].include?(scope)
+      Command.error(session, 'agent/clean: scope must be results, calls, or both')
+      return
+    end
+    mode = payload['mode'].to_s
+    unless %w[before_datetime first_n n_size].include?(mode)
+      Command.error(session, 'agent/clean: mode must be before_datetime, first_n, or n_size')
+      return
+    end
+
+    candidates = clean_candidates(convo, scope)
+    selected   = select_candidates(candidates, mode, payload)
+
+    preview = {
+      conversation_id: conv,
+      total_results:   candidates.count { |m| m.role == 'tool' },
+      total_calls:     candidates.count { |m| m.role == 'assistant' },
+      total_bytes:     candidates.sum { |m| clean_size(m) },
+      removed_results: selected.count { |m| m.role == 'tool' },
+      removed_calls:   selected.count { |m| m.role == 'assistant' },
+      bytes_reclaimed: selected.sum { |m| clean_size(m) },
+    }
+
+    if payload['dry_run']
+      Command.reply(session, 'agent', 'clean_preview', preview)
+      return
+    end
+
+    # Reflect the eviction in the live in-memory @history too (ADR-033 §4).
+    # Reject while a turn is in flight rather than mutate @history mid-loop.
+    sess = AgentSession.find(conv)
+    if sess && !sess.try_begin_turn!
+      Command.error(session, 'agent/clean: a turn is in progress; retry after it finishes')
+      return
+    end
+
+    begin
+      sess.evict!(selected) if sess
+      Command.reply(session, 'agent', 'cleaned', {
+        conversation_id: conv,
+        removed_results: preview[:removed_results],
+        removed_calls:   preview[:removed_calls],
+        bytes_reclaimed: preview[:bytes_reclaimed],
+      })
+    ensure
+      sess.finish_turn! if sess
+    end
+  end
+  register 'clean', :clean
+
+  # Candidate evictable messages in turn order: tool results and/or assistant
+  # rows carrying tool_calls, not already evicted.
+  def self.clean_candidates(convo, scope)
+    convo.agent_messages.not_evicted.order(:turn).to_a.select do |m|
+      case scope
+      when 'results' then m.role == 'tool'
+      when 'calls'   then m.role == 'assistant' && m.tool_calls.present?
+      else                m.role == 'tool' || (m.role == 'assistant' && m.tool_calls.present?)
+      end
+    end
+  end
+
+  # Evictable payload size in bytes: result content, or the sum of a call's
+  # arguments. (Phase 1 measures bytes; token-aware sizing is phase 2.)
+  def self.clean_size(m)
+    case m.role
+    when 'tool'
+      m.content.to_s.bytesize
+    when 'assistant'
+      (m.tool_calls || []).sum { |tc| tc.dig('function', 'arguments').to_s.bytesize }
+    else
+      0
+    end
+  end
+
+  # Front-trim the candidate list per the requested mode.
+  def self.select_candidates(candidates, mode, payload)
+    case mode
+    when 'before_datetime'
+      t = parse_clean_time(payload['cutoff'])
+      return [] unless t
+      candidates.select { |m| m.created_at < t }
+    when 'first_n'
+      n = payload['n'].to_i
+      n.positive? ? candidates.first(n) : []
+    when 'n_size'
+      bytes = payload['bytes'].to_i
+      return [] unless bytes.positive?
+      out   = []
+      total = 0
+      candidates.each do |m|
+        break if total >= bytes
+        out << m
+        total += clean_size(m)
+      end
+      out
+    end
+  end
+
+  def self.parse_clean_time(cutoff)
+    return nil if cutoff.to_s.empty?
+    Time.iso8601(cutoff)
+  rescue ArgumentError
+    Time.parse(cutoff)
+  rescue ArgumentError
+    nil
+  end
 end
