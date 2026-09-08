@@ -44,10 +44,12 @@ module AgentTools
     end
   end
 
-  # Invoke a tool by name. Returns the tool's result (Hash). Raises
-  # ArgumentError if the tool isn't registered or isn't in allowed_slugs.
-  # Any exception inside the tool is caught and returned as { error: ... }
-  # so the model can read it and retry rather than killing the loop.
+  # Invoke a tool by name. Returns the tool's result (Hash).
+  #
+  # An unknown tool, or one not in this agent's allowlist, is NOT raised — it
+  # returns { error: ... } so the model receives a tool result it can read and
+  # recover from (inventing a tool name must not kill the conversation). Any
+  # exception inside the tool is likewise caught and returned as { error: ... }.
   #
   # `agent:` is the Agent record — passed to callables that need per-agent
   # capability gates beyond the allowed_slugs list (currently: shell_exec
@@ -55,9 +57,10 @@ module AgentTools
   def self.invoke(slug, allowed_slugs:, session:, project_id:, args:, agent: nil,
                   cancel_check: nil)
     unless allowed_slugs.include?(slug)
-      raise ArgumentError, "tool #{slug.inspect} not allowed for this agent"
+      return { error: "tool #{slug.inspect} is not allowed for this agent" }
     end
-    entry = REGISTRY[slug] or raise ArgumentError, "unknown tool #{slug.inspect}"
+    entry = REGISTRY[slug]
+    return { error: "unknown tool #{slug.inspect}" } unless entry
     begin
       entry[:callable].call(session: session, project_id: project_id,
                             args: args, agent: agent, cancel_check: cancel_check)
