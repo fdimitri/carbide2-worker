@@ -175,8 +175,9 @@ class AgentSession
   # ADR-033 phase 1: tombstone the given messages and reflect it in the live
   # @history immediately so the next turn omits the payload without a reload.
   # @history is in turn order (turns are dense from 0), so a row's `turn`
-  # indexes its entry. Tool results drop :content; assistant rows drop their
-  # tool calls' `arguments` but keep id/name so the pairing survives.
+  # indexes its entry. Tool results set :content to '' (the provider requires
+  # the field on role=tool); assistant rows drop their tool calls' `arguments`
+  # but keep id/name so the pairing survives.
   def evict!(messages)
     messages.each(&:tombstone!)
     messages.each do |m|
@@ -184,7 +185,7 @@ class AgentSession
       next unless entry
       case m.role
       when 'tool'
-        entry.delete(:content)
+        entry[:content] = ''
       when 'assistant'
         Array(entry[:tool_calls]).each do |tc|
           tc['function'].delete('arguments') if tc['function']
