@@ -523,7 +523,7 @@ EM.run do
 
   # Stop VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do
-    VFS_WATCHERS.each_value(&:stop)
+    VFS_WATCHERS.each_value(&:stop!)
     puts '[worker] VFS watchers stopped'
   end
 
@@ -536,10 +536,9 @@ EM.run do
           proj    = Project.find_by(id: project_id)
           next unless proj
 
-          # project_setting.root_path, else PROJECTS_ROOT/<project uuid>.
-          fs_root = File.expand_path(
-            proj.project_setting&.root_path.presence || proj.default_root_path
-          )
+          # Keyed by project uuid (the control-owned workspace identity), never
+          # the local primary key or a stale id-based project_setting.root_path.
+          fs_root = File.expand_path(proj.default_root_path)
           FileUtils.mkdir_p(fs_root) rescue nil
           puts "[startup] Loading filesystem for project #{project_id} from #{fs_root}"
           stats = FsLoader.new(project_id: project_id, root_path: fs_root).load!
