@@ -295,6 +295,48 @@ module AgentHandlers
   end
   register 'set_visibility', :set_visibility
 
+  # Change which agent a conversation runs as (#120). The transcript is kept —
+  # the new agent answers subsequent turns — but the row is updated so the
+  # conversation list and the explorer's agent grouping track it.
+  #
+  # Broadcast PROJECT-wide, not just to subscribers: the change affects every
+  # client's conversation list, including clients that don't have this
+  # conversation open. (This is deliberately wider than the subscriber-scoped
+  # fan-out used for stream/tool frames.)
+  def self.set_agent(session, payload)
+    conv  = payload['conversation_id'].to_s
+    slug  = payload['agent_slug'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/set_agent: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/set_agent: conversation is private')
+      return
+    end
+    agent = Agent.enabled.find_by(slug: slug)
+    unless agent
+      Command.error(session, "agent/set_agent: no enabled agent with slug=#{slug}")
+      return
+    end
+
+    convo.update!(agent_id: agent.id)
+    # Re-point a live session so the next turn uses the new agent. The system
+    # prompt already seeded into history is left alone (refresh_agent!).
+    AgentSession.find(conv)&.refresh_agent!(agent)
+
+    change = {
+      conversation_id: conv,
+      agent_slug:      agent.slug,
+      agent_name:      agent.name,
+      agent_id:        agent.id,
+    }
+    Command.broadcast_project(session.project_id, 'agent', 'agent_changed', change)
+    Command.reply(session, 'agent', 'agent_changed', change)
+  end
+  register 'set_agent', :set_agent
+
   # Rename a conversation (owner-only). The title is otherwise auto-generated
   # from the first user message; a fork inherits the ancestor's title, which
   # reads poorly until the forker renames it.
