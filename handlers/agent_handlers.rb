@@ -19,6 +19,10 @@ module AgentHandlers
         role:        a.role,
         model:       a.model,
         tools:       a.allowed_tool_slugs,
+        # UTC peak-hour windows (see Agent#peak_hours_windows). Empty = none.
+        # The client reads these against the UTC clock to raise a warning
+        # badge; the worker itself does not throttle on them.
+        peak_hours:  a.peak_hours_windows,
       }
     end
     Command.reply(session, 'agent', 'list', { agents: agents })
