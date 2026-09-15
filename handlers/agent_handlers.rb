@@ -11,7 +11,33 @@ module AgentHandlers
   namespace 'agent'
 
   def self.list(session, _payload)
-    agents = Agent.enabled.order(:role, :name).map do |a|
+    Command.reply(session, 'agent', 'list', { agents: agent_catalog })
+  end
+  register 'list', :list
+
+  # Re-read the catalog and broadcast it to EVERY socket in the project,
+  # including the one that asked.
+  #
+  # The catalog is workspace-global, but an edit reaches the DB over REST
+  # (AgentsController) and there is no server->worker channel — the worker has
+  # no HTTP surface and neither server nor control references it — so the
+  # client that saved is the only thing positioned to say "this changed". It
+  # sends this after a successful write and the broadcast does the rest.
+  #
+  # Broadcasting rather than replying is the point: every other client's agent
+  # picker, meta line and peak-hours badge are reading the same catalog, and a
+  # reply to the saver alone would leave all of them on stale data. Because
+  # broadcast_project includes the origin socket, the saver is updated by the
+  # same frame and needs no separate refresh.
+  def self.config_changed(session, _payload)
+    Command.broadcast_project(session.project_id, 'agent', 'list', { agents: agent_catalog })
+  end
+  register 'config_changed', :config_changed
+
+  # The enabled-agent catalog in its wire shape. Shared by list and
+  # config_changed so the broadcast can never drift from the reply.
+  def self.agent_catalog
+    Agent.enabled.order(:role, :name).map do |a|
       {
         slug:        a.slug,
         name:        a.name,
@@ -19,15 +45,13 @@ module AgentHandlers
         role:        a.role,
         model:       a.model,
         tools:       a.allowed_tool_slugs,
-        # UTC peak-hour windows (see Agent#peak_hours_windows). Empty = none.
-        # The client reads these against the UTC clock to raise a warning
-        # badge; the worker itself does not throttle on them.
+        # Peak-hour windows, each with its own timezone (see
+        # Agent#peak_hours_windows). Empty = none. The client evaluates these
+        # for its badge; the worker itself does not throttle on them.
         peak_hours:  a.peak_hours_windows,
       }
     end
-    Command.reply(session, 'agent', 'list', { agents: agents })
   end
-  register 'list', :list
 
   # Advertise the tools this worker can make available, so the client builds
   # its per-agent allowlist UI from the live registry rather than a hardcoded
