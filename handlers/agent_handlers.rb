@@ -15,27 +15,73 @@ module AgentHandlers
   end
   register 'list', :list
 
-  # Re-read the catalog and broadcast it to EVERY socket in the project,
-  # including the one that asked.
-  #
-  # The catalog is workspace-global, but an edit reaches the DB over REST
-  # (AgentsController) and there is no server->worker channel — the worker has
-  # no HTTP surface and neither server nor control references it — so the
-  # client that saved is the only thing positioned to say "this changed". It
-  # sends this after a successful write and the broadcast does the rest.
-  #
-  # Broadcasting rather than replying is the point: every other client's agent
-  # picker, meta line and peak-hours badge are reading the same catalog, and a
-  # reply to the saver alone would leave all of them on stale data. Because
-  # broadcast_project includes the origin socket, the saver is updated by the
-  # same frame and needs no separate refresh.
-  def self.config_changed(session, _payload)
-    Command.broadcast_project(session.project_id, 'agent', 'list', { agents: agent_catalog })
+  # The ADMIN view: every agent, enabled or not, in the shape the config pane
+  # edits. Distinct from `list` because the catalog is deliberately
+  # enabled-only — a disabled agent must not appear in the picker — while an
+  # admin has to be able to see and re-enable one.
+  def self.all(session, _payload)
+    Command.reply(session, 'agent', 'all', { agents: Agent.order(:role, :slug).map { |a| agent_admin_json(a) } })
   end
-  register 'config_changed', :config_changed
+  register 'all', :all
 
-  # The enabled-agent catalog in its wire shape. Shared by list and
-  # config_changed so the broadcast can never drift from the reply.
+  # Create or update an agent. Replies with the saved row and broadcasts the
+  # catalog, in this one process, so the write and the notification cannot
+  # disagree — the client no longer has to tell the worker that it saved.
+  #
+  # Payload is the admin shape; `id` present => update, absent => create.
+  # `slug` is settable only on create (immutable after, as before). api_key is
+  # written only when non-blank so re-saving with the field empty preserves the
+  # stored key.
+  def self.save(session, payload)
+    agent = payload['id'].present? ? Agent.find_by(id: payload['id']) : Agent.new
+    unless agent
+      Command.error(session, 'agent/save: no such agent')
+      return
+    end
+
+    attrs = payload.slice('name', 'description', 'role', 'provider_url', 'model',
+                          'system_prompt', 'enabled', 'shell_exec_enabled', 'max_turns')
+    agent.assign_attributes(attrs)
+    # The model normalizes these three on assignment (see Agent#allowed_tools=,
+    # #sampling=, #peak_hours=), so the socket and REST paths cannot drift.
+    agent.allowed_tools = payload['allowed_tools'] if payload.key?('allowed_tools')
+    agent.sampling      = payload['sampling']      if payload.key?('sampling')
+    agent.peak_hours    = payload['peak_hours']    if payload.key?('peak_hours')
+    agent.slug          = payload['slug'].to_s.strip if agent.new_record?
+    agent.api_key       = payload['api_key'] if payload['api_key'].present?
+
+    agent.save! if agent.changed? || agent.new_record?
+
+    Command.reply(session, 'agent', 'saved', { agent: agent_admin_json(agent) })
+    broadcast_catalog(session)
+  rescue ActiveRecord::RecordInvalid => e
+    Command.error(session, "agent/save: #{e.record.errors.full_messages.join(', ')}")
+  end
+  register 'save', :save
+
+  # Delete an agent. Refuses while any conversation references it — the row is
+  # what a conversation's transcript is attributed to, and the REST path
+  # enforced the same rule.
+  def self.destroy(session, payload)
+    agent = Agent.find_by(id: payload['id'])
+    unless agent
+      Command.error(session, 'agent/delete: no such agent')
+      return
+    end
+    if agent.agent_conversations.exists?
+      Command.error(session, 'agent/delete: this agent has conversations and cannot be deleted')
+      return
+    end
+
+    id = agent.id
+    agent.destroy!
+    Command.reply(session, 'agent', 'deleted', { id: id })
+    broadcast_catalog(session)
+  end
+  register 'delete', :destroy
+
+  # The enabled-agent catalog in its wire shape. Shared by list and the
+  # post-write broadcast so the two can never drift.
   def self.agent_catalog
     Agent.enabled.order(:role, :name).map do |a|
       {
@@ -51,6 +97,36 @@ module AgentHandlers
         peak_hours:  a.peak_hours_windows,
       }
     end
+  end
+
+  # The admin shape the config pane reads and writes. Mirrors
+  # Api::AgentsController#agent_json so the two paths hand the client the same
+  # object; api_key is never returned, only whether one is set.
+  def self.agent_admin_json(a)
+    {
+      id:                 a.id,
+      slug:               a.slug,
+      name:               a.name,
+      description:        a.description,
+      provider_url:       a.provider_url,
+      model:              a.model,
+      api_key_set:        a.api_key.present?,
+      system_prompt:      a.system_prompt,
+      allowed_tools:      a.allowed_tool_slugs,
+      sampling:           a.sampling_params,
+      peak_hours:         a.peak_hours_windows,
+      role:               a.role,
+      enabled:            a.enabled,
+      shell_exec_enabled: a.shell_exec_enabled,
+      max_turns:          a.max_turns,
+    }
+  end
+
+  # Push the catalog to every socket in the project, origin included: the
+  # picker, meta line and peak-hours badge all render from it, and the saver
+  # needs the update as much as anyone.
+  def self.broadcast_catalog(session)
+    Command.broadcast_project(session.project_id, 'agent', 'list', { agents: agent_catalog })
   end
 
   # Advertise the tools this worker can make available, so the client builds
