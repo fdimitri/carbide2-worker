@@ -28,6 +28,33 @@ require 'fileutils'
 require 'open3'
 
 module FsStore
+  # Replies to recent fs/write batches, by "project:user:batch_id", so a
+  # client retrying after a dropped socket gets the original answer.
+  module RecentBatches
+    TTL_S = 600
+    MAX   = 2000
+    @entries = {}
+    @lock = Mutex.new
+
+    def self.get(key)
+      @lock.synchronize do
+        e = @entries[key]
+        e && Time.now - e[0] < TTL_S ? e[1] : nil
+      end
+    end
+
+    def self.put(key, value)
+      @lock.synchronize do
+        @entries[key] = [Time.now, value]
+        if @entries.size > MAX
+          cutoff = Time.now - TTL_S
+          @entries.delete_if { |_, (t, _)| t < cutoff }
+          @entries.shift while @entries.size > MAX
+        end
+      end
+    end
+  end
+
   # Entry point — called by worker route() for cs == 'fs'
   def self.handle(session, cmd, payload, sessions_by_project, send_fn, broadcast_fn)
     case cmd
@@ -193,7 +220,7 @@ module FsStore
   #
   # Without base_revision_id every change is a blind append at the head (older
   # clients). With it, the batch is based on that revision: appended if it is
-  # still the head, otherwise auto-branched there and merged; see
+  # still the head, otherwise auto-branched there and rebased onto main; see
   # ProjectFs.write_batch!.
   def self.handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path    = payload['path'].to_s.strip
@@ -212,7 +239,8 @@ module FsStore
       rescue JSON::ParserError => e
         return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad change_data: #{e.message}", resync: true })
       end
-    commit_and_broadcast(session, node.path, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn)
+    commit_and_broadcast(session, node.path, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn,
+                         batch_id: payload['batch_id'].presence)
   end
 
   def self.handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -223,32 +251,49 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     delta = DbfsV2::Delta.new('setContents', { data: content })
-    commit_and_broadcast(session, node.path, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn)
+    commit_and_broadcast(session, node.path, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn,
+                         batch_id: payload['batch_id'].presence)
   end
 
   # Persist `deltas` (ProjectFs.write_batch!: blind, anchored append, or
-  # auto-branch + merge), reply fs/written to the author, send the other viewers
-  # the frames that bring them to the new head, and nudge the flusher.
+  # auto-branch + rebase), reply fs/written to the author, send the other
+  # viewers one frame per revision that landed on main, and nudge the flusher.
   #
   # Failures commit nothing on main and come back as fs/error with resync set:
-  # conflict: true when an anchored batch overlapped concurrent edits (its
+  # conflict: true when an anchored batch overlapped a concurrent replace (its
   # revisions are kept on `branch`), or when the base is unknown.
-  def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn)
+  #
+  # `batch_id` (client-chosen, optional) makes a retried batch idempotent: a
+  # client that lost its connection before the reply resends the same batch_id,
+  # and gets the original reply instead of the batch being applied twice. The
+  # memory is per worker process (RecentBatches), so it covers socket drops, not
+  # a worker restart.
+  def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn, batch_id: nil)
+    key = batch_id && "#{session.project_id}:#{session.user_id}:#{batch_id}"
+    if key && (replay = RecentBatches.get(key))
+      return send_fn.call(session.ws, 'fs', replay[0], replay[1])
+    end
+    reply = lambda do |cmd, frame|
+      frame = frame.merge(batch_id: batch_id) if batch_id
+      RecentBatches.put(key, [cmd, frame]) if key
+      send_fn.call(session.ws, 'fs', cmd, frame)
+    end
+
     store = store_for(session)
     node  = store.resolve(path)
     result =
       begin
         ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id)
       rescue ProjectFs::BranchConflict => e
-        return send_fn.call(session.ws, 'fs', 'error', { path: path, error: e.message, conflict: true, resync: true,
-                                                         branch: e.branch, branch_head: e.branch_head })
+        return reply.call('error', { path: path, error: e.message, conflict: true, resync: true,
+                                     branch: e.branch, branch_head: e.branch_head })
       rescue DbfsV2::ConflictError => e
-        return send_fn.call(session.ws, 'fs', 'error', { path: path, error: e.message, conflict: true, resync: true })
+        return reply.call('error', { path: path, error: e.message, conflict: true, resync: true })
       rescue ArgumentError, JSON::ParserError, RegexpError, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotFound => e
-        return send_fn.call(session.ws, 'fs', 'error', { path: path, error: e.message, resync: true })
+        return reply.call('error', { path: path, error: e.message, resync: true })
       end
 
-    send_fn.call(session.ws, 'fs', 'written', ProjectFs.batch_ack(path, result, node))
+    reply.call('written', ProjectFs.batch_ack(path, result, node))
 
     doc   = OPEN_DOCUMENTS["#{session.project_id}:#{path}"]
     peers = doc ? doc.others(session.ws) : []

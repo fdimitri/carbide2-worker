@@ -159,12 +159,13 @@ PROBE_DEADLINE_SECONDS = 5
 # head `revision`; fs/write and fs/set_contents accept an optional
 # `base_revision_id`; fs/error may carry `conflict: true` or `resync: true`.
 # Today's client never reads `revision`, so MIN_CLIENT stays 1.
-# PROTOCOL 7: anchored fs/write batches auto-branch and merge instead of being
-# refused. fs/written carries mode (blind|append|fast_forward|merged), head,
-# and for a merge branch/branch_head/changes/content; revision frames carry
-# `parent`; a merged batch reaches other viewers as one fs/patch frame
-# ({changes:[...], revision, parent}); fs/error for a failed merge names the
-# branch holding the batch. Blind writes are unchanged, so MIN_CLIENT stays 1.
+# PROTOCOL 7: fs/write takes base_revision_id + batch_id. A batch based behind
+# the head is auto-branched and rebased onto main instead of refused.
+# fs/written carries batch_id, mode (blind|append|rebased), head, and for a
+# rebase branch/branch_head/changes (the author's state -> head); revision
+# frames carry `parent`; a refused rebase's fs/error names the branch holding
+# the batch; a resent batch_id gets the original reply. Blind writes are
+# unchanged, so MIN_CLIENT stays 1.
 PROTOCOL   = 7
 MIN_CLIENT = 1
 

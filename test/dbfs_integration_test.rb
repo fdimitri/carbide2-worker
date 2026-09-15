@@ -13,35 +13,7 @@
 #
 #   DBFS_IT_DATABASE_URL=postgres://carbide:carbide@127.0.0.1/carbide2_dbfs_it_test \
 #     ruby test/dbfs_integration_test.rb
-require 'active_record'
-require 'active_support/all'
-require 'tmpdir'
-require 'uri'
-
-WORKER_DIR = File.expand_path('..', __dir__)
-SERVER_DIR = ENV['CARBIDE_SERVER_DIR'] || [File.expand_path('../carbide2-server', WORKER_DIR), File.expand_path('..', WORKER_DIR)]
-  .find { |d| File.exist?(File.join(d, 'lib/dbfs_v2.rb')) } or abort 'set CARBIDE_SERVER_DIR'
-
-url = URI(ENV.fetch('DBFS_IT_DATABASE_URL') { abort 'set DBFS_IT_DATABASE_URL (the database is dropped and recreated)' })
-db  = url.path.delete_prefix('/')
-abort "refusing to drop #{db.inspect}: the database name must end in _test" unless db.end_with?('_test')
-admin = url.dup.tap { |u| u.path = '/postgres' }
-ActiveRecord::Base.establish_connection(admin.to_s)
-ActiveRecord::Base.connection.drop_database(db)
-ActiveRecord::Base.connection.create_database(db)
-ActiveRecord::Base.establish_connection(url.to_s)
-ActiveRecord::Schema.verbose = false
-load File.join(SERVER_DIR, 'db/schema.rb')
-
-ENV['PROJECTS_ROOT'] = Dir.mktmpdir('carbide-dbfs-it-projects')
-ActiveRecord::Base.belongs_to_required_by_default = true # as under Rails load_defaults
-class ApplicationRecord < ActiveRecord::Base
-  self.abstract_class = true
-end
-require File.join(SERVER_DIR, 'lib/dbfs_v2')
-Dir[File.join(SERVER_DIR, 'app/models/*.rb')].sort.each { |f| require f }
-require File.join(SERVER_DIR, 'app/services/project_fs')
-require File.join(SERVER_DIR, 'app/services/fs_loader')
+require_relative 'support/dbfs_boot'
 
 worker_dir = WORKER_DIR
 require 'eventmachine'
@@ -303,8 +275,9 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert lines[0].start_with?('B'), before.inspect
     assert lines[1].start_with?('A')
 
-    # A stale multi-change batch is auto-branched at its base and merged: the
-    # author gets the edits to the merged head, the peer one patch frame.
+    # A stale multi-change batch is auto-branched at its base and rebased onto
+    # main: the author gets the edits from its own view to the head, the peer
+    # one frame per rebased revision, chained from its head.
     fs(a, 'read', path: '/a.txt')
     stale = a.ws.of('content').last['payload']['revision']
     fs(b, 'write', path: '/a.txt', changes: [{ change_type: 'insertDataSingleLine',
@@ -318,19 +291,20 @@ class WorkerDbfsIntegrationTest < Minitest::Test
       { change_type: 'insertDataSingleLine', change_data: { startLine: 2, startChar: 1, data: '2' }.to_json }
     ])
     ack = a.ws.of('written').last['payload']
-    assert_equal 'merged', ack['mode'], a.ws.frames.last.inspect
+    assert_equal 'rebased', ack['mode'], a.ws.frames.last.inspect
     assert ack['branch'].start_with?('auto/')
     merged = store.read('/a.txt')
     assert merged.start_with?('b'), merged.inspect
     assert_equal '12', merged.lines[2][0, 2]
-    assert_equal merged, ack['content']
+    assert_equal ack['head'], ProjectFs.head_revision_id(store.find('/a.txt'))
     assert_equal merged, apply_frames(author_view.join, ack['changes']), 'author applies changes to its own view'
 
-    patch = b.ws.of('patch').last['payload']
-    assert_equal b_head, patch['parent']
-    assert_equal ack['head'], patch['revision']
+    frames = b.ws.frames.select { |f| %w[change set_contents].include?(f['cmd']) }.map { |f| f['payload'] }
+    assert_equal b_head, frames.first['parent']
+    assert_equal ack['head'], frames.last['revision']
     b_view = DbfsV2::Content.at(store.find('/a.txt'), b_head)
-    assert_equal merged, apply_frames(b_view, patch['changes']), 'peer applies the patch to the old head'
+    frames.each { |f| b_view = apply_frames(b_view, [f]) }
+    assert_equal merged, b_view, 'peer applies the rebased revisions to its head'
   end
 
   def apply_frames(text, changes)

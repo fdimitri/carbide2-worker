@@ -216,9 +216,9 @@ module AgentTools
   #
   # The specs were computed one after another against the content at
   # `base_revision_id`, so the batch is anchored there: if the file moved in
-  # between, the batch is auto-branched at that revision and merged into main
-  # (ProjectFs.write_batch!); overlapping edits raise BranchConflict and stay on
-  # the branch. Returns the batch's own persisted Revisions.
+  # between, the batch is auto-branched at that revision and rebased onto main
+  # (ProjectFs.write_batch!); an edit overlapping a concurrent replace raises
+  # BranchConflict and the batch stays on the branch. Returns the batch's own persisted Revisions.
   def self.commit_changes!(project_id:, node:, specs:, base_revision_id:, user_id:)
     return [] if specs.empty?
 
