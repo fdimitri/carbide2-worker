@@ -216,29 +216,28 @@ module AgentTools
   #
   # The specs were computed one after another against the content at
   # `base_revision_id`, so the batch is anchored there: if the file moved in
-  # between, OT transforms a single edit, and a multi-edit batch that would need
-  # transforming is refused (DbfsV2::ConflictError) rather than misapplied.
-  # Returns the persisted Revisions.
+  # between, the batch is auto-branched at that revision and merged into main
+  # (ProjectFs.write_batch!); overlapping edits raise BranchConflict and stay on
+  # the branch. Returns the batch's own persisted Revisions.
   def self.commit_changes!(project_id:, node:, specs:, base_revision_id:, user_id:)
     return [] if specs.empty?
 
     deltas = specs.map { |ch| DbfsV2::Delta.new(ch[:change_type], ch[:change_data]) }
-    revs = ProjectFs.write_batch!(ProjectFs.store(project_id), node.path, deltas,
-                                  base_revision_id: base_revision_id, user_id: user_id)
+    result = ProjectFs.write_batch!(ProjectFs.store(project_id), node.path, deltas,
+                                    base_revision_id: base_revision_id, user_id: user_id)
 
     doc   = defined?(OPEN_DOCUMENTS) ? OPEN_DOCUMENTS["#{project_id}:#{node.path}"] : nil
     peers = doc ? doc.clients.keys : []
     unless peers.empty?
-      revs.each do |rev|
-        cmd, frame = ProjectFs.revision_frame(node.path, rev, user_id: user_id)
+      ProjectFs.batch_peer_frames(node.path, result, node, user_id: user_id).each do |cmd, frame|
         msg = { cs: 'fs', cmd: cmd, payload: frame }.to_json
         peers.each { |ws| ws.send(msg) rescue nil }
       end
     end
 
-    bytes = revs.sum { |r| r.change_data.to_s.bytesize }
+    bytes = result.revisions.sum { |r| r.change_data.to_s.bytesize }
     VFS_FLUSHERS[project_id]&.record_write(node.id, bytes) if defined?(VFS_FLUSHERS)
-    revs
+    result.revisions
   end
 
   # Look up a live text file for an agent tool. Returns [node, target, error]:
@@ -262,8 +261,11 @@ module AgentTools
 
   # A write that lost a race between resolving the edit and committing it.
   def self.concurrent_write_error(project_id, target, e)
-    { error: "the file changed while this edit was being applied (#{e.message}). Re-read the file and retry.",
-      revision: ProjectFs.head_revision_id(target.reload), stale: true }
+    err = { error: "the file changed while this edit was being applied and the edits overlap (#{e.message}). " \
+                   'Re-read the file and retry.',
+            revision: ProjectFs.head_revision_id(target.reload), stale: true }
+    err[:branch] = e.branch if e.respond_to?(:branch)
+    err
   end
 
   # ---------------------------------------------------------------------

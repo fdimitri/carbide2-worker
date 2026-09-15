@@ -191,8 +191,9 @@ module FsStore
   # Each change: { change_type:, change_data:, start_line:, start_char:, end_line:, end_char: }
   # change_data is the JSON payload DbfsV2::Delta parses ({startLine, startChar, ...}).
   #
-  # Without base_revision_id every change is a blind append at the head (what
-  # today's client sends). With it, the batch is anchored and chained; see
+  # Without base_revision_id every change is a blind append at the head (older
+  # clients). With it, the batch is based on that revision: appended if it is
+  # still the head, otherwise auto-branched there and merged; see
   # ProjectFs.write_batch!.
   def self.handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path    = payload['path'].to_s.strip
@@ -225,34 +226,39 @@ module FsStore
     commit_and_broadcast(session, node.path, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn)
   end
 
-  # Persist `deltas`, reply fs/written to the author, broadcast each persisted
-  # revision to the file's other viewers, and nudge the flusher.
+  # Persist `deltas` (ProjectFs.write_batch!: blind, anchored append, or
+  # auto-branch + merge), reply fs/written to the author, send the other viewers
+  # the frames that bring them to the new head, and nudge the flusher.
   #
-  # A ConflictError (an edit overlapping a concurrent write — decisions #7/#16)
-  # or an ArgumentError (coordinates out of range for the base) commits nothing;
-  # the author gets fs/error with conflict/resync set so it can re-read.
+  # Failures commit nothing on main and come back as fs/error with resync set:
+  # conflict: true when an anchored batch overlapped concurrent edits (its
+  # revisions are kept on `branch`), or when the base is unknown.
   def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn)
     store = store_for(session)
-    revs =
+    node  = store.resolve(path)
+    result =
       begin
         ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id)
+      rescue ProjectFs::BranchConflict => e
+        return send_fn.call(session.ws, 'fs', 'error', { path: path, error: e.message, conflict: true, resync: true,
+                                                         branch: e.branch, branch_head: e.branch_head })
       rescue DbfsV2::ConflictError => e
         return send_fn.call(session.ws, 'fs', 'error', { path: path, error: e.message, conflict: true, resync: true })
-      rescue ArgumentError, JSON::ParserError, RegexpError, ActiveRecord::RecordInvalid => e
+      rescue ArgumentError, JSON::ParserError, RegexpError, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotFound => e
         return send_fn.call(session.ws, 'fs', 'error', { path: path, error: e.message, resync: true })
       end
 
-    send_fn.call(session.ws, 'fs', 'written', { path: path, revisions: revs.map(&:id) })
+    send_fn.call(session.ws, 'fs', 'written', ProjectFs.batch_ack(path, result, node))
 
     doc   = OPEN_DOCUMENTS["#{session.project_id}:#{path}"]
     peers = doc ? doc.others(session.ws) : []
-    revs.each do |rev|
-      cmd, frame = ProjectFs.revision_frame(path, rev, user_id: session.user_id)
-      broadcast_fn.call(peers, 'fs', cmd, frame)
+    unless peers.empty?
+      ProjectFs.batch_peer_frames(path, result, node, user_id: session.user_id).each do |cmd, frame|
+        broadcast_fn.call(peers, 'fs', cmd, frame)
+      end
     end
 
-    node = store.find(path)
-    VFS_FLUSHERS[session.project_id]&.record_write(node.id, revs.sum { |r| r.change_data.to_s.bytesize }) if node
+    VFS_FLUSHERS[session.project_id]&.record_write(node.id, result.revisions.sum { |r| r.change_data.to_s.bytesize })
   end
 
   def self.handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)

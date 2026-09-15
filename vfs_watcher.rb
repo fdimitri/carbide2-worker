@@ -316,7 +316,8 @@ class VfsWatcher
       rev  = res[:revisions].last
       head = @store.read(srcpath).to_s
       broadcast('set_contents', {
-        path: srcpath, content: head, revision: rev&.id, user_id: @system_user_id, source: 'inotify'
+        path: srcpath, content: head, revision: rev&.id, parent: res[:revisions].first&.parent_id,
+        user_id: @system_user_id, source: 'inotify'
       })
       adopt_if_identical(res[:node], abs_path, rev, head)
       puts "[VfsWatcher:#{@project_id}] external change: #{srcpath} (rev #{rev&.id})"

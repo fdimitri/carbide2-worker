@@ -303,19 +303,40 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert lines[0].start_with?('B'), before.inspect
     assert lines[1].start_with?('A')
 
-    # A stale multi-change batch that would need transforming is refused whole.
+    # A stale multi-change batch is auto-branched at its base and merged: the
+    # author gets the edits to the merged head, the peer one patch frame.
     fs(a, 'read', path: '/a.txt')
     stale = a.ws.of('content').last['payload']['revision']
     fs(b, 'write', path: '/a.txt', changes: [{ change_type: 'insertDataSingleLine',
                                                change_data: { startLine: 0, startChar: 0, data: 'b' }.to_json }])
-    snapshot = store.read('/a.txt')
+    b_head = b.ws.of('written').last['payload']['head']
+    author_view = a.ws.of('content').last['payload']['content'].lines
+    author_view[2] = "12#{author_view[2]}"
+    b.ws.frames.clear
     fs(a, 'write', path: '/a.txt', base_revision_id: stale, changes: [
       { change_type: 'insertDataSingleLine', change_data: { startLine: 2, startChar: 0, data: '1' }.to_json },
       { change_type: 'insertDataSingleLine', change_data: { startLine: 2, startChar: 1, data: '2' }.to_json }
     ])
-    err = a.ws.of('error').last['payload']
-    assert err['conflict'], err.inspect
-    assert_equal snapshot, store.read('/a.txt'), 'nothing from the refused batch was committed'
+    ack = a.ws.of('written').last['payload']
+    assert_equal 'merged', ack['mode'], a.ws.frames.last.inspect
+    assert ack['branch'].start_with?('auto/')
+    merged = store.read('/a.txt')
+    assert merged.start_with?('b'), merged.inspect
+    assert_equal '12', merged.lines[2][0, 2]
+    assert_equal merged, ack['content']
+    assert_equal merged, apply_frames(author_view.join, ack['changes']), 'author applies changes to its own view'
+
+    patch = b.ws.of('patch').last['payload']
+    assert_equal b_head, patch['parent']
+    assert_equal ack['head'], patch['revision']
+    b_view = DbfsV2::Content.at(store.find('/a.txt'), b_head)
+    assert_equal merged, apply_frames(b_view, patch['changes']), 'peer applies the patch to the old head'
+  end
+
+  def apply_frames(text, changes)
+    buf = DbfsV2::Buffer.new(text)
+    changes.each { |c| buf.apply(DbfsV2::Delta.parse(c['change_type'], c['change_data'])) }
+    buf.to_s
   end
 
   def test_07_external_binary_ingest
