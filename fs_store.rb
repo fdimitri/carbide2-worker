@@ -427,8 +427,9 @@ module FsStore
       return { ok: false, error: "clone failed: #{out.to_s.lines.last&.strip || out}" }
     end
 
-    stats = FsLoader.new(project_id: project_id, root_path: root,
-                         user_id: user_id, verbose: false).load!
+    # Attributed to the system user like every import from the working tree;
+    # the clone itself is the user's action.
+    stats = FsLoader.new(project_id: project_id, root_path: root, verbose: false).load!
     { ok: true, stats: stats }
   rescue => e
     { ok: false, error: "#{e.class}: #{e.message}" }

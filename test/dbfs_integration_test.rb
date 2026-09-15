@@ -152,6 +152,11 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert_nil ProjectFs.head_revision_id(big), 'oversized file has no archived revision'
     assert_equal ProjectFs::MAX_FILE_SIZE + 1, big.reload.last_size
     assert_operator stats[:files], :>=, 4
+    system_id = User.system.id
+    assert_equal system_id, User.find_by!(control_uuid: User::SYSTEM_UUID).id
+    loaded = FileNode.where(project_id: project.id)
+    assert loaded.all? { |n| n.created_by == system_id }, "imports from the working tree are the system user: #{loaded.reject { |n| n.created_by == system_id }.map { |n| [n.path, n.created_by] }}"
+    assert Revision.where(file_node_id: loaded.select(:id)).all? { |r| r.user_id == system_id }
 
     # Second load is idempotent: no new revisions anywhere.
     before = Revision.joins(:file_node).where(file_nodes: { project_id: project.id }).count
@@ -242,6 +247,12 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     File.write(disk('/sub/new.txt'), "fresh\n")
     assert em_with_flusher { store.find('/sub/new.txt') }
     assert b.ws.of('created').any? { |f| f['payload']['path'] == '/sub/new.txt' }
+
+    system_id = User.system.id
+    assert_equal system_id, Revision.find(sc['revision']).user_id, 'external edit is the system user'
+    created = store.find('/sub/new.txt')
+    assert_equal system_id, created.created_by
+    assert Revision.where(file_node_id: created.id).all? { |r| r.user_id == system_id }
   end
 
   def test_06b_external_edit_merges_with_unflushed_editor_writes
@@ -313,6 +324,9 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     File.binwrite(disk('/blob.bin'), bytes)
     assert em_with_flusher { store.head_blob_digest('/blob.bin') == Digest::SHA256.hexdigest(bytes) }
     assert em_with_flusher { b.ws.of('created').any? { |f| f['payload']['path'] == '/blob.bin' && f['payload']['binary'] } }
+    node = store.find('/blob.bin')
+    assert_equal User.system.id, node.created_by
+    assert Revision.where(file_node_id: node.id).all? { |r| r.user_id == User.system.id }, 'binary ingest is the system user'
   end
 
   # decisions #28 in an event loop: a write landing while the ingest copy is in

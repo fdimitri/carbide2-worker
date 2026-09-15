@@ -26,6 +26,9 @@
 #   * delete — tombstone (Store#delete); history is kept.
 #   * over ProjectFs::MAX_FILE_SIZE — tracked as a metadata-only binary node.
 #
+# Everything the watcher writes (and the reconcile sweep, via FsLoader) is
+# attributed to the system user, User::SYSTEM_UUID.
+#
 # Directory creation, pruning, dot-dirs, watch-exhaustion handling and the
 # debounced reconcile sweep are unchanged from the DBFS v1 watcher.
 #
@@ -90,7 +93,9 @@ class VfsWatcher
     @root_path    = root_path.to_s.chomp('/')
     @suppress_set = suppress_set
     @store        = ProjectFs.store(project_id)
-    @absorber     = DbfsV2::Watcher.new(@store, @root_path, cache: ProjectFs.blob_cache(project_id))
+    @system_user_id = User.system.id
+    @absorber     = DbfsV2::Watcher.new(@store, @root_path, cache: ProjectFs.blob_cache(project_id),
+                                        user_id: @system_user_id)
     @notifier     = nil
     @em_conn      = nil
     @dirty_dirs      = {}
@@ -203,7 +208,7 @@ class VfsWatcher
       srcpath = path_to_srcpath(abs_path)
       return unless @store.find(srcpath)
 
-      @store.delete(srcpath)
+      @store.delete(srcpath, user_id: @system_user_id)
       broadcast('deleted', { path: srcpath, source: 'inotify' })
       puts "[VfsWatcher:#{@project_id}] external delete: #{srcpath}"
       DebugStream.emit(:watcher, level: :info,
@@ -263,7 +268,7 @@ class VfsWatcher
     size = File.size(abs_path)
     if size > ProjectFs::MAX_FILE_SIZE
       existed = !@store.find(srcpath).nil?
-      ProjectFs.track_oversized!(@store, srcpath, abs_path)
+      ProjectFs.track_oversized!(@store, srcpath, abs_path, user_id: @system_user_id)
       broadcast(existed ? 'changed' : 'created',
                 { path: srcpath, type: 'file', size: size, binary: true, source: 'inotify' })
       puts "[VfsWatcher:#{@project_id}] tracked without content (#{size}B > cap): #{srcpath}"
@@ -311,7 +316,7 @@ class VfsWatcher
       rev  = res[:revisions].last
       head = @store.read(srcpath).to_s
       broadcast('set_contents', {
-        path: srcpath, content: head, revision: rev&.id, user_id: nil, source: 'inotify'
+        path: srcpath, content: head, revision: rev&.id, user_id: @system_user_id, source: 'inotify'
       })
       adopt_if_identical(res[:node], abs_path, rev, head)
       puts "[VfsWatcher:#{@project_id}] external change: #{srcpath} (rev #{rev&.id})"
@@ -365,14 +370,14 @@ class VfsWatcher
     # registry is not thread-safe).
     @guard = FileGuard.new(@notifier, abs_path)
     guard  = @guard
-    store, absorber = @store, @absorber
+    store, absorber, system_user_id = @store, @absorber, @system_user_id
 
     work = proc do
       ActiveRecord::Base.connection_pool.with_connection do
         existed = !store.find(srcpath).nil?
         # Create the node here, race-tolerantly (a reconcile sweep may be
         # importing the same path), before the absorber looks for it.
-        ProjectFs.ensure_file!(store, srcpath, binary: true) unless existed
+        ProjectFs.ensure_file!(store, srcpath, binary: true, user_id: system_user_id) unless existed
         res = absorber.ingest_binary(abs_path, srcpath, guard_factory: ->(_) { guard })
         ProjectFs.record_disk_stat!(store.find(srcpath), abs_path)
         [res, existed]
@@ -441,7 +446,7 @@ class VfsWatcher
       ProjectFs.record_disk_stat!(existing, abs_path)
       return existing
     end
-    node = ProjectFs.ensure_folder!(@store, srcpath)
+    node = ProjectFs.ensure_folder!(@store, srcpath, user_id: @system_user_id)
     ProjectFs.record_disk_stat!(node, abs_path)
     broadcast('created', { path: srcpath, type: 'folder', source: 'inotify' })
     puts "[VfsWatcher:#{@project_id}] external mkdir: #{srcpath}"
@@ -513,7 +518,7 @@ class VfsWatcher
           roots.each do |disk_dir|
             next unless Dir.exist?(disk_dir)
             stats = FsLoader.new(project_id: project_id, root_path: root_path,
-                                 user_id: nil, verbose: false).load_dir!(disk_dir)
+                                 verbose: false).load_dir!(disk_dir)
             imported += stats[:dirs].to_i + stats[:files].to_i
           end
         end
