@@ -5,8 +5,8 @@
 #   - a Ruby block that takes (session:, project_id:, args:) and returns a
 #     hash suitable for JSON serialization.
 #
-# Tools intentionally route through existing worker code paths (FsStore,
-# DirectoryEntry, etc.) so they inherit the same authorization the user has
+# Tools intentionally route through existing worker code paths (ProjectFs /
+# the project's DbfsV2::Store, etc.) so they inherit the same authorization the user has
 # over the project. Never add a tool that bypasses the session's project_id
 # scope.
 #
@@ -73,14 +73,14 @@ module AgentTools
   # Write helpers — shared by file_edit_anchored and file_write_lines.
   #
   # Agent edits are lowered to the SAME positional change ops the editors,
-  # calc_current, and both bridges already understand (deleteData*/
+  # DBFS replay, and both bridges already understand (deleteData*/
   # insertData*). The anchor/line window is resolved HERE, worker-side,
   # against the authoritative content, and only concrete positional deltas
   # travel the wire — so no client or bridge needs a new change type, and
   # no consumer re-runs a match against a possibly-stale copy.
   #
   # Coordinates are 0-based (line, char) with CHARACTER (not byte) columns,
-  # matching FsDocument's Ruby-string replay and Monaco's columns for BMP
+  # matching DbfsV2::Buffer's Ruby-string replay and Monaco's columns for BMP
   # text. setContents is intentionally never used for a replace.
   # =====================================================================
 
@@ -118,7 +118,7 @@ module AgentTools
   # The replaced span is narrowed to the minimal changed region by keeping any
   # shared prefix/suffix in place, so a pure insertion emits only an insert
   # (and a pure deletion only a delete) instead of deleting then re-inserting
-  # identical text — one FileChange row, one revision bump, half the fs/change
+  # identical text — one revision, half the fs/change
   # broadcast for the common "add a line" edit.
   def self.push_replace_spec(buf, off, endoff, new_text, specs)
     old_text = buf[off...endoff].to_s
@@ -209,61 +209,61 @@ module AgentTools
     { buffer: buf, specs: specs, applied: applied }
   end
 
-  # Persist accumulated change specs as FileChange rows (one transaction),
-  # broadcast each as an `fs/change` to EVERY client with the file open
-  # (the agent, not any single editor, is the origin), and nudge the VFS
-  # flusher so the on-disk mirror is rewritten. Mirrors FsStore.handle_write.
-  # Returns the stored FileChange rows.
-  def self.commit_changes!(project_id:, entry:, specs:, user_id:)
+  # Persist accumulated change specs as DBFS revisions (one transaction),
+  # broadcast each persisted revision to EVERY client with the file open (the
+  # agent, not any single editor, is the origin), and nudge the VFS flusher so
+  # the on-disk mirror is rewritten. Mirrors FsStore.commit_and_broadcast.
+  #
+  # The specs were computed one after another against the content at
+  # `base_revision_id`, so the batch is anchored there: if the file moved in
+  # between, OT transforms a single edit, and a multi-edit batch that would need
+  # transforming is refused (DbfsV2::ConflictError) rather than misapplied.
+  # Returns the persisted Revisions.
+  def self.commit_changes!(project_id:, node:, specs:, base_revision_id:, user_id:)
     return [] if specs.empty?
 
-    # Hydrate the live buffer BEFORE persisting so a cache miss replays only
-    # pre-write rows; apply! then advances by exactly the rows just written.
-    cached = defined?(Document) ? Document.for(entry) : nil
+    deltas = specs.map { |ch| DbfsV2::Delta.new(ch[:change_type], ch[:change_data]) }
+    revs = ProjectFs.write_batch!(ProjectFs.store(project_id), node.path, deltas,
+                                  base_revision_id: base_revision_id, user_id: user_id)
 
-    stored = ActiveRecord::Base.transaction do
-      specs.map do |ch|
-        FileChange.append!(
-          directory_entry_id: entry.id,
-          user_id:            user_id,
-          change_type:        ch[:change_type],
-          change_data:        ch[:change_data].to_json,
-          start_line:         ch[:start_line].to_i,
-          start_char:         ch[:start_char].to_i,
-          end_line:           ch[:end_line],
-          end_char:           ch[:end_char],
-        )
-      end
-    end
-
-    # Advance the in-memory buffer with the same changes (JSON form, so the
-    # cache replays them through the exact path calc_current uses).
-    specs.each { |ch| cached&.apply!(ch[:change_type], ch[:change_data].to_json) }
-
-    key   = "#{project_id}:#{entry.srcpath}"
-    doc   = defined?(OPEN_DOCUMENTS) ? OPEN_DOCUMENTS[key] : nil
+    doc   = defined?(OPEN_DOCUMENTS) ? OPEN_DOCUMENTS["#{project_id}:#{node.path}"] : nil
     peers = doc ? doc.clients.keys : []
     unless peers.empty?
-      specs.each_with_index do |ch, i|
-        frame = {
-          path:        entry.srcpath,
-          change_type: ch[:change_type],
-          change_data: ch[:change_data].to_json,
-          start_line:  ch[:start_line],
-          start_char:  ch[:start_char],
-          end_line:    ch[:end_line],
-          end_char:    ch[:end_char],
-          revision:    stored[i].revision,
-          user_id:     user_id,
-        }
-        msg = { cs: 'fs', cmd: 'change', payload: frame }.to_json
+      revs.each do |rev|
+        cmd, frame = ProjectFs.revision_frame(node.path, rev, user_id: user_id)
+        msg = { cs: 'fs', cmd: cmd, payload: frame }.to_json
         peers.each { |ws| ws.send(msg) rescue nil }
       end
     end
 
-    bytes = specs.sum { |ch| ch[:change_data].to_json.bytesize }
-    VFS_FLUSHERS[project_id]&.record_write(entry.id, bytes) if defined?(VFS_FLUSHERS)
-    stored
+    bytes = revs.sum { |r| r.change_data.to_s.bytesize }
+    VFS_FLUSHERS[project_id]&.record_write(node.id, bytes) if defined?(VFS_FLUSHERS)
+    revs
+  end
+
+  # Look up a live text file for an agent tool. Returns [node, target, error]:
+  # `target` is the symlink-resolved node, `error` a tool result Hash or nil.
+  def self.text_file(project_id, path, verb: 'edit')
+    node = ProjectFs.store(project_id).find(path)
+    return [nil, nil, { error: "no such path: #{path}" }] if node.nil?
+    return [node, nil, { error: "not a file: #{path} (ftype=#{node.ftype})" }] if node.ftype != 'file'
+    target = node.resolve
+    return [node, nil, { error: "dangling symlink: #{path}" }] if target.nil?
+    return [node, target, { error: "cannot #{verb} binary file: #{path}" }] if target.binary?
+    [node, target, nil]
+  end
+
+  # Stale-base check shared by the write tools. Returns an error Hash or nil.
+  def self.stale_base_error(base_rev, cur_rev)
+    return nil if base_rev.nil? || base_rev.to_s == cur_rev.to_s
+    { error: "stale base_revision: you have #{base_rev}, current is #{cur_rev}. " \
+             'Re-read the file and retry.', revision: cur_rev, stale: true }
+  end
+
+  # A write that lost a race between resolving the edit and committing it.
+  def self.concurrent_write_error(project_id, target, e)
+    { error: "the file changed while this edit was being applied (#{e.message}). Re-read the file and retry.",
+      revision: ProjectFs.head_revision_id(target.reload), stale: true }
   end
 
   # ---------------------------------------------------------------------
@@ -277,7 +277,7 @@ module AgentTools
         description: 'Read the current contents of a single file in the ' \
                      "user's project filesystem. Path is the VFS path " \
                      "(absolute, starting with '/'). The returned `revision` " \
-                     'is the file version stamp — pass it back as ' \
+                     'is the file version stamp (an opaque id) — pass it back as ' \
                      '`base_revision` to file_edit_anchored / file_write_lines ' \
                      'so the edit fails if the file changed since you read it.',
         parameters: {
@@ -291,24 +291,20 @@ module AgentTools
       },
     }
   ) do |session:, project_id:, args:, **_|
-    path  = args['path'].to_s
-    entry = DirectoryEntry.find_by_project_and_path(project_id, path)
-    if entry.nil?
-      { error: "no such path: #{path}" }
-    elsif entry.ftype != 'file'
-      { error: "not a file: #{path} (ftype=#{entry.ftype})" }
-    else
-      content = entry.get_content
-      # Cap returned content so a 5 MB log doesn't blow up the prompt.
-      truncated = content.length > 64_000
-      {
-        path: path,
-        bytes: content.bytesize,
-        truncated: truncated,
-        revision: entry.get_revision,
-        content: truncated ? content.byteslice(0, 64_000) : content,
-      }
-    end
+    path = args['path'].to_s
+    node, target, err = text_file(project_id, path, verb: 'read')
+    next err if err
+
+    content = ProjectFs.store(project_id).read(node.path).to_s
+    # Cap returned content so a 5 MB log doesn't blow up the prompt.
+    truncated = content.length > 64_000
+    {
+      path: node.path,
+      bytes: content.bytesize,
+      truncated: truncated,
+      revision: ProjectFs.head_revision_id(target),
+      content: truncated ? content.byteslice(0, 64_000) : content,
+    }
   end
 
   # ---------------------------------------------------------------------
@@ -333,16 +329,16 @@ module AgentTools
     }
   ) do |session:, project_id:, args:, **_|
     path  = args['path'].to_s
-    entry = DirectoryEntry.find_by_project_and_path(project_id, path)
-    if entry.nil?
+    store = ProjectFs.store(project_id)
+    node  = store.find(path)
+    if node.nil?
       { error: "no such path: #{path}" }
-    elsif entry.ftype != 'folder' && path != '/'
+    elsif node.ftype != 'folder'
       { error: "not a directory: #{path}" }
     else
-      children = DirectoryEntry.where(project_id: project_id, owner_id: entry.id).order(:cur_name)
       {
-        path: path,
-        entries: children.map { |c| { name: c.cur_name, type: c.ftype } },
+        path: node.path,
+        entries: store.list(node.path).map { |c| { name: c.cur_name, type: c.ftype } },
       }
     end
   end
@@ -693,7 +689,7 @@ module AgentTools
                 additionalProperties: false,
               },
             },
-            base_revision: { type: 'integer',
+            base_revision: { type: 'string',
                              description: 'Revision from read_file; edit is ' \
                                           'rejected if the file has changed.' },
           },
@@ -704,30 +700,31 @@ module AgentTools
   ) do |session:, project_id:, args:, **_|
     path  = args['path'].to_s
     edits = args['edits']
-    entry = DirectoryEntry.find_by_project_and_path(project_id, path)
-    next { error: "no such path: #{path}" } if entry.nil?
-    next { error: "not a file: #{path} (ftype=#{entry.ftype})" } if entry.ftype != 'file'
-    next { error: "cannot edit binary file: #{path}" } if entry.binary?
+    node, target, err = text_file(project_id, path)
+    next err if err
     next { error: 'edits must be a non-empty array' } unless edits.is_a?(Array) && !edits.empty?
 
-    base_rev = args['base_revision']
-    cur_rev  = entry.get_revision
-    if base_rev && base_rev.to_i != cur_rev
-      next { error: "stale base_revision: you have #{base_rev}, current is #{cur_rev}. " \
-                    'Re-read the file and retry.', revision: cur_rev, stale: true }
-    end
+    # Resolve against the content AT a known head, and anchor the write there.
+    cur_rev = ProjectFs.head_revision_id(target)
+    stale = stale_base_error(args['base_revision'], cur_rev)
+    next stale if stale
 
-    result = compute_anchored_edits(entry.get_content, edits)
+    content = ProjectFs.content_at(target, cur_rev)
+    result = compute_anchored_edits(content, edits)
     next result if result[:error]
 
-    stored = commit_changes!(project_id: project_id, entry: entry,
-                             specs: result[:specs], user_id: session.user_id)
+    begin
+      stored = commit_changes!(project_id: project_id, node: target, specs: result[:specs],
+                               base_revision_id: cur_rev, user_id: session.user_id)
+    rescue DbfsV2::ConflictError => e
+      next concurrent_write_error(project_id, target, e)
+    end
     {
-      path:          entry.srcpath,
+      path:          node.path,
       applied:       true,
       edits_applied: result[:applied],
       changes:       stored.size,
-      revision:      entry.get_revision,
+      revision:      ProjectFs.head_revision_id(target.reload),
     }
   end
 
@@ -760,7 +757,7 @@ module AgentTools
             line_count: { type: 'integer', description: 'Number of lines to replace (0 = insert).' },
             lines:      { type: 'array', items: { type: 'string' },
                           description: 'Replacement lines (include trailing newlines).' },
-            base_revision: { type: 'integer',
+            base_revision: { type: 'string',
                              description: 'Revision from read_file; write is ' \
                                           'rejected if the file has changed.' },
           },
@@ -769,24 +766,19 @@ module AgentTools
       },
     }
   ) do |session:, project_id:, args:, **_|
-    path  = args['path'].to_s
-    entry = DirectoryEntry.find_by_project_and_path(project_id, path)
-    next { error: "no such path: #{path}" } if entry.nil?
-    next { error: "not a file: #{path} (ftype=#{entry.ftype})" } if entry.ftype != 'file'
-    next { error: "cannot edit binary file: #{path}" } if entry.binary?
+    path = args['path'].to_s
+    node, target, err = text_file(project_id, path)
+    next err if err
 
-    base_rev = args['base_revision']
-    cur_rev  = entry.get_revision
-    if base_rev && base_rev.to_i != cur_rev
-      next { error: "stale base_revision: you have #{base_rev}, current is #{cur_rev}. " \
-                    'Re-read the file and retry.', revision: cur_rev, stale: true }
-    end
+    cur_rev = ProjectFs.head_revision_id(target)
+    stale = stale_base_error(args['base_revision'], cur_rev)
+    next stale if stale
 
     start_line = [args['start_line'].to_i, 0].max
     line_count = [args['line_count'].to_i, 0].max
     lines      = Array(args['lines']).map(&:to_s)
 
-    buffer    = entry.get_content
+    buffer    = ProjectFs.content_at(target, cur_rev)
     cur_lines = buffer.lines
     total     = cur_lines.length
     next { error: "start_line #{start_line} is beyond EOF (#{total} lines)" } if start_line > total
@@ -797,14 +789,18 @@ module AgentTools
 
     specs = []
     push_replace_spec(buffer, head_char, head_char + del_char, new_text, specs)
-    stored = commit_changes!(project_id: project_id, entry: entry,
-                             specs: specs, user_id: session.user_id)
+    begin
+      stored = commit_changes!(project_id: project_id, node: target, specs: specs,
+                               base_revision_id: cur_rev, user_id: session.user_id)
+    rescue DbfsV2::ConflictError => e
+      next concurrent_write_error(project_id, target, e)
+    end
     {
-      path:           entry.srcpath,
+      path:           node.path,
       applied:        true,
       lines_replaced: [line_count, total - start_line].min,
       changes:        stored.size,
-      revision:       entry.get_revision,
+      revision:       ProjectFs.head_revision_id(target.reload),
     }
   end
 
@@ -861,23 +857,23 @@ module AgentTools
     max_results = PCRE_SEARCH_DEFAULT_MAX if max_results <= 0
     max_results = PCRE_SEARCH_HARD_MAX    if max_results > PCRE_SEARCH_HARD_MAX
 
-    scope   = args['path'].to_s
-    entries = DirectoryEntry.where(project_id: project_id, ftype: 'file')
+    scope = args['path'].to_s
+    store = ProjectFs.store(project_id)
+    nodes = FileNode.live.where(project_id: project_id, ftype: 'file', binary: false, symlink_target: nil)
     if !scope.empty? && scope != '/'
-      base    = scope.chomp('/')
-      entries = entries.where('srcpath = ? OR srcpath LIKE ?', scope, "#{base}/%")
+      base  = scope.chomp('/')
+      nodes = nodes.where('path = ? OR starts_with(path, ?)', base, "#{base}/")
     end
 
     matches       = []
     files_scanned = 0
     truncated     = false
-    entries.order(:srcpath).each do |e|
+    nodes.order(:path).pluck(:path).each do |npath|
       break if matches.size >= max_results
-      next if e.binary?
       files_scanned += 1
-      e.get_content.each_line.with_index do |line, ln|
+      store.read(npath).to_s.each_line.with_index do |line, ln|
         next unless line.match?(rx)
-        matches << { path: e.srcpath, line: ln, text: line.chomp[0, 500] }
+        matches << { path: npath, line: ln, text: line.chomp[0, 500] }
         if matches.size >= max_results
           truncated = true
           break
@@ -918,10 +914,10 @@ module AgentTools
   # Tell every session in the project about a newly created entry so the file
   # explorer picks it up without a manual refresh. Mirrors the fs/created
   # broadcast FsStore.handle_create_file sends for interactive creates.
-  def self.broadcast_created!(project_id:, entry:)
+  def self.broadcast_created!(project_id:, node:)
     return unless defined?(SESSIONS_BY_PROJECT)
     msg = { cs: 'fs', cmd: 'created',
-            payload: { path: entry.srcpath, type: entry.ftype, id: entry.id } }.to_json
+            payload: { path: node.path, type: node.ftype, id: node.id } }.to_json
     (SESSIONS_BY_PROJECT[project_id] || []).each { |s| s.ws&.send(msg) rescue nil }
   end
 
@@ -931,22 +927,28 @@ module AgentTools
   # every other agent edit. Returns a result Hash.
   def self.write_whole_file!(project_id:, srcpath:, content:, user_id:)
     content = content.to_s
-    entry   = DirectoryEntry.find_by_project_and_path(project_id, srcpath)
-    if entry.nil?
-      entry = DirectoryEntry.create_file!(project_id: project_id, srcpath: srcpath,
-                                          user_id: user_id, data: content, mkdirp: true)
-      broadcast_created!(project_id: project_id, entry: entry)
-      VFS_FLUSHERS[project_id]&.record_write(entry.id, content.bytesize) if defined?(VFS_FLUSHERS)
-      return { path: entry.srcpath, created: true, revision: entry.get_revision }
+    store   = ProjectFs.store(project_id)
+    node    = store.find(srcpath)
+    if node.nil?
+      node = ProjectFs.ensure_file!(store, srcpath, content: content, user_id: user_id)
+      broadcast_created!(project_id: project_id, node: node)
+      VFS_FLUSHERS[project_id]&.record_write(node.id, content.bytesize) if defined?(VFS_FLUSHERS)
+      return { path: node.path, created: true, revision: ProjectFs.head_revision_id(node) }
     end
-    return { error: "not a file: #{srcpath} (ftype=#{entry.ftype})" } if entry.ftype != 'file'
-    return { error: "cannot write binary file: #{srcpath}" } if entry.binary?
+    _node, target, err = text_file(project_id, srcpath, verb: 'write')
+    return err if err
 
+    cur_rev = ProjectFs.head_revision_id(target)
+    current = ProjectFs.content_at(target, cur_rev)
     specs = []
-    push_replace_spec(entry.get_content, 0, entry.get_content.length, content, specs)
-    stored = commit_changes!(project_id: project_id, entry: entry,
-                             specs: specs, user_id: user_id)
-    { path: entry.srcpath, created: false, changes: stored.size, revision: entry.get_revision }
+    push_replace_spec(current, 0, current.length, content, specs)
+    begin
+      stored = commit_changes!(project_id: project_id, node: target, specs: specs,
+                               base_revision_id: cur_rev, user_id: user_id)
+    rescue DbfsV2::ConflictError => e
+      return concurrent_write_error(project_id, target, e)
+    end
+    { path: node.path, created: false, changes: stored.size, revision: ProjectFs.head_revision_id(target.reload) }
   end
 
   # ---------------------------------------------------------------------
@@ -968,12 +970,14 @@ module AgentTools
       },
     }
   ) do |session:, project_id:, args:, **_|
-    entry = DirectoryEntry.find_by_project_and_path(project_id, AGENTS_MD_PATH)
-    if entry.nil? || entry.ftype != 'file'
+    node, target, err = text_file(project_id, AGENTS_MD_PATH, verb: 'read')
+    if node.nil? || node.ftype != 'file'
       { path: AGENTS_MD_PATH, exists: false, content: '' }
+    elsif err
+      err
     else
-      { path: entry.srcpath, exists: true,
-        revision: entry.get_revision, content: entry.get_content }
+      { path: node.path, exists: true, revision: ProjectFs.head_revision_id(target),
+        content: ProjectFs.store(project_id).read(node.path).to_s }
     end
   end
 
@@ -1025,13 +1029,13 @@ module AgentTools
       },
     }
   ) do |session:, project_id:, args:, **_|
-    entries = DirectoryEntry.where(project_id: project_id, ftype: 'file')
-                            .where('srcpath LIKE ?', "#{MEMORY_DIR}/%")
-                            .order(:srcpath)
-    memories = entries.filter_map do |e|
-      next unless File.dirname(e.srcpath) == MEMORY_DIR   # direct children only
-      name    = File.basename(e.srcpath, '.md')
-      preview = e.binary? ? '' : e.get_content.lines.find { |l| !l.strip.empty? }.to_s.strip[0, 120]
+    store = ProjectFs.store(project_id)
+    dir   = store.find(MEMORY_DIR)
+    files = dir && dir.ftype == 'folder' ? store.list(MEMORY_DIR).select { |c| c.ftype == 'file' } : []
+    memories = files.map do |c|
+      name    = File.basename(c.path, '.md')
+      target  = c.resolve
+      preview = target.nil? || target.binary? ? '' : store.read(c.path).to_s.lines.find { |l| !l.strip.empty? }.to_s.strip[0, 120]
       { name: name, preview: preview }
     end
     { dir: MEMORY_DIR, count: memories.size, memories: memories }
@@ -1061,12 +1065,15 @@ module AgentTools
   ) do |session:, project_id:, args:, **_|
     srcpath = memory_path(args['name'])
     next { error: "invalid memory name: #{args['name'].inspect}" } if srcpath.nil?
-    entry = DirectoryEntry.find_by_project_and_path(project_id, srcpath)
-    if entry.nil? || entry.ftype != 'file'
+    node, target, err = text_file(project_id, srcpath, verb: 'read')
+    if node.nil? || node.ftype != 'file'
       { name: File.basename(srcpath, '.md'), exists: false, content: '' }
+    elsif err
+      err
     else
-      { name: File.basename(srcpath, '.md'), exists: true, path: entry.srcpath,
-        revision: entry.get_revision, content: entry.get_content }
+      { name: File.basename(srcpath, '.md'), exists: true, path: node.path,
+        revision: ProjectFs.head_revision_id(target),
+        content: ProjectFs.store(project_id).read(node.path).to_s }
     end
   end
 

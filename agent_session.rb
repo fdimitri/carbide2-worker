@@ -396,9 +396,11 @@ class AgentSession
   # Current project AGENTS.md text, or nil when absent/empty. Truncated to
   # AGENTS_MD_MAX_CHARS. Never raises into the inference path.
   def agents_md_content
-    entry = DirectoryEntry.find_by_project_and_path(@project_id, AgentTools::AGENTS_MD_PATH)
-    return nil unless entry && entry.ftype == 'file' && !entry.binary?
-    txt = entry.get_content.to_s
+    store  = ProjectFs.store(@project_id)
+    node   = store.find(AgentTools::AGENTS_MD_PATH)
+    target = node&.resolve
+    return nil unless target && target.ftype == 'file' && !target.binary?
+    txt = store.read(node.path).to_s
     return nil if txt.strip.empty?
     if txt.length > AGENTS_MD_MAX_CHARS
       txt = txt[0, AGENTS_MD_MAX_CHARS] + "\n\n[AGENTS.md truncated at #{AGENTS_MD_MAX_CHARS} chars]"
