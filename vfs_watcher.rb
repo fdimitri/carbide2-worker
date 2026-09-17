@@ -1,10 +1,36 @@
-# VfsWatcher — inotify watcher that syncs external disk changes into the VFS DB.
+# VfsWatcher — inotify watcher that folds external disk changes into DBFS v2.
 # Copyright (C) 2025 Carbide2 contributors. GPLv3.
 #
-# Watches root_path recursively for close_write / moved_to events. When a
-# tracked file changes outside of Carbide (e.g. edited in a terminal), reads
-# the new content, appends a setContents FileChange, and broadcasts to all
-# connected sessions so editors update in real time.
+# Watches root_path recursively. When something outside Carbide (a terminal, a
+# build, git) changes the working tree, the change is absorbed into DBFS and
+# broadcast to connected sessions so editors and the explorer update live.
+#
+# This is the EventMachine adapter. The absorb rules themselves are
+# DbfsV2::Watcher's (lib/dbfs_v2/watcher.rb), shared rather than re-implemented:
+#
+#   * text   — DbfsV2::Watcher#ingest_text: a setContents revision (loose sync),
+#              broadcast as fs/set_contents. The flusher's own writes are
+#              recognised by digest and ignored; a genuine external edit is
+#              anchored to the revision last flushed to that path, so OT merges
+#              it with editor writes that landed since (or raises a conflict)
+#              rather than reverting them.
+#   * binary — DbfsV2::Watcher#ingest_binary -> DbfsV2::Ingest, broadcast as
+#              fs/changed (or fs/created). Runs OFF the reactor, one file at a
+#              time, with a real read guard: while a file's bytes are being
+#              copied, a per-file inotify watch (IN_MODIFY / IN_CLOSE_WRITE /
+#              move / delete) is held, and any event on it discards the read so
+#              the newer state is ingested instead (decisions #28). The
+#              prototype's own guard is fed by its synchronous pump and never
+#              sees IN_MODIFY, so it cannot fire in an event loop; this is the
+#              adapter that makes #28 true here.
+#   * delete — tombstone (Store#delete); history is kept.
+#   * over ProjectFs::MAX_FILE_SIZE — tracked as a metadata-only binary node.
+#
+# Everything the watcher writes (and the reconcile sweep, via FsLoader) is
+# attributed to the system user, User::SYSTEM_UUID.
+#
+# Directory creation, pruning, dot-dirs, watch-exhaustion handling and the
+# debounced reconcile sweep are unchanged from the DBFS v1 watcher.
 #
 # Integrates with EventMachine via EM.watch on the inotify file descriptor
 # (non-blocking; process is only called when events are ready).
@@ -17,6 +43,7 @@
 #   # On shutdown:
 #   watcher.stop!
 require 'rb-inotify'
+require 'digest'
 
 class VfsWatcher
   # Debounced reconcile: coalesce a burst of inotify events (e.g. a shell
@@ -26,16 +53,59 @@ class VfsWatcher
   RECONCILE_DEBOUNCE  = 1.5   # seconds of quiescence before sweeping
   RECONCILE_MAX_DELAY = 10.0  # never defer a pending sweep longer than this
 
+  # Read guard for one binary ingest (see header). Events arrive on the reactor
+  # thread; the copy runs on an EM.defer thread, hence the mutex.
+  class FileGuard
+    WATCH_FLAGS = %i[modify close_write move_self delete_self].freeze
+
+    def initialize(notifier, abs)
+      @mutex   = Mutex.new
+      @changed = false
+      @watch   = notifier.watch(abs, *WATCH_FLAGS) { mark! }
+    rescue SystemCallError
+      # The file vanished before we could watch it; the copy will fail on its
+      # own and the delete event is already queued.
+      @watch = nil
+    end
+
+    def mark!
+      @mutex.synchronize { @changed = true }
+    end
+
+    # DbfsV2::Ingest guard protocol.
+    def on_read_start
+      @mutex.synchronize { @changed = false }
+    end
+
+    def changed?
+      @mutex.synchronize { @changed }
+    end
+
+    def close
+      @watch&.close
+    rescue SystemCallError
+      nil # already removed by the kernel (file deleted)
+    end
+  end
+
   def initialize(project_id:, root_path:, suppress_set: nil)
     @project_id   = project_id
     @root_path    = root_path.to_s.chomp('/')
     @suppress_set = suppress_set
+    @store        = ProjectFs.store(project_id)
+    @system_user_id = User.system.id
+    @absorber     = DbfsV2::Watcher.new(@store, @root_path, cache: ProjectFs.blob_cache(project_id),
+                                        user_id: @system_user_id)
     @notifier     = nil
     @em_conn      = nil
     @dirty_dirs      = {}
     @reconcile_timer = nil
     @dirty_since     = nil
     @reconciling     = false
+    @ingest_queue = []   # abs paths awaiting binary ingest, FIFO, deduped
+    @ingesting    = nil  # abs path whose binary ingest is running off-reactor
+    @rerun        = {}   # abs => true when an event arrived for @ingesting mid-read
+    @guard        = nil
   end
 
   # Returns true on success, false when the watcher could not be started. On
@@ -72,6 +142,7 @@ class VfsWatcher
   def stop!
     EM.cancel_timer(@reconcile_timer) if @reconcile_timer
     @reconcile_timer = nil
+    @guard&.close
     @em_conn&.detach rescue nil
     @notifier&.close rescue nil
     puts "[VfsWatcher:#{@project_id}] stopped"
@@ -82,9 +153,7 @@ class VfsWatcher
   def add_watches_recursive(dir)
     add_watch(dir)
     # Dotmatch-aware: hidden directories (.carbide, .gnupg, ...) are
-    # first-class workspace paths and must get watches too. Dir.glob without
-    # FNM_DOTMATCH silently skipped them, so writes inside dot-dirs never
-    # produced a close_write and never reached the DBFS (#77).
+    # first-class workspace paths and must get watches too (#77).
     #
     # Mirror FsLoader's prune set so the two can't drift: .git / node_modules /
     # .bundle are excluded by the loader and therefore must not be watched (and
@@ -93,8 +162,7 @@ class VfsWatcher
     #
     # Guarded on both the enumeration and the per-child stat (#101): a directory
     # that vanishes or becomes unreadable mid-walk must skip that subtree, not
-    # kill the entire recursive walk (Dir.glob silently skipped these;
-    # Dir.children raises).
+    # kill the entire recursive walk.
     begin
       entries = Dir.children(dir)
     rescue Errno::ENOENT, Errno::EACCES, Errno::ENAMETOOLONG
@@ -133,19 +201,15 @@ class VfsWatcher
 
     abs_path = event.absolute_name
 
-    # Deletions / moves-out — drop the DBFS entry (and any subtree) and notify.
-    # Note: inotify on the parent dir is what carries :delete for children,
-    # so we don't strictly need to scope these to abs_path inside @root_path.
+    # Deletions / moves-out — tombstone the node (and subtree) and notify.
     if event.flags.include?(:delete) || event.flags.include?(:moved_from)
       return unless abs_path.start_with?(@root_path + '/')
+      return if @suppress_set&.include?(abs_path)
       srcpath = path_to_srcpath(abs_path)
-      entry = DirectoryEntry.find_by(project_id: @project_id, srcpath: srcpath)
-      return unless entry
-      # destroy! cascades children via has_many :dependent => :destroy
-      entry.destroy!
-      Document.forget(srcpath) if defined?(Document)
-      sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-      @broadcast_fn.call(sessions, 'fs', 'deleted', { path: srcpath, source: 'inotify' })
+      return unless @store.find(srcpath)
+
+      @store.delete(srcpath, user_id: @system_user_id)
+      broadcast('deleted', { path: srcpath, source: 'inotify' })
       puts "[VfsWatcher:#{@project_id}] external delete: #{srcpath}"
       DebugStream.emit(:watcher, level: :info,
         message: "deleted #{srcpath}", project_id: @project_id,
@@ -153,8 +217,8 @@ class VfsWatcher
       return
     end
 
-    # Directory appeared: add watches AND make a DBFS entry so it shows up
-    # in the explorer. Fixes #2 (May30-Questions.md) for new directories.
+    # Directory appeared: add watches AND make a DBFS node so it shows up in
+    # the explorer.
     if event.flags.include?(:isdir)
       if (event.flags.include?(:create) || event.flags.include?(:moved_to)) && File.directory?(abs_path)
         in_root = abs_path.start_with?(@root_path + '/')
@@ -167,9 +231,8 @@ class VfsWatcher
         unless FsLoader::PRUNE_DIR_NAMES.include?(File.basename(abs_path))
           add_watches_recursive(abs_path)
         end
-        # Create the DBFS entry AFTER the walk: ensure_dir_entry is self-rescuing,
-        # and its DB write + broadcast must not delay watch registration (which
-        # would widen the #72 window the sweep exists to protect) (#101).
+        # Create the DBFS node AFTER the walk: its DB write + broadcast must not
+        # delay watch registration (#101).
         ensure_dir_entry(abs_path) if in_root
       end
       return
@@ -178,91 +241,194 @@ class VfsWatcher
     # Only act on file-write events
     return unless event.flags.include?(:close_write) || event.flags.include?(:moved_to)
 
-    # Skip paths written by VfsFlusher to prevent feedback loops
+    # Skip paths FsStore is moving/creating itself (its rename lands here as
+    # moved_to). Flusher writes are recognised by digest in absorb_text.
     return if @suppress_set&.include?(abs_path)
-    return if File.directory?(abs_path)
     return unless abs_path.start_with?(@root_path + '/')
 
-    srcpath = path_to_srcpath(abs_path)
-
-    entry = DirectoryEntry.find_by(project_id: @project_id, srcpath: srcpath)
-    if entry.nil?
-      # File created outside Carbide (e.g. `touch foo.txt` in the terminal).
-      # Import it into the DBFS so the explorer picks it up without a manual
-      # rescan. Fixes #2 in May30-Questions.md.
-      import_new_file(abs_path, srcpath)
-      return
-    end
-    return unless File.file?(abs_path)
-
-    # Binary entries: content lives on disk only. Just refresh stat metadata
-    # (size/mtime/mode) so the explorer Properties panel stays accurate, and
-    # broadcast an fs/changed event so open viewers can re-fetch the blob.
-    if entry.binary?
-      entry.refresh_disk_stat!(abs_path)
-      sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-      @broadcast_fn.call(sessions, 'fs', 'changed', {
-        path:   srcpath,
-        size:   File.size(abs_path),
-        binary: true,
-        source: 'inotify'
-      })
-      puts "[VfsWatcher:#{@project_id}] external change (binary): #{srcpath}"
-      return
-    end
-
-    # First 8KB null-byte check — a previously-text file may have been replaced
-    # with binary content. Promote the entry to binary so we don't dump bytes
-    # through the text replay pipeline.
-    raw_head = File.binread(abs_path, [File.size(abs_path), 8192].min)
-    if raw_head.include?("\x00")
-      entry.update_columns(binary: true, updated_at: Time.current)
-      entry.refresh_disk_stat!(abs_path)
-      sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-      @broadcast_fn.call(sessions, 'fs', 'changed', {
-        path:   srcpath,
-        size:   File.size(abs_path),
-        binary: true,
-        source: 'inotify'
-      })
-      puts "[VfsWatcher:#{@project_id}] external change (now binary): #{srcpath}"
-      return
-    end
-
-    content = File.read(abs_path, encoding: 'UTF-8', invalid: :replace, undef: :replace, replace: '')
-    current = entry.get_content
-    if content == current
-      entry.refresh_disk_stat!(abs_path)
-      return  # no net text change — stat refresh is still useful for mtime
-    end
-
-    fc = ActiveRecord::Base.transaction do
-      FileChange.append!(
-        directory_entry_id: entry.id,
-        user_id:            nil,
-        change_type:        'setContents',
-        change_data:        content,
-        start_line:         0,
-        start_char:         0
-      )
-    end
-    Document.for(entry)&.apply!('setContents', content) if defined?(Document)
-    entry.refresh_disk_stat!(abs_path)
-
-    sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-    @broadcast_fn.call(sessions, 'fs', 'set_contents', {
-      path:     srcpath,
-      content:  content,
-      revision: fc.revision,
-      user_id:  nil,
-      source:   'inotify'
-    })
-    puts "[VfsWatcher:#{@project_id}] external change: #{srcpath} (rev #{fc.revision})"
-    DebugStream.emit(:watcher, level: :info,
-      message: "changed #{srcpath} (rev #{fc.revision})", project_id: @project_id,
-      meta: { path: srcpath, rev: fc.revision, source: 'inotify' }) if defined?(DebugStream)
+    absorb_path(abs_path)
   rescue => e
     puts "[VfsWatcher:#{@project_id}] handle_event error: #{e.class}: #{e.message}"
+  end
+
+  # Decide how a changed file on disk enters DBFS. Re-entered after a binary
+  # ingest when more events arrived for the same path while it ran.
+  def absorb_path(abs_path)
+    return unless File.file?(abs_path)
+    srcpath = path_to_srcpath(abs_path)
+
+    # One writer per path: an event for a file that is being (or waiting to be)
+    # ingested is folded into a rerun instead of racing it.
+    if @ingesting == abs_path
+      @rerun[abs_path] = true
+      return
+    end
+    return if @ingest_queue.include?(abs_path)
+
+    size = File.size(abs_path)
+    if size > ProjectFs::MAX_FILE_SIZE
+      existed = !@store.find(srcpath).nil?
+      ProjectFs.track_oversized!(@store, srcpath, abs_path, user_id: @system_user_id)
+      broadcast(existed ? 'changed' : 'created',
+                { path: srcpath, type: 'file', size: size, binary: true, source: 'inotify' })
+      puts "[VfsWatcher:#{@project_id}] tracked without content (#{size}B > cap): #{srcpath}"
+      return
+    end
+
+    if ProjectFs.binary_file?(abs_path)
+      enqueue_binary(abs_path)
+    else
+      absorb_text(abs_path, srcpath)
+    end
+  rescue Errno::ENOENT
+    nil # gone between the event and the stat; its delete event follows
+  end
+
+  # --- text ----------------------------------------------------------------
+
+  def absorb_text(abs_path, srcpath, retried: false)
+    # Our own flush coming back: the bytes on disk are exactly what the flusher
+    # last wrote here. Ignore it — even if DBFS has moved on since, because
+    # folding it in would diff those newer writes away.
+    flushed = VFS_FLUSHERS[@project_id]&.flushed_state(abs_path) if defined?(VFS_FLUSHERS)
+    return if flushed && Digest::SHA256.file(abs_path).hexdigest == flushed.digest
+
+    # A genuine external edit, anchored to the revision the file was last
+    # flushed from (when that revision still belongs to this node).
+    node = @store.find(srcpath)
+    base = flushed&.head
+    base = nil unless base && node && Revision.exists?(id: base, file_node_id: (node.resolve || node).id)
+
+    res = @absorber.ingest_text(abs_path, srcpath, base_revision_id: base)
+    ProjectFs.record_disk_stat!(res[:node], abs_path)
+
+    case res[:status]
+    when :created
+      node = res[:node]
+      adopt_if_identical(node, abs_path, ProjectFs.head_revision_id(node), @store.read(srcpath).to_s)
+      size = File.size(abs_path) rescue 0
+      broadcast('created', { path: srcpath, type: 'file', binary: false, size: size, source: 'inotify' })
+      puts "[VfsWatcher:#{@project_id}] external create (text): #{srcpath} (#{size}B)"
+      DebugStream.emit(:watcher, level: :info,
+        message: "new text file #{srcpath} (#{size}B)", project_id: @project_id,
+        meta: { path: srcpath, type: 'file', binary: false, size: size, source: 'inotify' }) if defined?(DebugStream)
+    when :changed
+      rev  = res[:revisions].last
+      head = @store.read(srcpath).to_s
+      broadcast('set_contents', {
+        path: srcpath, content: head, revision: rev&.id, parent: res[:revisions].first&.parent_id,
+        user_id: @system_user_id, source: 'inotify'
+      })
+      adopt_if_identical(res[:node], abs_path, rev, head)
+      puts "[VfsWatcher:#{@project_id}] external change: #{srcpath} (rev #{rev&.id})"
+      DebugStream.emit(:watcher, level: :info,
+        message: "changed #{srcpath} (rev #{rev&.id})", project_id: @project_id,
+        meta: { path: srcpath, rev: rev&.id, source: 'inotify' }) if defined?(DebugStream)
+    end
+  rescue ActiveRecord::RecordNotUnique
+    # A reconcile sweep created the node between our find and create; the
+    # second pass sees it and takes the change path.
+    retry_once = !retried
+    absorb_text(abs_path, srcpath, retried: true) if retry_once
+  rescue DbfsV2::ConflictError => e
+    puts "[VfsWatcher:#{@project_id}] external change to #{srcpath} conflicts with a concurrent edit: #{e.message}"
+    DebugStream.emit(:watcher, level: :warn,
+      message: "external change conflicted: #{srcpath}", project_id: @project_id,
+      meta: { path: srcpath, error: e.message, source: 'inotify' }) if defined?(DebugStream)
+  end
+
+  # When the merged head is byte-identical to the disk file, tell the flusher
+  # the disk is already current. (After an OT merge with concurrent editor
+  # writes it isn't, and the next sweep writes the merge out.)
+  def adopt_if_identical(node, abs_path, rev_or_id, head_content)
+    flusher = defined?(VFS_FLUSHERS) && VFS_FLUSHERS[@project_id]
+    return unless flusher && node && rev_or_id
+
+    disk = File.binread(abs_path)
+    return unless disk == head_content.b
+
+    head_id = rev_or_id.respond_to?(:id) ? rev_or_id.id : rev_or_id
+    flusher.adopt_disk_state(node.id, abs_path, head_id, Digest::SHA256.hexdigest(disk))
+  rescue Errno::ENOENT
+    nil
+  end
+
+  # --- binary --------------------------------------------------------------
+
+  def enqueue_binary(abs_path)
+    @ingest_queue << abs_path
+    pump_ingest
+  end
+
+  def pump_ingest
+    return if @ingesting || @ingest_queue.empty?
+
+    abs_path   = @ingest_queue.shift
+    srcpath    = path_to_srcpath(abs_path)
+    @ingesting = abs_path
+    @rerun.delete(abs_path)
+    # Watch the file BEFORE the copy starts (reactor thread; rb-inotify's
+    # registry is not thread-safe).
+    @guard = FileGuard.new(@notifier, abs_path)
+    guard  = @guard
+    store, absorber, system_user_id = @store, @absorber, @system_user_id
+
+    work = proc do
+      ActiveRecord::Base.connection_pool.with_connection do
+        existed = !store.find(srcpath).nil?
+        # Create the node here, race-tolerantly (a reconcile sweep may be
+        # importing the same path), before the absorber looks for it.
+        ProjectFs.ensure_file!(store, srcpath, binary: true, user_id: system_user_id) unless existed
+        res = absorber.ingest_binary(abs_path, srcpath, guard_factory: ->(_) { guard })
+        ProjectFs.record_disk_stat!(store.find(srcpath), abs_path)
+        [res, existed]
+      end
+    rescue => e
+      [{ status: :error, error: "#{e.class}: #{e.message}" }, true]
+    end
+
+    done = proc do |(res, existed)|
+      guard.close
+      @guard = nil
+      @ingesting = nil
+      report_binary(srcpath, res, existed)
+      absorb_path(abs_path) if @rerun.delete(abs_path)
+      pump_ingest
+    end
+
+    EM.defer(work, done)
+  end
+
+  def report_binary(srcpath, res, existed)
+    case res && res[:status]
+    when :committed
+      rev = res[:revision]
+      broadcast(existed ? 'changed' : 'created', {
+        path: srcpath, type: 'file', binary: true, size: res[:size], revision: rev&.id, source: 'inotify'
+      })
+      puts "[VfsWatcher:#{@project_id}] external #{existed ? 'change' : 'create'} (binary): #{srcpath} (#{res[:size]}B)"
+      DebugStream.emit(:watcher, level: :info,
+        message: "#{existed ? 'changed' : 'new'} binary file #{srcpath} (#{res[:size]}B)",
+        project_id: @project_id,
+        meta: { path: srcpath, binary: true, size: res[:size], rev: rev&.id, source: 'inotify' }) if defined?(DebugStream)
+    when :noop
+      broadcast('created', { path: srcpath, type: 'file', binary: true, source: 'inotify' }) unless existed
+    when :discarded
+      # Still being written after every attempt; its next close_write reruns it.
+      puts "[VfsWatcher:#{@project_id}] binary ingest discarded (file kept changing): #{srcpath}"
+    when :error
+      puts "[VfsWatcher:#{@project_id}] binary ingest error for #{srcpath}: #{res[:error]}"
+      DebugStream.emit(:watcher, level: :error,
+        message: "binary ingest failed: #{srcpath}", project_id: @project_id,
+        meta: { path: srcpath, error: res[:error], source: 'inotify' }) if defined?(DebugStream)
+    end
+  end
+
+  # --- helpers -------------------------------------------------------------
+
+  def broadcast(cmd, payload)
+    sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
+    @broadcast_fn.call(sessions, 'fs', cmd, payload)
   end
 
   # Convert an absolute path under @root_path to a leading-slash srcpath.
@@ -271,75 +437,27 @@ class VfsWatcher
     sp.start_with?('/') ? sp : "/#{sp}"
   end
 
-  # Idempotently create a DBFS folder entry for an externally-created
-  # directory and broadcast fs/created. mkdir_p ensures intermediate dirs
-  # also exist in the DBFS — covers `mkdir -p a/b/c` in one inotify event.
+  # Idempotently create a DBFS folder node for an externally-created directory
+  # and broadcast fs/created. mkdir -p semantics cover `mkdir -p a/b/c` in one
+  # inotify event.
   def ensure_dir_entry(abs_path)
-    srcpath = path_to_srcpath(abs_path)
-    existing = DirectoryEntry.find_by(project_id: @project_id, srcpath: srcpath)
+    srcpath  = path_to_srcpath(abs_path)
+    existing = @store.find(srcpath)
     if existing
-      existing.refresh_disk_stat!(abs_path)
+      ProjectFs.record_disk_stat!(existing, abs_path)
       return existing
     end
-    DirectoryEntry.mkdir_p!(project_id: @project_id, srcpath: srcpath, user_id: nil)
-    entry = DirectoryEntry.find_by(project_id: @project_id, srcpath: srcpath)
-    entry&.refresh_disk_stat!(abs_path)
-    sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-    @broadcast_fn.call(sessions, 'fs', 'created', {
-      path:   srcpath,
-      type:   'folder',
-      source: 'inotify'
-    })
+    node = ProjectFs.ensure_folder!(@store, srcpath, user_id: @system_user_id)
+    ProjectFs.record_disk_stat!(node, abs_path)
+    broadcast('created', { path: srcpath, type: 'folder', source: 'inotify' })
     puts "[VfsWatcher:#{@project_id}] external mkdir: #{srcpath}"
     DebugStream.emit(:watcher, level: :info,
       message: "mkdir #{srcpath}", project_id: @project_id,
       meta: { path: srcpath, type: 'folder', source: 'inotify' }) if defined?(DebugStream)
-    entry
+    node
   rescue => e
     puts "[VfsWatcher:#{@project_id}] ensure_dir_entry error: #{e.class}: #{e.message}"
     nil
-  end
-
-  # Import a brand-new on-disk file into the DBFS. Picks the text/binary path
-  # by sniffing for null bytes (same heuristic as FsLoader/ArchiveImporter).
-  # Broadcasts fs/created so the explorer refreshes without a manual rescan.
-  def import_new_file(abs_path, srcpath)
-    return unless File.file?(abs_path)
-    size = File.size(abs_path)
-    head = size.zero? ? ''.b : File.binread(abs_path, [size, 8192].min)
-    binary = head.include?("\x00")
-
-    if binary
-      entry = DirectoryEntry.create_file!(
-        project_id: @project_id, srcpath: srcpath,
-        user_id: nil, mkdirp: true, binary: true
-      )
-      entry.update_columns(last_size: size, updated_at: Time.current) if entry.last_size != size
-      entry.refresh_disk_stat!(abs_path)
-    else
-      data = File.read(abs_path, encoding: 'UTF-8', invalid: :replace, undef: :replace, replace: '')
-      entry = DirectoryEntry.create_file!(
-        project_id: @project_id, srcpath: srcpath,
-        user_id: nil, data: data, mkdirp: true
-      )
-      entry.refresh_disk_stat!(abs_path)
-    end
-
-    sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-    @broadcast_fn.call(sessions, 'fs', 'created', {
-      path:   srcpath,
-      type:   'file',
-      binary: binary,
-      size:   size,
-      source: 'inotify'
-    })
-    puts "[VfsWatcher:#{@project_id}] external create (#{binary ? 'binary' : 'text'}): #{srcpath} (#{size}B)"
-    DebugStream.emit(:watcher, level: :info,
-      message: "new #{binary ? 'binary' : 'text'} file #{srcpath} (#{size}B)",
-      project_id: @project_id,
-      meta: { path: srcpath, type: 'file', binary: binary, size: size, source: 'inotify' }) if defined?(DebugStream)
-  rescue => e
-    puts "[VfsWatcher:#{@project_id}] import_new_file error for #{srcpath}: #{e.class}: #{e.message}"
   end
 
   # --- Debounced reconcile (fdimitri/carbide2#72) --------------------------
@@ -401,7 +519,7 @@ class VfsWatcher
           roots.each do |disk_dir|
             next unless Dir.exist?(disk_dir)
             stats = FsLoader.new(project_id: project_id, root_path: root_path,
-                                 user_id: nil, verbose: false).load_dir!(disk_dir)
+                                 verbose: false).load_dir!(disk_dir)
             imported += stats[:dirs].to_i + stats[:files].to_i
           end
         end
@@ -414,11 +532,8 @@ class VfsWatcher
     done = proc do |imported|
       @reconciling = false
       if imported.to_i.positive?
-        sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
         # Client refetches the whole tree on any fs/created (ExplorerPane).
-        @broadcast_fn.call(sessions, 'fs', 'created', {
-          path: '/', type: 'folder', source: 'inotify-reconcile'
-        })
+        broadcast('created', { path: '/', type: 'folder', source: 'inotify-reconcile' })
         puts "[VfsWatcher:#{@project_id}] reconcile imported #{imported} entries"
         DebugStream.emit(:watcher, level: :info,
           message: "reconciled #{imported} entries", project_id: @project_id,

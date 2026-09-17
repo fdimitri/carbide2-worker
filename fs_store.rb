@@ -1,26 +1,60 @@
-# FsStore — database-backed filesystem handler for the EventMachine worker.
+# FsStore — the 'fs' commandSet over WebSocket, on DBFS v2.
 #
-# Handles the 'fs' commandSet over WebSocket.  All reads go through
-# DirectoryEntry#calc_current (full replay).  Writes append FileChange rows
-# and broadcast the operation to other connected clients in the same project.
+# Reads come from the project's DbfsV2::Store (served from the in-memory
+# DocumentCache when warm). Writes append revisions to the file's DAG — OT
+# transforms an edit whose base is behind the head — and the revisions AS
+# PERSISTED are broadcast to co-viewers. Deletes are tombstones: the node is
+# hidden, its history is kept, and recreating the path resurrects it.
 #
 # Supported commands (cs: 'fs'):
-#   tree         — return full file tree for the session's project
-#   read         — return current content for a single file (text only)
-#   read_binary  — return base64 chunk of a binary file's on-disk bytes
-#   stat         — return stat-style metadata for a single entry (#5)
-#   write        — append one or more change operations to a file
-#   set_contents — replace file content entirely (setContents)
-#   create_file  — create a new file entry
+#   tree         — full file tree for the session's project
+#   read         — current text content (+ head `revision`) for a file
+#   read_binary  — base64 chunk of a file's live bytes on disk
+#   stat         — stat-style metadata for a single node
+#   open/close   — register/unregister as a viewer of a file
+#   cursor       — broadcast this session's cursor to co-viewers
+#   write        — apply one or more change operations to a file
+#   set_contents — replace file content (diffed against the base, mergeable)
+#   create_file  — create a file
 #   create_dir   — create a directory (mkdir -p)
-#   rename       — rename a file entry
-#   delete       — delete an entry (and children) from DB and disk (#12)
+#   rename       — rename a file or directory
+#   delete       — tombstone a node (and subtree), remove it from disk
+#   import_git   — clone a repo into an empty project and load it
+#
+# `revision` values on the wire are revision UUID strings (PROTOCOL 6).
 
 require 'base64'
 require 'fileutils'
 require 'open3'
 
 module FsStore
+  # Replies to recent fs/write batches, by "project:user:batch_id", so a
+  # client retrying after a dropped socket gets the original answer.
+  module RecentBatches
+    TTL_S = 600
+    MAX   = 2000
+    @entries = {}
+    @lock = Mutex.new
+
+    def self.get(key)
+      @lock.synchronize do
+        e = @entries[key]
+        e && Time.now - e[0] < TTL_S ? e[1] : nil
+      end
+    end
+
+    def self.put(key, value)
+      @lock.synchronize do
+        @entries[key] = [Time.now, value]
+        if @entries.size > MAX
+          cutoff = Time.now - TTL_S
+          @entries.delete_if { |_, (t, _)| t < cutoff }
+          @entries.shift while @entries.size > MAX
+        end
+      end
+    end
+  end
+
   # Entry point — called by worker route() for cs == 'fs'
   def self.handle(session, cmd, payload, sessions_by_project, send_fn, broadcast_fn)
     case cmd
@@ -67,34 +101,38 @@ module FsStore
   # -------------------------------------------------------------------------
 
   def self.handle_tree(session, send_fn)
-    tree = DirectoryEntry.tree_for_project(session.project_id)
-    send_fn.call(session.ws, 'fs', 'tree', { tree: tree })
+    send_fn.call(session.ws, 'fs', 'tree', { tree: ProjectFs.tree_json(session.project_id) })
   end
 
   def self.handle_read(session, payload, send_fn)
-    path  = payload['path'].to_s.strip
-    entry = find_entry!(session.project_id, path)
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if entry.binary?
+    path = payload['path'].to_s.strip
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    content = entry.get_content
+    target = node.resolve
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'dangling symlink' }) unless target
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if target.binary?
+
     send_fn.call(session.ws, 'fs', 'content', {
-      path:    entry.srcpath,
-      content: content
+      path:     node.path,
+      content:  store_for(session).read(node.path),
+      revision: ProjectFs.head_revision_id(target)
     })
   end
 
-  # read_binary — stream a chunk of a binary file from disk.
+  # read_binary — stream a chunk of a file's live bytes from the working tree.
+  # (The PVC is authoritative for binaries; archived revisions are served by the
+  # REST blob endpoint with ?revision=.)
   # Payload: { path:, offset: 0, length: 65536 }
   # Reply:   { path:, offset:, length: (actual), size: (total), eof: bool, data: base64 }
   def self.handle_read_binary(session, payload, send_fn)
-    path  = payload['path'].to_s.strip
-    entry = find_entry!(session.project_id, path)
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
+    path = payload['path'].to_s.strip
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    flusher   = VFS_FLUSHERS[session.project_id]
+    flusher = VFS_FLUSHERS[session.project_id]
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'no disk root configured' }) unless flusher
-    disk_path = File.join(flusher.root_path, entry.srcpath)
+    disk_path = ProjectFs.disk_path(flusher.root_path, node.path)
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'not present on disk' }) unless File.file?(disk_path)
 
     offset = [payload['offset'].to_i, 0].max
@@ -113,7 +151,7 @@ module FsStore
       end
     end
     send_fn.call(session.ws, 'fs', 'binary_chunk', {
-      path:   entry.srcpath,
+      path:   node.path,
       offset: offset,
       length: bytes.bytesize,
       size:   total,
@@ -124,18 +162,18 @@ module FsStore
 
   # stat — metadata snapshot for the explorer Properties panel (#5).
   def self.handle_stat(session, payload, send_fn)
-    path  = payload['path'].to_s.strip
-    entry = find_entry!(session.project_id, path)
-    send_fn.call(session.ws, 'fs', 'stat', entry.stat_hash)
+    path = payload['path'].to_s.strip
+    find_node!(session.project_id, path)
+    send_fn.call(session.ws, 'fs', 'stat', store_for(session).stat(path))
   end
 
   # open — register this session as viewing a file; receive its peer viewer list
   def self.handle_open(session, payload, send_fn)
-    path  = payload['path'].to_s.strip
-    entry = find_entry!(session.project_id, path)
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
+    path = payload['path'].to_s.strip
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    norm = entry.srcpath
+    norm = node.path
     key  = "#{session.project_id}:#{norm}"
     doc  = OPEN_DOCUMENTS[key] ||= OpenDocument.new(session.project_id, norm)
     doc.add_client(session.ws, user_id: session.user_id, name: session.name)
@@ -146,8 +184,7 @@ module FsStore
 
   # close — unregister this session from a file
   def self.handle_close(session, payload)
-    path = payload['path'].to_s.strip
-    norm = path.start_with?('/') ? path : "/#{path}"
+    norm = normalize(payload['path'])
     key  = "#{session.project_id}:#{norm}"
     doc  = OPEN_DOCUMENTS[key]
     return unless doc
@@ -159,8 +196,7 @@ module FsStore
 
   # cursor — update this session's cursor position and broadcast to co-viewers
   def self.handle_cursor(session, payload, broadcast_fn)
-    path = payload['path'].to_s.strip
-    norm = path.start_with?('/') ? path : "/#{path}"
+    norm = normalize(payload['path'])
     key  = "#{session.project_id}:#{norm}"
     doc  = OPEN_DOCUMENTS[key]
     return unless doc&.member?(session.ws)
@@ -178,193 +214,189 @@ module FsStore
     })
   end
 
-  # write — accepts { path:, changes: [...] }
-  # Each change in the array: { change_type:, change_data:, start_line:, start_char:, end_line:, end_char: }
+  # write — { path:, changes: [...], base_revision_id: (optional) }
+  # Each change: { change_type:, change_data:, start_line:, start_char:, end_line:, end_char: }
+  # change_data is the JSON payload DbfsV2::Delta parses ({startLine, startChar, ...}).
+  #
+  # Without base_revision_id every change is a blind append at the head (older
+  # clients). With it, the batch is based on that revision: appended if it is
+  # still the head, otherwise auto-branched there and rebased onto main; see
+  # ProjectFs.write_batch!.
   def self.handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path    = payload['path'].to_s.strip
     changes = Array(payload['changes'])
-    return send_fn.call(session.ws, 'fs', 'error', { message: 'no changes provided' }) if changes.empty?
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, message: 'no changes provided' }) if changes.empty?
 
-    entry = find_entry!(session.project_id, path)
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if entry.ftype == 'folder'
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    # Hydrate the live buffer BEFORE persisting so a cache miss replays only
-    # pre-write rows. apply! then advances it by exactly the rows just written.
-    # (Order matters: hydrate-after-persist would replay the new rows during
-    # cache construction and then apply! them a second time.)
-    cached = Document.for(entry)
-
-    stored = ActiveRecord::Base.transaction do
-      changes.map do |ch|
-        FileChange.append!(
-          directory_entry_id: entry.id,
-          user_id:            session.user_id,
-          change_type:        ch['change_type'].to_s,
-          change_data:        ch['change_data'].is_a?(Hash) ? ch['change_data'].to_json : ch['change_data'].to_s,
-          start_line:         ch['start_line'].to_i,
-          start_char:         ch['start_char'].to_i,
-          end_line:           ch['end_line'],
-          end_char:           ch['end_char']
-        )
+    deltas =
+      begin
+        changes.map do |ch|
+          data = ch['change_data']
+          DbfsV2::Delta.parse(ch['change_type'].to_s, data.is_a?(Hash) ? data : data.to_s)
+        end
+      rescue JSON::ParserError => e
+        return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad change_data: #{e.message}", resync: true })
       end
-    end
-
-    send_fn.call(session.ws, 'fs', 'written', {
-      path:      entry.srcpath,
-      revisions: stored.map(&:revision)
-    })
-
-    # Advance the in-memory buffer with the same changes we just persisted.
-    changes.each { |ch| cached&.apply!(ch['change_type'], ch['change_data']) }
-
-    # Broadcast only to clients that have this file open
-    key   = "#{session.project_id}:#{entry.srcpath}"
-    doc   = OPEN_DOCUMENTS[key]
-    peers = doc ? doc.others(session.ws) : []
-    changes.each_with_index do |ch, i|
-      broadcast_fn.call(peers, 'fs', 'change', {
-        path:        entry.srcpath,
-        change_type: ch['change_type'],
-        change_data: ch['change_data'],
-        start_line:  ch['start_line'],
-        start_char:  ch['start_char'],
-        end_line:    ch['end_line'],
-        end_char:    ch['end_char'],
-        revision:    stored[i].revision,
-        user_id:     session.user_id
-      })
-    end
-
-    data_bytes = changes.sum { |ch| ch['change_data'].to_s.bytesize }
-    VFS_FLUSHERS[session.project_id]&.record_write(entry.id, data_bytes)
+    commit_and_broadcast(session, node.path, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn,
+                         batch_id: payload['batch_id'].presence)
   end
 
   def self.handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path    = payload['path'].to_s.strip
-    content = payload['content'].to_s
-    entry   = find_entry!(session.project_id, path)
+    content = payload['content'].to_s.dup.force_encoding('UTF-8')
+    content = content.scrub('') unless content.valid_encoding?
+    node    = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    # Hydrate the live buffer BEFORE persisting (see handle_write for why).
-    cached = Document.for(entry)
+    delta = DbfsV2::Delta.new('setContents', { data: content })
+    commit_and_broadcast(session, node.path, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn,
+                         batch_id: payload['batch_id'].presence)
+  end
 
-    fc = ActiveRecord::Base.transaction do
-      FileChange.append!(
-        directory_entry_id: entry.id,
-        user_id:            session.user_id,
-        change_type:        'setContents',
-        change_data:        content.encode('UTF-8', invalid: :replace, undef: :replace, replace: ''),
-        start_line:         0,
-        start_char:         0
-      )
+  # Persist `deltas` (ProjectFs.write_batch!: blind, anchored append, or
+  # auto-branch + rebase), reply fs/written to the author, send the other
+  # viewers one frame per revision that landed on main, and nudge the flusher.
+  #
+  # Failures commit nothing on main and come back as fs/error with resync set:
+  # conflict: true when an anchored batch overlapped a concurrent replace (its
+  # revisions are kept on `branch`), or when the base is unknown.
+  #
+  # `batch_id` (client-chosen, optional) makes a retried batch idempotent: a
+  # client that lost its connection before the reply resends the same batch_id,
+  # and gets the original reply instead of the batch being applied twice. The
+  # memory is per worker process (RecentBatches), so it covers socket drops, not
+  # a worker restart.
+  def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn, batch_id: nil)
+    key = batch_id && "#{session.project_id}:#{session.user_id}:#{batch_id}"
+    if key && (replay = RecentBatches.get(key))
+      return send_fn.call(session.ws, 'fs', replay[0], replay[1])
+    end
+    reply = lambda do |cmd, frame|
+      frame = frame.merge(batch_id: batch_id) if batch_id
+      RecentBatches.put(key, [cmd, frame]) if key
+      send_fn.call(session.ws, 'fs', cmd, frame)
     end
 
-    send_fn.call(session.ws, 'fs', 'written', { path: entry.srcpath, revisions: [fc.revision] })
-    cached&.apply!('setContents', content)
-    key   = "#{session.project_id}:#{entry.srcpath}"
-    doc   = OPEN_DOCUMENTS[key]
-    peers = doc ? doc.others(session.ws) : []
-    broadcast_fn.call(peers, 'fs', 'set_contents', {
-      path:     entry.srcpath,
-      content:  content,
-      revision: fc.revision,
-      user_id:  session.user_id
-    })
+    store = store_for(session)
+    node  = store.resolve(path)
+    result =
+      begin
+        ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id)
+      rescue ProjectFs::BranchConflict => e
+        return reply.call('error', { path: path, error: e.message, conflict: true, resync: true,
+                                     branch: e.branch, branch_head: e.branch_head })
+      rescue DbfsV2::ConflictError => e
+        return reply.call('error', { path: path, error: e.message, conflict: true, resync: true })
+      rescue ArgumentError, JSON::ParserError, RegexpError, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotFound => e
+        return reply.call('error', { path: path, error: e.message, resync: true })
+      end
 
-    VFS_FLUSHERS[session.project_id]&.record_write(entry.id, content.bytesize)
+    reply.call('written', ProjectFs.batch_ack(path, result, node))
+
+    doc   = OPEN_DOCUMENTS["#{session.project_id}:#{path}"]
+    peers = doc ? doc.others(session.ws) : []
+    unless peers.empty?
+      ProjectFs.batch_peer_frames(path, result, node, user_id: session.user_id).each do |cmd, frame|
+        broadcast_fn.call(peers, 'fs', cmd, frame)
+      end
+    end
+
+    VFS_FLUSHERS[session.project_id]&.record_write(node.id, result.revisions.sum { |r| r.change_data.to_s.bytesize })
   end
 
   def self.handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path    = payload['path'].to_s.strip
+    path    = normalize(payload['path'])
     content = payload['content'].to_s
-    entry   = DirectoryEntry.create_file!(
-      project_id: session.project_id,
-      srcpath:    path,
-      user_id:    session.user_id,
-      data:       content,
-      mkdirp:     !!payload['mkdirp']
-    )
+    store   = store_for(session)
 
-    send_fn.call(session.ws, 'fs', 'created', { path: entry.srcpath, type: 'file', id: entry.id })
-    peers = other_project_sessions(session, sessions_by_project)
-    broadcast_fn.call(peers, 'fs', 'created', {
-      path:    entry.srcpath,
-      type:    'file',
-      id:      entry.id,
-      user_id: session.user_id
+    unless payload['mkdirp'] || store.find(File.dirname(path))
+      return send_fn.call(session.ws, 'fs', 'error', { path: path, error: "Parent directory #{File.dirname(path)} does not exist" })
+    end
+
+    node = ProjectFs.ensure_file!(store, path, content: content, user_id: session.user_id)
+    VFS_FLUSHERS[session.project_id]&.record_write(node.id, content.bytesize)
+
+    send_fn.call(session.ws, 'fs', 'created', { path: node.path, type: 'file', id: node.id })
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', {
+      path: node.path, type: 'file', id: node.id, user_id: session.user_id
     })
   end
 
   def self.handle_create_dir(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path  = payload['path'].to_s.strip
-    entry = DirectoryEntry.mkdir_p!(project_id: session.project_id, srcpath: path, user_id: session.user_id)
+    node = ProjectFs.ensure_folder!(store_for(session), normalize(payload['path']), user_id: session.user_id)
+    flusher = VFS_FLUSHERS[session.project_id]
+    if flusher
+      abs = ProjectFs.disk_path(flusher.root_path, node.path)
+      flusher.suppress(abs) { FileUtils.mkdir_p(abs) }
+    end
 
-    send_fn.call(session.ws, 'fs', 'created', { path: entry.srcpath, type: 'folder', id: entry.id })
-    peers = other_project_sessions(session, sessions_by_project)
-    broadcast_fn.call(peers, 'fs', 'created', {
-      path:    entry.srcpath,
-      type:    'folder',
-      id:      entry.id,
-      user_id: session.user_id
+    send_fn.call(session.ws, 'fs', 'created', { path: node.path, type: 'folder', id: node.id })
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', {
+      path: node.path, type: 'folder', id: node.id, user_id: session.user_id
     })
   end
 
+  # rename — { path:, new_name: } (a basename, same parent). Files and folders:
+  # DBFS v2 moves a folder by rewriting descendant paths; revisions stay keyed
+  # to the same node ids, so history survives the rename.
   def self.handle_rename(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path     = payload['path'].to_s.strip
     new_name = payload['new_name'].to_s.strip
-    entry    = find_entry!(session.project_id, path)
-    old_path = entry.srcpath
-    entry.rename!(new_name)
-    Document.forget(old_path)
-    Document.forget(entry.srcpath)
+    if new_name.empty? || new_name.include?('/')
+      return send_fn.call(session.ws, 'fs', 'error', { path: payload['path'], error: 'new_name must be a single path segment' })
+    end
 
-    send_fn.call(session.ws, 'fs', 'renamed', { old_path: old_path, new_path: entry.srcpath, id: entry.id })
-    peers = other_project_sessions(session, sessions_by_project)
-    broadcast_fn.call(peers, 'fs', 'renamed', {
-      old_path: old_path,
-      new_path: entry.srcpath,
-      id:       entry.id,
-      user_id:  session.user_id
-    })
-  end
-
-  def self.handle_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path  = payload['path'].to_s.strip
-    entry = find_entry!(session.project_id, path)
-    entry_path = entry.srcpath
-
-    # Collect every descendant srcpath BEFORE destroying the DB row. After
-    # destroy, ActiveRecord's dependent: :destroy has already cascaded, so we
-    # need the list in advance to (a) forget each live Document buffer the DB
-    # cascade never touches, and (b) suppress each resulting inotify :delete as
-    # an external mutation. Fixes #12 in May30-Questions.md + Cursor PR #5.
-    descendant_paths =
-      DirectoryEntry.where(project_id: session.project_id)
-        .where('srcpath = ? OR srcpath LIKE ?', entry_path, "#{entry_path.chomp('/')}/%")
-        .pluck(:srcpath)
+    node     = find_node!(session.project_id, payload['path'].to_s.strip)
+    old_path = node.path
+    new_path = File.join(File.dirname(old_path), new_name)
+    moved    = store_for(session).move(old_path, new_path, user_id: session.user_id)
 
     flusher = VFS_FLUSHERS[session.project_id]
-    root    = flusher&.root_path
+    if flusher
+      from = ProjectFs.disk_path(flusher.root_path, old_path)
+      to   = ProjectFs.disk_path(flusher.root_path, new_path)
+      if File.exist?(from) || File.symlink?(from)
+        flusher.suppress(from, to) { File.rename(from, to) }
+      end
+    end
 
-    entry.destroy!
-    descendant_paths.each { |p| Document.forget(p) }
+    send_fn.call(session.ws, 'fs', 'renamed', { old_path: old_path, new_path: moved.path, id: moved.id })
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'renamed', {
+      old_path: old_path, new_path: moved.path, id: moved.id, user_id: session.user_id
+    })
+  rescue RuntimeError => e
+    send_fn.call(session.ws, 'fs', 'error', { path: payload['path'], error: e.message })
+  end
 
-    if root
-      descendant_paths.each do |p|
-        abs_path = File.join(root, p)
-        flusher.suppress_set&.add(abs_path)
-        begin
-          FileUtils.rm_rf(abs_path)
-        rescue => e
-          puts "[FsStore] disk delete failed for #{abs_path}: #{e.class}: #{e.message}"
-        ensure
-          EM.add_timer(1) { flusher.suppress_set&.delete(abs_path) }
-        end
+  # delete — tombstone the node and its subtree (history kept), then remove it
+  # from disk with the watcher suppressed for every descendant path.
+  def self.handle_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    node = find_node!(session.project_id, payload['path'].to_s.strip)
+    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'cannot delete root' }) if node.root?
+
+    entry_path = node.path
+    prefix     = "#{entry_path.chomp('/')}/"
+    descendant_paths =
+      FileNode.live.where(project_id: session.project_id)
+              .where('path = ? OR starts_with(path, ?)', entry_path, prefix)
+              .pluck(:path)
+
+    store_for(session).delete(entry_path, user_id: session.user_id)
+
+    flusher = VFS_FLUSHERS[session.project_id]
+    if flusher
+      abs_paths = descendant_paths.map { |p| ProjectFs.disk_path(flusher.root_path, p) }
+      flusher.suppress(*abs_paths) do
+        FileUtils.rm_rf(ProjectFs.disk_path(flusher.root_path, entry_path))
+      rescue => e
+        puts "[FsStore] disk delete failed for #{entry_path}: #{e.class}: #{e.message}"
       end
     end
 
     send_fn.call(session.ws, 'fs', 'deleted', { path: entry_path })
-    peers = other_project_sessions(session, sessions_by_project)
-    broadcast_fn.call(peers, 'fs', 'deleted', { path: entry_path, user_id: session.user_id })
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'deleted',
+                      { path: entry_path, user_id: session.user_id })
     DebugStream.emit(:fs, level: :info,
       message: "deleted #{entry_path}", project_id: session.project_id,
       meta: { path: entry_path, user_id: session.user_id, source: 'ws' }) if defined?(DebugStream)
@@ -394,13 +426,13 @@ module FsStore
       return send_fn.call(session.ws, 'fs', 'error',
                           { message: 'git_url must be an http(s):// or git@ URL' })
     end
-    unless DirectoryEntry.project_empty?(session.project_id)
+    unless ProjectFs.store(session.project_id).project_empty?
       return send_fn.call(session.ws, 'fs', 'error',
                           { message: 'project is not empty; refusing to import' })
     end
 
     root = VFS_FLUSHERS[session.project_id]&.root_path ||
-           Project.find(session.project_id).project_setting&.root_path
+           ProjectFs.root_path(Project.find(session.project_id))
     unless root
       return send_fn.call(session.ws, 'fs', 'error',
                           { message: 'no root_path configured for project' })
@@ -446,8 +478,9 @@ module FsStore
       return { ok: false, error: "clone failed: #{out.to_s.lines.last&.strip || out}" }
     end
 
-    stats = FsLoader.new(project_id: project_id, root_path: root,
-                         user_id: user_id, verbose: false).load!
+    # Attributed to the system user like every import from the working tree;
+    # the clone itself is the user's action.
+    stats = FsLoader.new(project_id: project_id, root_path: root, verbose: false).load!
     { ok: true, stats: stats }
   rescue => e
     { ok: false, error: "#{e.class}: #{e.message}" }
@@ -486,11 +519,21 @@ module FsStore
   # -------------------------------------------------------------------------
   private_class_method
 
-  def self.find_entry!(project_id, path)
-    normalized = path.start_with?('/') ? path : "/#{path}"
-    entry = DirectoryEntry.find_by_project_and_path(project_id, normalized)
-    raise ActiveRecord::RecordNotFound, path unless entry
-    entry
+  def self.store_for(session)
+    ProjectFs.store(session.project_id)
+  end
+
+  def self.normalize(path)
+    p = path.to_s.strip
+    p = "/#{p}" unless p.start_with?('/')
+    p = p.chomp('/')
+    p.empty? ? '/' : p
+  end
+
+  def self.find_node!(project_id, path)
+    node = ProjectFs.store(project_id).find(path)
+    raise ActiveRecord::RecordNotFound, path unless node
+    node
   end
 
   def self.other_project_sessions(session, sessions_by_project)

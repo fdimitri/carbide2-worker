@@ -94,7 +94,6 @@ require_relative 'terminal_instance'
 require_relative 'terminal_recorder'
 require_relative 'chat_room'
 require_relative 'open_document'
-require_relative 'document'
 require_relative 'shell_client'
 require_relative 'session'
 require_relative 'jwt_verifier'
@@ -155,7 +154,19 @@ PROBE_DEADLINE_SECONDS = 5
 # PROTOCOL 4: agent/user_turn broadcast (shared conversations, #80) + per-message
 # author on agent user messages (#79). Additive — MIN_CLIENT stays 1.
 # PROTOCOL 5: agent/stop + agent/stopping + agent/stopped (#83). Additive.
-PROTOCOL   = 5
+# PROTOCOL 6: DBFS v2. `revision` in fs/written, fs/change and fs/set_contents
+# is now a revision UUID string (was an integer count); fs/content carries the
+# head `revision`; fs/write and fs/set_contents accept an optional
+# `base_revision_id`; fs/error may carry `conflict: true` or `resync: true`.
+# Today's client never reads `revision`, so MIN_CLIENT stays 1.
+# PROTOCOL 7: fs/write takes base_revision_id + batch_id. A batch based behind
+# the head is auto-branched and rebased onto main instead of refused.
+# fs/written carries batch_id, mode (blind|append|rebased), head, and for a
+# rebase branch/branch_head/changes (the author's state -> head); revision
+# frames carry `parent`; a refused rebase's fs/error names the branch holding
+# the batch; a resent batch_id gets the original reply. Blind writes are
+# unchanged, so MIN_CLIENT stays 1.
+PROTOCOL   = 7
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
@@ -223,11 +234,10 @@ end
 TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
 OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
-DOCUMENTS           = {}        # srcpath => Document (in-memory rendered buffer)
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 SHELL_HANDLES       = {}        # terminal_id (int) => ShellClient::Handle
 SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]
-VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths being written by VfsFlusher
+VFS_FLUSH_SUPPRESS  = Set.new   # absolute paths FsStore is deleting/moving/creating on disk (watcher skips them)
 VFS_FLUSHERS        = {}        # project_id => VfsFlusher
 VFS_WATCHERS        = {}        # project_id => VfsWatcher
 PENDING_AUTH        = {}        # ws.object_id => Session (unauthenticated, awaiting system/auth)

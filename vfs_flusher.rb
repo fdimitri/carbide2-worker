@@ -1,10 +1,19 @@
-# VfsFlusher — writes changed VFS (DB) file content back to disk.
+# VfsFlusher — writes DBFS v2 text heads back to the working tree on disk.
 # Copyright (C) 2025 Carbide2 contributors. GPLv3.
 #
 # Two flush triggers:
-#   1. Periodic sweep (default 800 ms) — any file with pending changes is written.
+#   1. Periodic sweep (default 800 ms) — any text file whose main-branch head
+#      moved since this flusher last wrote it.
 #   2. Byte threshold (default 20 bytes) — immediate flush triggered by FsStore
-#      via record_write() when accumulated unflushed bytes >= threshold.
+#      / AgentTools via record_write() when accumulated unflushed bytes >= threshold.
+#
+# Dirty tracking is DbfsV2's: a branch head is an immutable revision id that
+# only moves forward, so "head != last flushed head" is the whole check — one
+# query per sweep for the project, no counts, no replay.
+#
+# Binaries are never flushed (decisions #28): their live copy is the PVC, and a
+# second writer to the working area is exactly what v2 rules out. The actual
+# write (path safety, mode/owner, folders) is DbfsV2::Flusher#flush_file.
 #
 # Settings are read from ProjectSetting (DB) with a 5-second cache so changes
 # made via PATCH /api/projects/:id/settings take effect quickly at runtime.
@@ -15,34 +24,83 @@
 # The worker timer fires every POLL_INTERVAL seconds (0.1 s); the flusher
 # internally decides whether enough time has elapsed for a full sweep.
 require 'fileutils'
-require 'etc'
+require 'digest'
 
 class VfsFlusher
   POLL_INTERVAL          = 0.1   # seconds — EM timer granularity (fixed)
   DEFAULT_INTERVAL_S     = Float(ENV.fetch('CARBIDE_FLUSH_INTERVAL', '0.8'))
   DEFAULT_BYTE_THRESHOLD = Integer(ENV.fetch('CARBIDE_FLUSH_BYTES',  '20'))
   SETTINGS_CACHE_TTL     = 5.0   # seconds between DB re-reads
+  SUPPRESS_HOLD_S        = 1     # how long a path we wrote stays invisible to the watcher
+
+  # Sentinel for "never flushed by this process". Distinct from nil, which is a
+  # real head value (a text file created empty has no revisions yet).
+  NEVER = Object.new.freeze
 
   attr_reader :root_path, :project_id, :suppress_set
+
+  # What this flusher last put on disk at a path: the head it wrote and the
+  # SHA-256 of the bytes. The watcher uses it to recognise its own echo by
+  # content (not by a time window, which also swallowed real edits that landed
+  # inside it) and to anchor a genuine external edit to the revision the
+  # external writer saw.
+  Flushed = Struct.new(:head, :digest)
 
   def initialize(project_id:, root_path:, suppress_set: nil)
     @project_id      = project_id
     @root_path       = root_path.to_s.chomp('/')
     @suppress_set    = suppress_set
-    @last_rev        = {}   # entry_id => max revision at last flush
-    @unflushed_bytes = {}   # entry_id => bytes accumulated since last flush
-    @last_flush_at   = 0.0  # monotonic time of last sweep
-    # Settings cache
+    @store           = ProjectFs.store(project_id)
+    @writer          = DbfsV2::Flusher.new(@store, @root_path)
+    @last_head       = Hash.new(NEVER)  # file_node_id => head revision id at last flush
+    @on_disk         = {}               # abs path => Flushed
+    @unflushed_bytes = Hash.new(0)      # file_node_id => bytes accumulated since last flush
+    @last_flush_at   = 0.0
     @settings_cached_at    = 0.0
     @cached_interval_s     = DEFAULT_INTERVAL_S
     @cached_byte_threshold = DEFAULT_BYTE_THRESHOLD
   end
 
-  # Called by FsStore after every write/set_contents to track unflushed bytes.
-  # Triggers an immediate flush for this entry when the threshold is exceeded.
-  def record_write(entry_id, byte_count)
-    @unflushed_bytes[entry_id] = (@unflushed_bytes[entry_id] || 0) + byte_count
-    flush_entry_by_id!(entry_id) if @unflushed_bytes[entry_id] >= @cached_byte_threshold
+  # Called after every DBFS write that should reach disk. Triggers an immediate
+  # flush for this node when the byte threshold is crossed.
+  #
+  # Agent tool calls write from EM.defer threads; the flusher's bookkeeping and
+  # its EM timers belong to the reactor, so off-reactor callers are marshalled
+  # onto it.
+  def record_write(file_node_id, byte_count)
+    unless !EM.reactor_running? || EM.reactor_thread?
+      return EM.schedule { record_write(file_node_id, byte_count) }
+    end
+
+    @unflushed_bytes[file_node_id] += byte_count
+    flush_node_by_id!(file_node_id) if @unflushed_bytes[file_node_id] >= @cached_byte_threshold
+  end
+
+  def flushed_state(abs_path)
+    @on_disk[abs_path]
+  end
+
+  # The watcher absorbed an external edit and DBFS's head content is now
+  # byte-identical to the file on disk: record that, so the next sweep doesn't
+  # rewrite the file it just read (an mtime bump and a pointless echo).
+  def adopt_disk_state(file_node_id, abs_path, head, digest)
+    return unless !EM.reactor_running? || EM.reactor_thread?
+
+    @last_head[file_node_id] = head
+    @on_disk[abs_path] = Flushed.new(head, digest)
+    @unflushed_bytes[file_node_id] = 0
+  end
+
+  # Mark absolute paths as touched-by-us for the duration of the block and a
+  # short hold after it, so the watcher ignores the delete/move/mkdir events
+  # FsStore's own disk operations produce. (Content writes don't need this; see
+  # Flushed.)
+  def suppress(*abs_paths)
+    abs_paths.each { |p| @suppress_set&.add(p) }
+    yield
+  ensure
+    release = -> { abs_paths.each { |p| @suppress_set&.delete(p) } }
+    EM.reactor_running? ? EM.add_timer(SUPPRESS_HOLD_S, &release) : release.call
   end
 
   # Called by the EM timer every POLL_INTERVAL seconds.
@@ -53,17 +111,10 @@ class VfsFlusher
     return unless now - @last_flush_at >= @cached_interval_s
     @last_flush_at = now
 
-    rows = DirectoryEntry
-      .joins(:file_changes)
-      .where(project_id: @project_id, ftype: 'file', binary: false)
-      .group('directory_entries.id')
-      .select('directory_entries.id, directory_entries.srcpath, MAX(file_changes.revision) AS max_rev')
-
     flushed = 0
-    rows.each do |row|
-      next if @last_rev[row.id] == row.max_rev.to_i
-      entry = DirectoryEntry.find(row.id)
-      flush_single(entry, row.max_rev.to_i) && flushed += 1
+    text_heads.each do |id, path, head|
+      next if @last_head[id] == head
+      flush_single(id, path, head) && flushed += 1
     end
 
     puts "[VfsFlusher:#{@project_id}] sweep: flushed #{flushed} file(s)" if flushed > 0
@@ -72,6 +123,14 @@ class VfsFlusher
   end
 
   private
+
+  # [file_node_id, path, main head] for every live, non-symlink text file.
+  def text_heads(scope = FileNode.all)
+    scope.live
+         .where(project_id: @project_id, ftype: 'file', binary: false, symlink_target: nil)
+         .joins(:branches).where(branches: { name: Branch::MAIN })
+         .pluck('file_nodes.id', 'file_nodes.path', 'branches.head_revision_id')
+  end
 
   def refresh_settings_cache!
     now = EM.current_time
@@ -84,63 +143,49 @@ class VfsFlusher
     puts "[VfsFlusher:#{@project_id}] settings refresh error: #{e.message}"
   end
 
-  def flush_entry_by_id!(entry_id)
-    entry = DirectoryEntry.find_by(id: entry_id, project_id: @project_id, ftype: 'file')
-    return unless entry
-    return if entry.binary?   # binary entries hold no text content to flush
-    max_rev = FileChange.where(directory_entry_id: entry_id).maximum(:revision).to_i
-    return if @last_rev[entry_id] == max_rev
-    flush_single(entry, max_rev)
+  def flush_node_by_id!(file_node_id)
+    row = text_heads(FileNode.where(id: file_node_id)).first
+    return unless row
+    _id, path, head = row
+    return if @last_head[file_node_id] == head
+    flush_single(file_node_id, path, head)
   rescue => e
-    puts "[VfsFlusher:#{@project_id}] flush_entry_by_id! error: #{e.class}: #{e.message}"
+    puts "[VfsFlusher:#{@project_id}] flush_node_by_id! error: #{e.class}: #{e.message}"
   end
 
-  def flush_single(entry, max_rev)
-    abs_path = File.join(@root_path, entry.srcpath)
-    content  = entry.calc_current
-    @suppress_set&.add(abs_path)
-    begin
-      FileUtils.mkdir_p(File.dirname(abs_path))
-      File.write(abs_path, content)
-      apply_posix!(entry, abs_path)
-      entry.update_columns(last_size: content.bytesize, mtime: Time.current, updated_at: Time.current)
-      @last_rev[entry.id]        = max_rev
-      @unflushed_bytes[entry.id] = 0
-      puts "[VfsFlusher:#{@project_id}] flushed #{entry.srcpath}"
-      DebugStream.emit(:flusher, level: :info,
-        message: "flushed #{entry.srcpath}", project_id: @project_id,
-        meta: { path: entry.srcpath, bytes: content.bytesize, rev: max_rev }) if defined?(DebugStream)
-      true
-    rescue => e
-      puts "[VfsFlusher:#{@project_id}] write error #{abs_path}: #{e.message}"
-      DebugStream.emit(:flusher, level: :error,
-        message: "write error #{entry.srcpath}: #{e.message}", project_id: @project_id,
-        meta: { path: entry.srcpath, error: e.class.to_s }) if defined?(DebugStream)
-      false
-    ensure
-      EM.add_timer(1) { @suppress_set&.delete(abs_path) }
-    end
-  end
+  def flush_single(id, path, head)
+    abs = @writer.disk_path(path)
+    first_time = @last_head[id].equal?(NEVER)
 
-  # Best-effort POSIX metadata application. chown almost always fails when
-  # the worker isn't root (single-user dev container is usually fine; multi-
-  # tenant prod will need a privileged side-process). We swallow EPERM so a
-  # missing chown doesn't break the flush of file contents.
-  def apply_posix!(entry, abs_path)
-    if entry.posix_mode
-      File.chmod(entry.posix_mode & 0o7777, abs_path) rescue nil
+    # The first time this process sees a node, skip the write when the disk
+    # already holds exactly the head content: a worker restart must not rewrite
+    # every file in the tree and bump every mtime (which makes build tools
+    # rebuild everything). After that, head movement alone decides.
+    content = @store.read(path).to_s
+    if first_time && File.file?(abs) && File.size(abs) == content.bytesize && File.binread(abs) == content.b
+      @last_head[id] = head
+      @on_disk[abs] = Flushed.new(head, Digest::SHA256.hexdigest(content.b))
+      @unflushed_bytes[id] = 0
+      return false
     end
-    if entry.posix_owner || entry.posix_group
-      begin
-        uid = entry.posix_owner ? (Etc.getpwnam(entry.posix_owner).uid rescue Integer(entry.posix_owner, 10) rescue nil) : nil
-        gid = entry.posix_group ? (Etc.getgrnam(entry.posix_group).gid rescue Integer(entry.posix_group, 10) rescue nil) : nil
-        File.chown(uid, gid, abs_path) if uid || gid
-      rescue Errno::EPERM
-        # Worker not running as root — silently skip; the file's mode is what
-        # matters most for builds/scripts and we did set it above.
-      rescue => e
-        puts "[VfsFlusher:#{@project_id}] chown skipped (#{e.class}): #{e.message}"
-      end
-    end
+
+    # No suppress window: the watcher recognises this write by digest.
+    @writer.flush_file(path)
+    written = File.binread(abs)
+    bytes = written.bytesize
+    @on_disk[abs] = Flushed.new(head, Digest::SHA256.hexdigest(written))
+    @last_head[id] = head
+    @unflushed_bytes[id] = 0
+    puts "[VfsFlusher:#{@project_id}] flushed #{path}"
+    DebugStream.emit(:flusher, level: :info,
+      message: "flushed #{path}", project_id: @project_id,
+      meta: { path: path, bytes: bytes, rev: head }) if defined?(DebugStream)
+    true
+  rescue => e
+    puts "[VfsFlusher:#{@project_id}] write error #{abs}: #{e.class}: #{e.message}"
+    DebugStream.emit(:flusher, level: :error,
+      message: "write error #{path}: #{e.message}", project_id: @project_id,
+      meta: { path: path, error: e.class.to_s }) if defined?(DebugStream)
+    false
   end
 end

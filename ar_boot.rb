@@ -32,6 +32,9 @@ end
 Dir[File.expand_path('../app/models/*.rb', __dir__)].sort.each do |f|
   require f
 end
+# DBFS v2: the library (outside any autoloader) and the carbide2 seam over it.
+require_relative '../lib/dbfs_v2'
+require_relative '../app/services/project_fs'
 require_relative '../app/services/fs_loader'
 
 puts "[ar_boot] connected to Postgres at #{ENV.fetch('POSTGRES_HOST', '?')}:#{ENV.fetch('POSTGRES_PORT', '?')}"
