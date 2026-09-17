@@ -44,23 +44,27 @@ module AgentTools
     end
   end
 
-  # Invoke a tool by name. Returns the tool's result (Hash). Raises
-  # ArgumentError if the tool isn't registered or isn't in allowed_slugs.
-  # Any exception inside the tool is caught and returned as { error: ... }
-  # so the model can read it and retry rather than killing the loop.
+  # Invoke a tool by name. Returns the tool's result (Hash).
+  #
+  # An unknown tool, or one not in this agent's allowlist, is NOT raised — it
+  # returns { error: ... } so the model receives a tool result it can read and
+  # recover from (inventing a tool name must not kill the conversation). Any
+  # exception inside the tool is likewise caught and returned as { error: ... }.
   #
   # `agent:` is the Agent record — passed to callables that need per-agent
   # capability gates beyond the allowed_slugs list (currently: shell_exec
   # also requires agent.shell_exec_enabled).
   def self.invoke(slug, allowed_slugs:, session:, project_id:, args:, agent: nil,
-                  cancel_check: nil)
+                  cancel_check: nil, conversation_id: nil)
     unless allowed_slugs.include?(slug)
-      raise ArgumentError, "tool #{slug.inspect} not allowed for this agent"
+      return { error: "tool #{slug.inspect} is not allowed for this agent" }
     end
-    entry = REGISTRY[slug] or raise ArgumentError, "unknown tool #{slug.inspect}"
+    entry = REGISTRY[slug]
+    return { error: "unknown tool #{slug.inspect}" } unless entry
     begin
       entry[:callable].call(session: session, project_id: project_id,
-                            args: args, agent: agent, cancel_check: cancel_check)
+                            args: args, agent: agent, cancel_check: cancel_check,
+                            conversation_id: conversation_id)
     rescue => e
       { error: "#{e.class}: #{e.message}" }
     end
@@ -431,7 +435,7 @@ module AgentTools
         },
       },
     }
-  ) do |session:, project_id:, args:, agent:, cancel_check:|
+  ) do |session:, project_id:, args:, agent:, cancel_check:, **_|
     # Two-layer gate: allowed_slugs already passed (we're inside the block);
     # also require the per-agent boolean.
     unless agent&.shell_exec_enabled
@@ -1096,5 +1100,54 @@ module AgentTools
     res = write_whole_file!(project_id: project_id, srcpath: srcpath,
                             content: args['content'].to_s, user_id: session.user_id)
     res.is_a?(Hash) && res[:path] ? res.merge(name: File.basename(srcpath, '.md')) : res
+  end
+
+  # ---------------------------------------------------------------------
+  # rehydrate_ttl(tool_call_id) — renew a tool result's lease before it expires.
+  #
+  # ADR-033 phase 2: tool results carry a turn-budget TTL (expires_at_turn).
+  # The agent calls this on a tool_call_id it still needs, which clears the
+  # expiry (keeps the result in the prompt). This is lease renewal BEFORE
+  # eviction — a tombstoned result is a flag, not a delete, so un-flagging is
+  # still the restore path; this tool is for keeping content that is merely
+  # *about to* expire.
+  # ---------------------------------------------------------------------
+  register('rehydrate_ttl',
+    schema: {
+      type: 'function',
+      function: {
+        name: 'rehydrate_ttl',
+        description: 'Renew the expiry on a tool result the agent still ' \
+                     'needs, identified by its tool_call_id. Tool results are ' \
+                     'evicted from the prompt after a turn budget to save ' \
+                     'tokens; call this on any tool_call_id whose result you ' \
+                     'will need again so it is not removed.',
+        parameters: {
+          type: 'object',
+          required: ['tool_call_id'],
+          properties: {
+            tool_call_id: { type: 'string',
+                            description: 'The tool_call_id of the result to keep.' },
+          },
+          additionalProperties: false,
+        },
+      },
+    }
+  ) do |session:, project_id:, args:, conversation_id:, **_|
+    tid = args['tool_call_id'].to_s
+    next { error: 'tool_call_id is required' } if tid.empty?
+
+    # Scoped to THIS conversation. tool_call_id comes from the provider and is
+    # not unique across a project, so matching on it project-wide renewed (or
+    # cleared) another conversation's results — a lease renewed in one thread
+    # silently kept another thread's payload in its prompt.
+    convo = AgentConversation.find_by(uuid: conversation_id)
+    next { error: 'no conversation in scope' } if convo.nil?
+
+    msgs = convo.agent_messages.where(tool_call_id: tid, role: 'tool')
+    next { error: "no tool result with tool_call_id #{tid.inspect} in this conversation" } if msgs.empty?
+
+    msgs.each { |m| m.update_column(:expires_at_turn, nil) }
+    { tool_call_id: tid, rehydrated: msgs.size }
   end
 end

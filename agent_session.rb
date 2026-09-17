@@ -114,6 +114,8 @@ class AgentSession
     # clear the cancel flag for an in-flight turn.
     @turn_mutex      = Mutex.new
     @turn_in_progress = false
+    @current_turn    = nil   # ADR-032 AgentTurn open during ask
+    @last_usage      = nil   # ADR-033 usage from the final SSE chunk
 
     # Resume from DB if a conversation with this uuid exists, otherwise
     # create one and seed with the agent's system prompt. We persist
@@ -148,8 +150,61 @@ class AgentSession
   # effect on the next turn. The system prompt already seeded into @history is
   # intentionally left as-is — rewriting an in-flight transcript's system
   # message would be surprising and isn't reversible.
+  #
+  # Mid-turn the swap is DROPPED, not applied: the ask loop reads @agent on
+  # every completion, so writing it here would change model, tools and sampling
+  # under a turn already in flight. Nothing is lost by dropping it — the next
+  # ask calls this again with a freshly loaded record before it takes the turn
+  # lock, so it re-points there.
   def refresh_agent!(agent)
-    @agent = agent if agent
+    return unless agent
+
+    @turn_mutex.synchronize { @agent = agent unless @turn_in_progress }
+  end
+
+  # ADR-032: open an AgentTurn for the user exchange about to begin. start_turn
+  # is the message turn the user's question will occupy.
+  def open_turn!
+    @current_turn = @convo.agent_turns.create!(status: 'in_progress', start_turn: @turn)
+  end
+
+  # ADR-032: close the current AgentTurn, recording the last message turn it
+  # spans. end_turn defaults to the last persisted turn (@turn - 1).
+  def close_turn!(status:)
+    return unless @current_turn
+    end_turn = @turn - 1
+    @current_turn.update!(status: status, end_turn: end_turn)
+    @current_turn = nil
+  rescue => e
+    puts "[AgentSession] close_turn failed: #{e.class} #{e.message}"
+    @current_turn = nil
+  end
+
+  # ADR-033 phase 1: tombstone the given messages and reflect it in the live
+  # @history immediately so the next turn omits the payload without a reload.
+  # @history is in turn order (turns are dense from 0), so a row's `turn`
+  # indexes its entry. Tool results set :content to '' (the provider requires
+  # the field on role=tool); assistant rows empty their tool calls' `arguments`
+  # and keep id/name so the pairing survives.
+  #
+  # Both payloads are emptied rather than dropped, matching what the server
+  # writes on reload (AgentMessage#to_history_entry): a function entry without
+  # `arguments` is rejected, so deleting the key here would make the in-memory
+  # send fail where the reloaded one succeeds.
+  def evict!(messages)
+    messages.each(&:tombstone!)
+    messages.each do |m|
+      entry = @history[m.turn]
+      next unless entry
+      case m.role
+      when 'tool'
+        entry[:content] = ''
+      when 'assistant'
+        Array(entry[:tool_calls]).each do |tc|
+          tc['function']['arguments'] = '' if tc['function']
+        end
+      end
+    end
   end
 
   # Request cancellation of the in-flight turn. Closes the active model HTTP
@@ -219,6 +274,7 @@ class AgentSession
   # caller surfaces via agent/error.
   def ask(user_text, images: nil, author_user_id: nil)
     @cancel_mutex.synchronize { @cancel_requested = false }
+    open_turn!
     push_history!(role: 'user', content: user_text.to_s, images: images,
                   author_user_id: author_user_id)
     debug_agent(level: :info,
@@ -251,8 +307,16 @@ class AgentSession
 
       # Always append whatever the model said, even if empty (tool-only turn).
       push_history!(role: 'assistant', content: content, tool_calls: calls)
+      record_usage!
 
       if calls.empty?
+        # Capture the completed turn's identity BEFORE close_turn! nulls it,
+        # so the live done frame can carry the same turn/agent_turn_id that
+        # load() would replay — the client needs them to render the per-turn
+        # fork marker without a re-fetch.
+        done_turn_id = @current_turn&.id
+        done_turn    = @turn - 1   # last persisted message turn
+        close_turn!(status: 'done')
         # Pass finish_reason and reasoning_content through so the client can
         # distinguish "model genuinely had nothing to say" (stop, empty
         # content) from "model was cut off mid-output by the context window"
@@ -261,7 +325,8 @@ class AgentSession
         # don't return the field don't get noise.
         emit('done', {
           content:       content.to_s,
-          turn:          turn,
+          turn:          done_turn,
+          agent_turn_id: done_turn_id,
           finish_reason: finish,
           reasoning:     reasoning,
         }.compact)
@@ -280,12 +345,14 @@ class AgentSession
         run_tool_call(call)
       end
     end
+    close_turn!(status: 'error')
     emit('error', { message: "agent exceeded max_turns=#{max_turns}" })
     nil
   rescue => e
     if cancelled?
       emit_stopped(nil)
     else
+      close_turn!(status: 'error')
       emit('error', { message: "#{e.class}: #{e.message}" })
       debug_agent(level: :error,
         message: "error: #{e.class}: #{e.message}",
@@ -300,6 +367,7 @@ class AgentSession
   # Broadcast a cancellation of the current turn to the same audience as
   # other agent events. turn is informational (nil when we bailed mid-HTTP).
   def emit_stopped(turn)
+    close_turn!(status: 'stopped')
     emit('stopped', { reason: 'cancelled', turn: turn }.compact)
     debug_agent(level: :info,
       message: "stopped turn=#{turn.inspect}",
@@ -374,6 +442,7 @@ class AgentSession
       model:    @agent.model,
       messages: outgoing_messages,
       stream:   true,
+      stream_options: { include_usage: true },
     }
     body.merge!(@agent.sampling_params)
     tools = AgentTools.openai_tools_for(@agent.allowed_tool_slugs)
@@ -393,6 +462,7 @@ class AgentSession
     reasoning = +''
     tool_acc  = {}   # index => { 'id', 'type', 'function' => { 'name', 'arguments' } }
     finish    = nil
+    usage     = nil
     buffer    = +''
     saw_sse   = false
 
@@ -420,6 +490,7 @@ class AgentSession
             choice = (json['choices'] || [])[0] || {}
             delta  = choice['delta'] || {}
             finish = choice['finish_reason'] if choice['finish_reason']
+            usage  = json['usage'] if json['usage']
 
             if (c = delta['content']) && !c.empty?
               content << c
@@ -454,6 +525,7 @@ class AgentSession
     end
 
     tool_calls = tool_acc.keys.sort.map { |k| tool_acc[k] }
+    @last_usage = usage
     {
       'choices' => [{
         'message' => {
@@ -464,6 +536,26 @@ class AgentSession
         'finish_reason' => finish,
       }],
     }
+  end
+
+  # ADR-033 phase 2: persist the usage returned on the final SSE chunk, keyed
+  # to the just-appended assistant message (the head of this completion
+  # request). Usage is per-request, not per-message.
+  def record_usage!
+    u = @last_usage
+    @last_usage = nil
+    return unless u.is_a?(Hash) && !u.empty?
+    last = @convo.agent_messages.order(:turn).last
+    return unless last
+    @convo.agent_turn_usage.create!(
+      agent_message:     last,
+      prompt_tokens:     u['prompt_tokens'],
+      completion_tokens: u['completion_tokens'],
+      total_tokens:      u['total_tokens'],
+      cached_tokens:     u.dig('prompt_tokens_details', 'cached_tokens'),
+    )
+  rescue => e
+    puts "[AgentSession] record_usage failed: #{e.class} #{e.message}"
   end
 
   def run_tool_call(call)
@@ -479,6 +571,7 @@ class AgentSession
       allowed_slugs: @agent.allowed_tool_slugs,
       session:       @session,
       project_id:    @project_id,
+      conversation_id: @conversation_id,
       args:          args,
       agent:         @agent,
       cancel_check:  -> { cancelled? },
@@ -583,7 +676,8 @@ class AgentSession
     @convo.append!(turn: @turn, role: role, content: content,
                    tool_calls: persist_calls,
                    tool_call_id: tool_call_id, name: name,
-                   user_id: author_user_id)
+                   user_id: author_user_id,
+                   agent_turn: @current_turn)
     @turn += 1
   rescue => e
     # Persistence failure is logged but does not kill the conversation —

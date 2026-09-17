@@ -4,12 +4,86 @@
 # Heavy lifting (HTTP to model server) runs in EM.defer; these handlers
 # return promptly.
 
+require 'time'
+
 module AgentHandlers
   extend Command::Dispatcher
   namespace 'agent'
 
   def self.list(session, _payload)
-    agents = Agent.enabled.order(:role, :name).map do |a|
+    Command.reply(session, 'agent', 'list', { agents: agent_catalog })
+  end
+  register 'list', :list
+
+  # The ADMIN view: every agent, enabled or not, in the shape the config pane
+  # edits. Distinct from `list` because the catalog is deliberately
+  # enabled-only — a disabled agent must not appear in the picker — while an
+  # admin has to be able to see and re-enable one.
+  def self.all(session, _payload)
+    Command.reply(session, 'agent', 'all', { agents: Agent.order(:role, :slug).map { |a| agent_admin_json(a) } })
+  end
+  register 'all', :all
+
+  # Create or update an agent. Replies with the saved row and broadcasts the
+  # catalog, in this one process, so the write and the notification cannot
+  # disagree — the client no longer has to tell the worker that it saved.
+  #
+  # Payload is the admin shape; `id` present => update, absent => create.
+  # `slug` is settable only on create (immutable after, as before). api_key is
+  # written only when non-blank so re-saving with the field empty preserves the
+  # stored key.
+  def self.save(session, payload)
+    agent = payload['id'].present? ? Agent.find_by(id: payload['id']) : Agent.new
+    unless agent
+      Command.error(session, 'agent/save: no such agent')
+      return
+    end
+
+    attrs = payload.slice('name', 'description', 'role', 'provider_url', 'model',
+                          'system_prompt', 'enabled', 'shell_exec_enabled', 'max_turns')
+    agent.assign_attributes(attrs)
+    # The model normalizes these three on assignment (see Agent#allowed_tools=,
+    # #sampling=, #peak_hours=), so the socket and REST paths cannot drift.
+    agent.allowed_tools = payload['allowed_tools'] if payload.key?('allowed_tools')
+    agent.sampling      = payload['sampling']      if payload.key?('sampling')
+    agent.peak_hours    = payload['peak_hours']    if payload.key?('peak_hours')
+    agent.slug          = payload['slug'].to_s.strip if agent.new_record?
+    agent.api_key       = payload['api_key'] if payload['api_key'].present?
+
+    agent.save! if agent.changed? || agent.new_record?
+
+    Command.reply(session, 'agent', 'saved', { agent: agent_admin_json(agent) })
+    broadcast_catalog(session)
+  rescue ActiveRecord::RecordInvalid => e
+    Command.error(session, "agent/save: #{e.record.errors.full_messages.join(', ')}")
+  end
+  register 'save', :save
+
+  # Delete an agent. Refuses while any conversation references it — the row is
+  # what a conversation's transcript is attributed to, and the REST path
+  # enforced the same rule.
+  def self.destroy(session, payload)
+    agent = Agent.find_by(id: payload['id'])
+    unless agent
+      Command.error(session, 'agent/delete: no such agent')
+      return
+    end
+    if agent.agent_conversations.exists?
+      Command.error(session, 'agent/delete: this agent has conversations and cannot be deleted')
+      return
+    end
+
+    id = agent.id
+    agent.destroy!
+    Command.reply(session, 'agent', 'deleted', { id: id })
+    broadcast_catalog(session)
+  end
+  register 'delete', :destroy
+
+  # The enabled-agent catalog in its wire shape. Shared by list and the
+  # post-write broadcast so the two can never drift.
+  def self.agent_catalog
+    Agent.enabled.order(:role, :name).map do |a|
       {
         slug:        a.slug,
         name:        a.name,
@@ -17,11 +91,43 @@ module AgentHandlers
         role:        a.role,
         model:       a.model,
         tools:       a.allowed_tool_slugs,
+        # Peak-hour windows, each with its own timezone (see
+        # Agent#peak_hours_windows). Empty = none. The client evaluates these
+        # for its badge; the worker itself does not throttle on them.
+        peak_hours:  a.peak_hours_windows,
       }
     end
-    Command.reply(session, 'agent', 'list', { agents: agents })
   end
-  register 'list', :list
+
+  # The admin shape the config pane reads and writes. Mirrors
+  # Api::AgentsController#agent_json so the two paths hand the client the same
+  # object; api_key is never returned, only whether one is set.
+  def self.agent_admin_json(a)
+    {
+      id:                 a.id,
+      slug:               a.slug,
+      name:               a.name,
+      description:        a.description,
+      provider_url:       a.provider_url,
+      model:              a.model,
+      api_key_set:        a.api_key.present?,
+      system_prompt:      a.system_prompt,
+      allowed_tools:      a.allowed_tool_slugs,
+      sampling:           a.sampling_params,
+      peak_hours:         a.peak_hours_windows,
+      role:               a.role,
+      enabled:            a.enabled,
+      shell_exec_enabled: a.shell_exec_enabled,
+      max_turns:          a.max_turns,
+    }
+  end
+
+  # Push the catalog to every socket in the project, origin included: the
+  # picker, meta line and peak-hours badge all render from it, and the saver
+  # needs the update as much as anyone.
+  def self.broadcast_catalog(session)
+    Command.broadcast_project(session.project_id, 'agent', 'list', { agents: agent_catalog })
+  end
 
   # Advertise the tools this worker can make available, so the client builds
   # its per-agent allowlist UI from the live registry rather than a hardcoded
@@ -53,6 +159,9 @@ module AgentHandlers
         owner_is_self:    (c.user_id == session.user_id),
         last_activity_at: c.last_activity_at&.iso8601,
         message_count:    c.agent_messages.count,
+        # ADR-032 fork lineage (nil for root conversations).
+        forked_from_conversation_id: c.forked_from&.uuid,
+        forked_at_turn:             c.forked_at_turn,
       }
     end
     Command.reply(session, 'agent', 'recent', { conversations: items })
@@ -80,6 +189,48 @@ module AgentHandlers
   end
   register 'create', :create
 
+  # ADR-032: fork a conversation at a turn boundary into a new, independent
+  # conversation (deep copy of the prefix). fork_at_turn defaults to the latest
+  # message turn. Authorization mirrors ask (any member for project threads,
+  # owner-only for private).
+  def self.fork_conversation(session, payload)
+    conv  = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/fork: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/fork: conversation is private')
+      return
+    end
+
+    latest = convo.agent_messages.order(:turn).last
+    unless latest
+      Command.error(session, 'agent/fork: conversation has no messages to fork')
+      return
+    end
+    fork_at_turn = payload['fork_at_turn'].to_i
+    fork_at_turn = latest.turn if fork_at_turn <= 0 || fork_at_turn > latest.turn
+
+    forker = User.find_by(id: session.user_id) || convo.user
+    fork = convo.fork_from!(forker: forker, fork_at_turn: fork_at_turn)
+
+    AgentSession.start(session: session, agent: fork.agent,
+                       project_id: fork.project_id,
+                       conversation_id: fork.uuid)
+    AgentSession.subscribe(session, fork.uuid)
+    session.agent_subs << fork.uuid unless session.agent_subs.include?(fork.uuid)
+
+    Command.reply(session, 'agent', 'forked', {
+      conversation_id:            fork.uuid,
+      agent:                      fork.agent.slug,
+      forked_from_conversation_id: conv,
+      forked_at_turn:             fork.forked_at_turn,
+    })
+  end
+  register 'fork', :fork_conversation
+
   def self.load(session, payload)
     conv  = payload['conversation_id'].to_s
     convo = AgentConversation.find_by(uuid: conv)
@@ -94,14 +245,17 @@ module AgentHandlers
 
     # Replay messages in the wire-shape AgentPane already understands.
     # includes(:user) so per-message display-name resolution doesn't N+1.
+    # Each item also carries turn + agent_turn_id (ADR-032) so the client can
+    # group messages into turns and offer per-turn fork points.
     msgs = convo.agent_messages.includes(:user).order(:turn).to_a
     items = msgs.flat_map do |m|
+      base = { turn: m.turn, agent_turn_id: m.agent_turn_id }
       case m.role
       when 'user'
-        [{ kind: 'user', text: m.content.to_s, user_id: m.user_id, name: m.user&.display_name }]
+        [{ kind: 'user', text: m.content.to_s, user_id: m.user_id, name: m.user&.display_name, **base }]
       when 'assistant'
         out = []
-        out << { kind: 'assistant', text: m.content.to_s } if m.content.to_s.strip != ''
+        out << { kind: 'assistant', text: m.content.to_s, **base } if m.content.to_s.strip != ''
         # tool_calls surface as their own UI rows; tool_call_id pairs with
         # the role=tool row that follows.
         (m.tool_calls || []).each do |tc|
@@ -110,12 +264,13 @@ module AgentHandlers
             id:   tc['id'],
             name: tc.dig('function', 'name'),
             args: (JSON.parse(tc.dig('function', 'arguments').to_s) rescue {}),
+            **base,
           }
         end
         out
       when 'tool'
         result = (JSON.parse(m.content.to_s) rescue m.content)
-        [{ kind: 'tool_result', id: m.tool_call_id, name: m.name, result: result }]
+        [{ kind: 'tool_result', id: m.tool_call_id, name: m.name, result: result, **base }]
       else
         [] # 'system' is hidden from UI
       end
@@ -128,10 +283,52 @@ module AgentHandlers
       visibility:      convo.visibility,
       owner_user_id:   convo.user_id,
       owner_is_self:   (convo.user_id == session.user_id),
+      # ADR-032 fork lineage.
+      forked_from_conversation_id: convo.forked_from&.uuid,
+      forked_at_turn:             convo.forked_at_turn,
       messages:        items,
+      usage:           usage_rows(convo),
     })
   end
   register 'load', :load
+
+  # ADR-033 phase 2: per-completion-request usage. Each row carries its logical
+  # AgentTurn id (via the assistant message) and the cached/uncached split so
+  # the client can compute per-turn cost and deltas (turn - last_turn).
+  def self.usage(session, payload)
+    conv  = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/usage: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/usage: conversation is private')
+      return
+    end
+    Command.reply(session, 'agent', 'usage', {
+      conversation_id: conv,
+      rows: usage_rows(convo),
+    })
+  end
+  register 'usage', :usage
+
+  # Usage rows for a conversation, ordered by request time. uncached is the
+  # prompt minus the cached prefix; completion is always full-price output.
+  def self.usage_rows(convo)
+    convo.agent_turn_usage.includes(:agent_message).order(:created_at).map do |u|
+      prompt = u.prompt_tokens.to_i
+      cached = u.cached_tokens.to_i
+      {
+        agent_turn_id:     u.agent_message&.agent_turn_id,
+        turn:              u.agent_message&.turn,
+        prompt_tokens:     prompt,
+        cached_tokens:     cached,
+        uncached_tokens:   [prompt - cached, 0].max,
+        completion_tokens: u.completion_tokens.to_i,
+      }
+    end
+  end
 
   # --- subscribe (delivery membership, #85) ---------------------------------
   # Authorization lives here: a client may subscribe only to a conversation it
@@ -197,6 +394,72 @@ module AgentHandlers
     })
   end
   register 'set_visibility', :set_visibility
+
+  # Change which agent a conversation runs as (#120). The transcript is kept —
+  # the new agent answers subsequent turns — but the row is updated so the
+  # conversation list and the explorer's agent grouping track it.
+  #
+  # Broadcast PROJECT-wide, not just to subscribers: the change affects every
+  # client's conversation list, including clients that don't have this
+  # conversation open. (This is deliberately wider than the subscriber-scoped
+  # fan-out used for stream/tool frames.)
+  def self.set_agent(session, payload)
+    conv  = payload['conversation_id'].to_s
+    slug  = payload['agent_slug'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/set_agent: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/set_agent: conversation is private')
+      return
+    end
+    agent = Agent.enabled.find_by(slug: slug)
+    unless agent
+      Command.error(session, "agent/set_agent: no enabled agent with slug=#{slug}")
+      return
+    end
+
+    convo.update!(agent_id: agent.id)
+    # Re-point a live session so the next turn uses the new agent. The system
+    # prompt already seeded into history is left alone (refresh_agent!).
+    AgentSession.find(conv)&.refresh_agent!(agent)
+
+    change = {
+      conversation_id: conv,
+      agent_slug:      agent.slug,
+      agent_name:      agent.name,
+      agent_id:        agent.id,
+    }
+    Command.broadcast_project(session.project_id, 'agent', 'agent_changed', change)
+    Command.reply(session, 'agent', 'agent_changed', change)
+  end
+  register 'set_agent', :set_agent
+
+  # Rename a conversation (owner-only). The title is otherwise auto-generated
+  # from the first user message; a fork inherits the ancestor's title, which
+  # reads poorly until the forker renames it.
+  def self.rename(session, payload)
+    conv  = payload['conversation_id'].to_s
+    title = payload['title'].to_s.strip
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/rename: conversation not found in this project')
+      return
+    end
+    unless convo.user_id == session.user_id
+      Command.error(session, 'agent/rename: only the owner can rename a conversation')
+      return
+    end
+    if title.empty?
+      Command.error(session, 'agent/rename: title must not be empty')
+      return
+    end
+    convo.update!(title: title)
+    Command.reply(session, 'agent', 'renamed', { conversation_id: conv, title: convo.title })
+  end
+  register 'rename', :rename
 
   # Interrupt an in-flight turn. Any project member who can see the
   # conversation may stop it (project-visible => all members; private => owner
@@ -312,4 +575,157 @@ module AgentHandlers
     end
   end
   register 'ask', :ask
+
+  # ADR-033 phase 1: soft-evict (tombstone) tool results and/or tool call text
+  # from a conversation's history, oldest-first. dry_run returns a preview
+  # without writing. Selected messages keep their rows and structural fields
+  # (turn/tool_call_id/name); only the payload leaves the prompt.
+  def self.clean(session, payload)
+    conv  = payload['conversation_id'].to_s
+    convo = AgentConversation.find_by(uuid: conv)
+    unless convo && convo.project_id == session.project_id
+      Command.error(session, 'agent/clean: conversation not found in this project')
+      return
+    end
+    unless convo.visible_to?(session.user_id)
+      Command.error(session, 'agent/clean: conversation is private')
+      return
+    end
+
+    scope = payload['scope'].to_s
+    scope = 'both' if scope.empty?
+    unless %w[results calls both].include?(scope)
+      Command.error(session, 'agent/clean: scope must be results, calls, or both')
+      return
+    end
+    mode = payload['mode'].to_s
+    unless %w[before_datetime first_n n_size].include?(mode)
+      Command.error(session, 'agent/clean: mode must be before_datetime, first_n, or n_size')
+      return
+    end
+
+    candidates = clean_candidates(convo, scope)
+    selected   = select_candidates(candidates, mode, payload)
+
+    # ADR-033 phase 2: the Resolver's cache-cost verdict on this trim.
+    # removed_tokens is a bytes→token estimate; prompt_tokens comes from the
+    # last recorded request. context_limit is nil for now (ceiling is an open
+    # question) so the verdict is :evict/:extend without :mandatory.
+    last_usage    = convo.agent_turn_usage.order(:created_at).last
+    prompt_tokens = last_usage&.prompt_tokens
+    removed_tokens = selected.sum { |m| (clean_size(m) / 4.0).ceil }
+    resolved = Resolver.resolve(removed_tokens: removed_tokens,
+                                prompt_tokens: prompt_tokens || 0)
+
+    preview = {
+      conversation_id: conv,
+      total_results:   candidates.count { |m| m.role == 'tool' },
+      total_calls:     candidates.count { |m| m.role == 'assistant' },
+      total_bytes:     candidates.sum { |m| clean_size(m) },
+      removed_results: selected.count { |m| m.role == 'tool' },
+      removed_calls:   selected.count { |m| m.role == 'assistant' },
+      bytes_reclaimed: selected.sum { |m| clean_size(m) },
+      prompt_tokens:      prompt_tokens,
+      removed_tokens_estimate: removed_tokens,
+      f:                  resolved.f,
+      surcharge:          resolved.surcharge,
+      break_even_turns:   resolved.break_even_turns,
+      recovery_turns:     resolved.recovery_turns,
+      verdict:            resolved.verdict.to_s,
+    }
+
+    if payload['dry_run']
+      Command.reply(session, 'agent', 'clean_preview', preview)
+      return
+    end
+
+    # Reflect the eviction in the live in-memory @history too (ADR-033 §4).
+    # Reject while a turn is in flight rather than mutate @history mid-loop.
+    sess = AgentSession.find(conv)
+    if sess && !sess.try_begin_turn!
+      Command.error(session, 'agent/clean: a turn is in progress; retry after it finishes')
+      return
+    end
+
+    begin
+      if sess
+        sess.evict!(selected)
+      else
+        # No live session to update a prompt through, so tombstone the rows
+        # directly. evict! does this AND mutates @history; there is no @history
+        # here, and the next load rebuilds from the DB and sees the tombstones.
+        # Replying `cleaned` without this wrote nothing at all: open a
+        # conversation, trim it before the next ask, and the panel reported
+        # success while the DB and the following prompt were unchanged.
+        selected.each(&:tombstone!)
+      end
+      Command.reply(session, 'agent', 'cleaned', {
+        conversation_id: conv,
+        removed_results: preview[:removed_results],
+        removed_calls:   preview[:removed_calls],
+        bytes_reclaimed: preview[:bytes_reclaimed],
+      })
+    ensure
+      sess&.finish_turn!
+    end
+  end
+  register 'clean', :clean
+
+  # Candidate evictable messages in turn order: tool results and/or assistant
+  # rows carrying tool_calls, not already evicted.
+  def self.clean_candidates(convo, scope)
+    convo.agent_messages.not_evicted.order(:turn).to_a.select do |m|
+      case scope
+      when 'results' then m.role == 'tool'
+      when 'calls'   then m.role == 'assistant' && m.tool_calls.present?
+      else                m.role == 'tool' || (m.role == 'assistant' && m.tool_calls.present?)
+      end
+    end
+  end
+
+  # Evictable payload size in bytes: result content, or the sum of a call's
+  # arguments. (Phase 1 measures bytes; token-aware sizing is phase 2.)
+  def self.clean_size(m)
+    case m.role
+    when 'tool'
+      m.content.to_s.bytesize
+    when 'assistant'
+      (m.tool_calls || []).sum { |tc| tc.dig('function', 'arguments').to_s.bytesize }
+    else
+      0
+    end
+  end
+
+  # Front-trim the candidate list per the requested mode.
+  def self.select_candidates(candidates, mode, payload)
+    case mode
+    when 'before_datetime'
+      t = parse_clean_time(payload['cutoff'])
+      return [] unless t
+      candidates.select { |m| m.created_at < t }
+    when 'first_n'
+      n = payload['n'].to_i
+      n.positive? ? candidates.first(n) : []
+    when 'n_size'
+      bytes = payload['bytes'].to_i
+      return [] unless bytes.positive?
+      out   = []
+      total = 0
+      candidates.each do |m|
+        break if total >= bytes
+        out << m
+        total += clean_size(m)
+      end
+      out
+    end
+  end
+
+  def self.parse_clean_time(cutoff)
+    return nil if cutoff.to_s.empty?
+    Time.iso8601(cutoff)
+  rescue ArgumentError
+    Time.parse(cutoff)
+  rescue ArgumentError
+    nil
+  end
 end
