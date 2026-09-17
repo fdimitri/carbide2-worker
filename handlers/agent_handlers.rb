@@ -648,7 +648,17 @@ module AgentHandlers
     end
 
     begin
-      sess.evict!(selected) if sess
+      if sess
+        sess.evict!(selected)
+      else
+        # No live session to update a prompt through, so tombstone the rows
+        # directly. evict! does this AND mutates @history; there is no @history
+        # here, and the next load rebuilds from the DB and sees the tombstones.
+        # Replying `cleaned` without this wrote nothing at all: open a
+        # conversation, trim it before the next ask, and the panel reported
+        # success while the DB and the following prompt were unchanged.
+        selected.each(&:tombstone!)
+      end
       Command.reply(session, 'agent', 'cleaned', {
         conversation_id: conv,
         removed_results: preview[:removed_results],
@@ -656,7 +666,7 @@ module AgentHandlers
         bytes_reclaimed: preview[:bytes_reclaimed],
       })
     ensure
-      sess.finish_turn! if sess
+      sess&.finish_turn!
     end
   end
   register 'clean', :clean

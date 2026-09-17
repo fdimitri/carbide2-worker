@@ -55,7 +55,7 @@ module AgentTools
   # capability gates beyond the allowed_slugs list (currently: shell_exec
   # also requires agent.shell_exec_enabled).
   def self.invoke(slug, allowed_slugs:, session:, project_id:, args:, agent: nil,
-                  cancel_check: nil)
+                  cancel_check: nil, conversation_id: nil)
     unless allowed_slugs.include?(slug)
       return { error: "tool #{slug.inspect} is not allowed for this agent" }
     end
@@ -63,7 +63,8 @@ module AgentTools
     return { error: "unknown tool #{slug.inspect}" } unless entry
     begin
       entry[:callable].call(session: session, project_id: project_id,
-                            args: args, agent: agent, cancel_check: cancel_check)
+                            args: args, agent: agent, cancel_check: cancel_check,
+                            conversation_id: conversation_id)
     rescue => e
       { error: "#{e.class}: #{e.message}" }
     end
@@ -434,7 +435,7 @@ module AgentTools
         },
       },
     }
-  ) do |session:, project_id:, args:, agent:, cancel_check:|
+  ) do |session:, project_id:, args:, agent:, cancel_check:, **_|
     # Two-layer gate: allowed_slugs already passed (we're inside the block);
     # also require the per-agent boolean.
     unless agent&.shell_exec_enabled
@@ -1132,13 +1133,19 @@ module AgentTools
         },
       },
     }
-  ) do |session:, project_id:, args:, **_|
+  ) do |session:, project_id:, args:, conversation_id:, **_|
     tid = args['tool_call_id'].to_s
     next { error: 'tool_call_id is required' } if tid.empty?
-    msgs = AgentMessage.joins(:agent_conversation)
-                       .where(agent_conversations: { project_id: project_id })
-                       .where(tool_call_id: tid, role: 'tool')
-    next { error: "no tool result with tool_call_id #{tid.inspect} in this project" } if msgs.empty?
+
+    # Scoped to THIS conversation. tool_call_id comes from the provider and is
+    # not unique across a project, so matching on it project-wide renewed (or
+    # cleared) another conversation's results — a lease renewed in one thread
+    # silently kept another thread's payload in its prompt.
+    convo = AgentConversation.find_by(uuid: conversation_id)
+    next { error: 'no conversation in scope' } if convo.nil?
+
+    msgs = convo.agent_messages.where(tool_call_id: tid, role: 'tool')
+    next { error: "no tool result with tool_call_id #{tid.inspect} in this conversation" } if msgs.empty?
 
     msgs.each { |m| m.update_column(:expires_at_turn, nil) }
     { tool_call_id: tid, rehydrated: msgs.size }

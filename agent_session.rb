@@ -150,8 +150,16 @@ class AgentSession
   # effect on the next turn. The system prompt already seeded into @history is
   # intentionally left as-is — rewriting an in-flight transcript's system
   # message would be surprising and isn't reversible.
+  #
+  # Mid-turn the swap is DROPPED, not applied: the ask loop reads @agent on
+  # every completion, so writing it here would change model, tools and sampling
+  # under a turn already in flight. Nothing is lost by dropping it — the next
+  # ask calls this again with a freshly loaded record before it takes the turn
+  # lock, so it re-points there.
   def refresh_agent!(agent)
-    @agent = agent if agent
+    return unless agent
+
+    @turn_mutex.synchronize { @agent = agent unless @turn_in_progress }
   end
 
   # ADR-032: open an AgentTurn for the user exchange about to begin. start_turn
@@ -176,8 +184,13 @@ class AgentSession
   # @history immediately so the next turn omits the payload without a reload.
   # @history is in turn order (turns are dense from 0), so a row's `turn`
   # indexes its entry. Tool results set :content to '' (the provider requires
-  # the field on role=tool); assistant rows drop their tool calls' `arguments`
-  # but keep id/name so the pairing survives.
+  # the field on role=tool); assistant rows empty their tool calls' `arguments`
+  # and keep id/name so the pairing survives.
+  #
+  # Both payloads are emptied rather than dropped, matching what the server
+  # writes on reload (AgentMessage#to_history_entry): a function entry without
+  # `arguments` is rejected, so deleting the key here would make the in-memory
+  # send fail where the reloaded one succeeds.
   def evict!(messages)
     messages.each(&:tombstone!)
     messages.each do |m|
@@ -188,7 +201,7 @@ class AgentSession
         entry[:content] = ''
       when 'assistant'
         Array(entry[:tool_calls]).each do |tc|
-          tc['function'].delete('arguments') if tc['function']
+          tc['function']['arguments'] = '' if tc['function']
         end
       end
     end
@@ -558,6 +571,7 @@ class AgentSession
       allowed_slugs: @agent.allowed_tool_slugs,
       session:       @session,
       project_id:    @project_id,
+      conversation_id: @conversation_id,
       args:          args,
       agent:         @agent,
       cancel_check:  -> { cancelled? },

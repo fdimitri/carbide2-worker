@@ -68,10 +68,24 @@ module TermHandlers
       proc do |result|
         if result.is_a?(ShellClient::Handle)
           SHELL_HANDLES[terminal_id] = result
-          finish.call(cmd: result.exec_cmd)
-          # After finish.call, so the new terminal is already in TERMINALS
-          # and the count we report is the real one.
-          report_shell_terminals
+          begin
+            finish.call(cmd: result.exec_cmd)
+            # After finish.call, so the new terminal is already in TERMINALS
+            # and the count we report is the real one.
+            report_shell_terminals
+          rescue => e
+            # TerminalInstance.new spawns the PTY and raises if that fails, so
+            # finish can throw. Without this the exception leaves the
+            # completion callback and nobody cleans up: the handle stays in
+            # SHELL_HANDLES with its exec token on disk, the id is already out
+            # of PENDING, and the client is told nothing. A retry then reuses
+            # the id and overwrites the map without disposing the old handle.
+            SHELL_HANDLES.delete(terminal_id)&.dispose
+            PENDING_TERMINAL_IDS.delete(terminal_id)
+            warn "[term/create] ERROR: #{e.class} #{e.message}\n  " \
+                 "#{Array(e.backtrace).first(5).join("\n  ")}"
+            Command.error(session, "term/create failed: #{e.message}")
+          end
         else
           PENDING_TERMINAL_IDS.delete(terminal_id)
           warn "[term/create] ERROR: #{result.class} #{result.message}\n  " \
