@@ -96,6 +96,10 @@ module FsStore
       handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'merge'
       handle_merge(session, payload, send_fn, broadcast_fn)
+    when 'merge_preview'
+      handle_merge_preview(session, payload, send_fn)
+    when 'merge_resolve'
+      handle_merge_resolve(session, payload, send_fn, broadcast_fn)
     when 'dag'
       handle_dag(session, payload, send_fn)
     when 'create_file'
@@ -492,6 +496,63 @@ module FsStore
       return send_fn.call(session.ws, 'fs', 'merged', reply)
     end
 
+    announce_merge(session, store, node, resolved, source, target, old_head, reply, send_fn, broadcast_fn)
+  end
+
+  # merge_preview — { path, source, target? } -> fs/merge_preview: the
+  # three-way view for a merge tab (DbfsV2::Merge.preview): base / ours
+  # (target) / theirs (source) with their revisions, the regions auto-merge
+  # refused on, `clean`, and `merged` — the exact auto-merge result when clean,
+  # else a diff3 text with markers plus `conflict_blocks` locating them.
+  def self.handle_merge_preview(session, payload, send_fn)
+    path   = payload['path'].to_s.strip
+    source = payload['source'].to_s.strip
+    target = payload['target'].presence || Branch::MAIN
+    node   = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
+
+    p = store_for(session).merge_preview(node.path, target: target, source: source)
+    send_fn.call(session.ws, 'fs', 'merge_preview', p.merge(path: node.path))
+  end
+
+  # merge_resolve — { path, source, target?, content, expected_head,
+  # expected_source_head } commits a human's resolution as a merge commit on
+  # target with source's head as second parent (ADR-036). Both heads are
+  # pinned to what the preview showed: if either advanced since, nothing is
+  # committed and the reply is fs/merged { merged: false, reason: 'stale',
+  # error } so the client re-previews. On success the reply and viewer
+  # broadcast are the same as fs/merge.
+  def self.handle_merge_resolve(session, payload, send_fn, broadcast_fn)
+    path   = payload['path'].to_s.strip
+    source = payload['source'].to_s.strip
+    target = payload['target'].presence || Branch::MAIN
+    node   = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
+    unless payload.key?('content') && payload['expected_head'].present?
+      return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'content and expected_head are required' })
+    end
+
+    store    = store_for(session)
+    resolved = node.resolve || node
+    old_head = payload['expected_head']
+    reply    = { path: node.path, source: source, target: target }
+    begin
+      store.merge(node.path, target: target, source: source, resolved: payload['content'].to_s,
+                             user_id: session.user_id, expected_head: old_head,
+                             expected_source_head: payload['expected_source_head'].presence)
+    rescue DbfsV2::ConflictError => e
+      return send_fn.call(session.ws, 'fs', 'merged', reply.merge(merged: false, reason: 'stale', error: e.message))
+    end
+
+    announce_merge(session, store, node, resolved, source, target, old_head, reply.merge(merged: true), send_fn, broadcast_fn)
+  end
+
+  # After something landed on `target`: reply fs/merged with the new head,
+  # give the target's viewers one set_contents chained to the head they held,
+  # and nudge main's flusher.
+  def self.announce_merge(session, store, node, resolved, source, target, old_head, reply, send_fn, broadcast_fn)
     head = ProjectFs.head_revision_id(resolved, target)
     reply[:head] = head
     send_fn.call(session.ws, 'fs', 'merged', reply)

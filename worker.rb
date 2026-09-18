@@ -177,7 +177,14 @@ PROBE_DEADLINE_SECONDS = 5
 # pinned read; fs/content then carries pinned: true), and fs/viewer_left to the
 # remaining viewers of a (path, branch) when one closes it or disconnects.
 # MIN_CLIENT stays 1: a client that never sends `branch` is on main throughout.
-PROTOCOL   = 8
+# PROTOCOL 9: human merge resolution. fs/merge_preview { path, source, target? }
+# -> fs/merge_preview with base/ours/theirs and their revisions, the regions
+# auto-merge refused on, `clean`, and a `merged` start text (the auto-merge
+# result when clean, else diff3 markers + conflict_blocks). fs/merge_resolve
+# { path, source, target?, content, expected_head, expected_source_head }
+# commits a resolution pinned at both heads and replies fs/merged (reason
+# 'stale' when either head moved). Additive; MIN_CLIENT stays 1.
+PROTOCOL   = 9
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
