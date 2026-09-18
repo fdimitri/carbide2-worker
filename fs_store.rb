@@ -100,6 +100,10 @@ module FsStore
       handle_project_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'project_branch_delete'
       handle_project_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'project_merge_preview'
+      handle_project_merge(session, payload, sessions_by_project, send_fn, broadcast_fn, dry_run: true)
+    when 'project_merge'
+      handle_project_merge(session, payload, sessions_by_project, send_fn, broadcast_fn, dry_run: false)
     when 'merge'
       handle_merge(session, payload, send_fn, broadcast_fn)
     when 'merge_preview'
@@ -526,6 +530,81 @@ module FsStore
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_deleted', frame)
   rescue ActiveRecord::RecordNotFound
     send_fn.call(session.ws, 'fs', 'error', { error: "no project branch #{name}" })
+  end
+
+  # project_merge_preview / project_merge — { source, target?, resolutions? }
+  # merges project branch `source` into `target` (default main; either may be
+  # the other's parent). Preview plans and applies in a transaction that
+  # rolls back; merge commits. Reply fs/project_merge_preview |
+  # fs/project_merged { merged, source, target, base: { branch, seq }, seq,
+  # actions: [{ kind: delete|move|add|content, ... }], conflicts: [{ id, kind,
+  # ours: { path, revision_id }, theirs: {...}, detail }] }. `resolutions` is
+  # { node_id => { action: ours|theirs|path, path? } } for identity
+  # conflicts; content conflicts are settled with fs/merge_resolve first. A
+  # committed merge is announced to the project (fs/project_merged, so
+  # explorers on the target refresh), open viewers of changed files on the
+  # target get fs/set_contents, and main's disk mirror follows.
+  def self.handle_project_merge(session, payload, sessions_by_project, send_fn, broadcast_fn, dry_run:)
+    store  = store_for(session)
+    source = payload['source'].to_s.strip
+    target = payload['target'].presence || Branch::MAIN
+    res    = store.merge_branches(source: source, target: target, resolutions: payload['resolutions'] || {},
+                                  user_id: session.user_id, dry_run: dry_run)
+    if dry_run
+      return send_fn.call(session.ws, 'fs', 'project_merge_preview', res)
+    end
+
+    frame = res.merge(user_id: session.user_id)
+    send_fn.call(session.ws, 'fs', 'project_merged', frame)
+    return unless res[:merged]
+
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_merged', frame)
+    announce_project_merge(session, store, res, broadcast_fn)
+  rescue ArgumentError => e
+    send_fn.call(session.ws, 'fs', 'error', { source: source, target: target, error: e.message })
+  end
+
+  # After a committed project merge: viewers of files whose content moved on
+  # the target hear the new text; when the target is main, disk follows the
+  # applied actions in order (a branch's tree is not on disk).
+  def self.announce_project_merge(session, store, res, broadcast_fn)
+    target  = res[:target]
+    flusher = target == Branch::MAIN ? VFS_FLUSHERS[session.project_id] : nil
+    state   = store.state(branch: target)
+
+    res[:actions].each do |a|
+      case a[:kind]
+      when 'delete'
+        next unless flusher
+        abs = ProjectFs.disk_path(flusher.root_path, a[:path])
+        flusher.suppress(abs) { FileUtils.rm_rf(abs) }
+      when 'move'
+        next unless flusher
+        from = ProjectFs.disk_path(flusher.root_path, a[:from])
+        to   = ProjectFs.disk_path(flusher.root_path, a[:to])
+        next unless File.exist?(from) || File.symlink?(from)
+        flusher.suppress(from, to) { FileUtils.mkdir_p(File.dirname(to)); File.rename(from, to) }
+      when 'add'
+        next unless flusher
+        if a[:ftype] == 'folder'
+          abs = ProjectFs.disk_path(flusher.root_path, a[:path])
+          flusher.suppress(abs) { FileUtils.mkdir_p(abs) }
+        else
+          flusher.record_write(a[:id], 0)
+        end
+      when 'content'
+        entry = state.entries[a[:id]]
+        next unless entry
+        flusher&.record_write(a[:id], 0)
+        doc = OPEN_DOCUMENTS[doc_key(session.project_id, entry.path, target)]
+        next unless doc && !doc.empty?
+        broadcast_fn.call(doc.clients.keys, 'fs', 'set_contents', {
+          path: entry.path, branch: target, content: store.read(entry.path, branch: target),
+          revision: a[:head], parent: a[:ours_revision], user_id: session.user_id,
+          source: "merge #{res[:source]}"
+        })
+      end
+    end
   end
 
   # merge — { path, source, target? } auto-merges `source` into `target`

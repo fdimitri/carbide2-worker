@@ -666,6 +666,45 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert_equal 'main', a.ws.of('tree').last['payload']['branch'], 'a dead branch name falls back to main'
   end
 
+  # A project merge on the wire: preview reports the identity conflict and
+  # applies nothing; the merge with a resolution commits, the project hears,
+  # viewers of a changed file get its text, and disk follows main.
+  def test_17_project_merge_on_the_wire
+    a, b = w[:a], w[:b]
+    a.ws.frames.clear
+    b.ws.frames.clear
+    store.create_folder('/pm')
+    store.create_file('/pm/keep.txt', content: "k\n")
+    store.create_file('/pm/ren.txt', content: "r\n")
+    fs(a, 'project_branch_create', name: 'pm')
+    store.write('/pm/keep.txt', DbfsV2::Delta.new('insertDataSingleLine', { startLine: 0, startChar: 1, data: '-pm' }), branch: 'pm')
+    store.move('/pm/ren.txt', '/pm/theirs.txt', branch: 'pm')
+    store.move('/pm/ren.txt', '/pm/ours.txt')
+    store.create_file('/pm/added.txt', content: "added\n", branch: 'pm')
+    fs(b, 'open', path: '/pm/keep.txt')
+
+    fs(a, 'project_merge_preview', source: 'pm')
+    pre = a.ws.of('project_merge_preview').last['payload']
+    refute pre['merged']
+    assert_equal ['rename/rename'], pre['conflicts'].map { |c| c['kind'] }
+    assert_nil store.find('/pm/added.txt'), 'preview applied nothing'
+
+    fs(a, 'project_merge', source: 'pm', resolutions: { pre['conflicts'][0]['id'] => { action: 'theirs' } })
+    m = a.ws.of('project_merged').last['payload']
+    assert m['merged'], m.inspect
+    assert_equal 'pm', b.ws.of('project_merged').last['payload']['source'], 'the project heard'
+    assert_equal "k-pm\n", store.read('/pm/keep.txt')
+    assert_equal "added\n", store.read('/pm/added.txt')
+    assert store.find('/pm/theirs.txt')
+    assert_nil store.find('/pm/ours.txt')
+    sc = b.ws.of('set_contents').last&.dig('payload')
+    assert sc, "no set_contents; actions=#{m['actions'].inspect} frames=#{b.ws.frames.map { |f| f['cmd'] }.inspect}"
+    assert_equal ['/pm/keep.txt', 'main', "k-pm\n"], sc.values_at('path', 'branch', 'content'), 'the viewer got the merged text'
+    assert em_with_flusher { File.exist?(disk('/pm/theirs.txt')) && !File.exist?(disk('/pm/ours.txt')) }
+    assert em_with_flusher { File.exist?(disk('/pm/added.txt')) && File.read(disk('/pm/added.txt')) == "added\n" }
+    assert em_with_flusher { File.read(disk('/pm/keep.txt')) == "k-pm\n" }
+  end
+
   def flat_paths(node)
     [node['path']] + (node['children'] || []).flat_map { |c| flat_paths(c) }
   end

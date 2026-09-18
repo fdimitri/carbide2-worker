@@ -192,7 +192,10 @@ PROBE_DEADLINE_SECONDS = 5
 # not a project branch means main's tree, as before); fs/tree, created,
 # renamed, deleted frames carry `branch`. fs/read on a project branch of a
 # file it has not written returns the pinned fork content. Disk mirrors main
-# only. Additive; MIN_CLIENT stays 1.
+# only. fs/project_merge_preview / fs/project_merge { source, target?,
+# resolutions? } merge a project branch with its parent (whole tree,
+# identity + content, atomic); fs/project_merged announces a commit.
+# Additive; MIN_CLIENT stays 1.
 PROTOCOL   = 10
 MIN_CLIENT = 1
 
