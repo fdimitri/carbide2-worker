@@ -64,7 +64,9 @@ class Session
     @open_files.delete(path)
   end
 
-  def cleanup
+  # `broadcast_fn` (clients, cs, cmd, payload), when given, tells the remaining
+  # viewers of each open file that this session left (fs/viewer_left).
+  def cleanup(broadcast_fn = nil)
     @terminals.each do |tid|
       TERMINALS[tid]&.remove_client(@ws)
     end
@@ -75,8 +77,7 @@ class Session
     @open_files.dup.each do |key|
       doc = OPEN_DOCUMENTS[key]
       next unless doc
-      doc.remove_client(@ws)
-      OPEN_DOCUMENTS.delete(key) if doc.empty?
+      FsStore.leave_document(self, key, doc, broadcast_fn)
     end
     @open_files.clear
     @session_subs.dup.each do |uuid|

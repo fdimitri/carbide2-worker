@@ -17,6 +17,7 @@
 #   set_contents — replace file content (diffed against the base, mergeable)
 #   branches     — the file's branches with their heads
 #   branch_create— fork a new branch of a file from another branch's head
+#   branch_delete— drop a branch of a file (not main; not while others view it)
 #   merge        — auto-merge one branch of a file into another
 #   create_file  — create a file
 #   create_dir   — create a directory (mkdir -p)
@@ -78,7 +79,7 @@ module FsStore
     when 'open'
       handle_open(session, payload, send_fn)
     when 'close'
-      handle_close(session, payload)
+      handle_close(session, payload, broadcast_fn)
     when 'cursor'
       handle_cursor(session, payload, broadcast_fn)
     when 'write'
@@ -89,6 +90,8 @@ module FsStore
       handle_branches(session, payload, send_fn)
     when 'branch_create'
       handle_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'branch_delete'
+      handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'merge'
       handle_merge(session, payload, send_fn, broadcast_fn)
     when 'create_file'
@@ -221,15 +224,29 @@ module FsStore
     send_fn.call(session.ws, 'fs', 'opened', { path: norm, branch: branch, viewers: doc.viewers })
   end
 
-  # close — unregister this session from a file on a branch
-  def self.handle_close(session, payload)
+  # close — unregister this session from a file on a branch. The remaining
+  # viewers are told (fs/viewer_left) so they drop this session's cursor.
+  def self.handle_close(session, payload, broadcast_fn)
     key = doc_key(session.project_id, normalize(payload['path']), branch_of(payload))
     doc = OPEN_DOCUMENTS[key]
     return unless doc
 
+    leave_document(session, key, doc, broadcast_fn)
+  end
+
+  # Shared by fs/close and Session#cleanup (disconnect).
+  def self.leave_document(session, key, doc, broadcast_fn)
+    return unless doc.member?(session.ws)
+
     doc.remove_client(session.ws)
     session.close_file(key)
-    OPEN_DOCUMENTS.delete(key) if doc.empty?
+    if doc.empty?
+      OPEN_DOCUMENTS.delete(key)
+    elsif broadcast_fn
+      broadcast_fn.call(doc.clients.keys, 'fs', 'viewer_left', {
+        path: doc.path, branch: doc.branch, user_id: session.user_id, name: session.name
+      })
+    end
   end
 
   # cursor — update this session's cursor position and broadcast to co-viewers
@@ -381,6 +398,33 @@ module FsStore
     frame = { path: node.path, name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'branch_created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_created', frame)
+  end
+
+  # branch_delete — { path, name } drops a branch of the file. main cannot be
+  # deleted, nor a branch another session is viewing (they would be editing a
+  # branch that no longer exists); the caller's own view of it is fine — it
+  # moves to main when fs/branch_deleted arrives. History is kept (the store
+  # re-homes the branch's revisions to main). Replies fs/branch_deleted to the
+  # caller and every other session of the project.
+  def self.handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    path = payload['path'].to_s.strip
+    name = payload['name'].to_s.strip
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "cannot delete #{Branch::MAIN}" }) if name == Branch::MAIN
+
+    doc    = OPEN_DOCUMENTS[doc_key(session.project_id, node.path, name)]
+    others = doc ? doc.others(session.ws) : []
+    unless others.empty?
+      return send_fn.call(session.ws, 'fs', 'error', {
+        path: node.path, error: "branch #{name} is open by #{others.size} other viewer#{'s' if others.size != 1}"
+      })
+    end
+
+    store_for(session).delete_branch(node.path, name)
+    frame = { path: node.path, name: name, user_id: session.user_id }
+    send_fn.call(session.ws, 'fs', 'branch_deleted', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_deleted', frame)
   end
 
   # merge — { path, source, target? } auto-merges `source` into `target`

@@ -172,8 +172,9 @@ PROBE_DEADLINE_SECONDS = 5
 # set_contents/written/opened/cursor frames carry `branch`. In fs/written and a
 # refused batch's fs/error the rebase's source is now auto_branch/
 # auto_branch_head (`branch` is the branch written to). New: fs/branches,
-# fs/branch_create, fs/merge. MIN_CLIENT stays 1: a client that never sends
-# `branch` is on main throughout.
+# fs/branch_create, fs/branch_delete, fs/merge, and fs/viewer_left to the
+# remaining viewers of a (path, branch) when one closes it or disconnects.
+# MIN_CLIENT stays 1: a client that never sends `branch` is on main throughout.
 PROTOCOL   = 8
 MIN_CLIENT = 1
 
@@ -702,7 +703,7 @@ EM.run do
             SESSIONS_BY_PROJECT[session.project_id].delete(session)
           end
 
-          session.cleanup
+          session.cleanup(method(:broadcast))
         else
           puts 'Client disconnected before authentication' unless is_probe
         end

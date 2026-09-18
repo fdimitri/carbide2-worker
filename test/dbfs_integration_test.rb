@@ -508,6 +508,28 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert_equal 'bt2', err['batch_id']
     assert err['resync']
 
+    # b joins a on topic, then leaves: a is told, so it can drop b's cursor.
+    fs(b, 'open', path: '/a.txt', branch: 'topic')
+    a.ws.frames.clear
+    fs(b, 'close', path: '/a.txt', branch: 'topic')
+    left = a.ws.of('viewer_left').last['payload']
+    assert_equal ['/a.txt', 'topic', b.user_id], [left['path'], left['branch'], left['user_id']]
+
+    # Deleting a branch someone else is viewing is refused; once they leave,
+    # it goes, everyone hears, and main's history is intact.
+    fs(b, 'open', path: '/a.txt', branch: 'topic')
+    fs(a, 'branch_delete', path: '/a.txt', name: 'topic')
+    assert_match(/open by 1 other viewer/, a.ws.of('error').last['payload']['error'])
+    fs(a, 'branch_delete', path: '/a.txt', name: 'main')
+    assert_match(/cannot delete main/, a.ws.of('error').last['payload']['error'])
+    fs(b, 'close', path: '/a.txt', branch: 'topic')
+    b.ws.frames.clear
+    fs(a, 'branch_delete', path: '/a.txt', name: 'topic')
+    assert_equal 'topic', a.ws.of('branch_deleted').last['payload']['name']
+    assert_equal 'topic', b.ws.of('branch_deleted').last['payload']['name']
+    assert_equal %w[main], store.branches('/a.txt').map { |x| x[:name] }
+    assert_equal "T#{main_before}", store.read('/a.txt'), 'main survives deleting the branch it fast-forwarded to'
+
     fs(a, 'close', path: '/a.txt', branch: 'topic')
     fs(a, 'open', path: '/a.txt')
   end
