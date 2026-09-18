@@ -703,6 +703,12 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert em_with_flusher { File.exist?(disk('/pm/theirs.txt')) && !File.exist?(disk('/pm/ours.txt')) }
     assert em_with_flusher { File.exist?(disk('/pm/added.txt')) && File.read(disk('/pm/added.txt')) == "added\n" }
     assert em_with_flusher { File.read(disk('/pm/keep.txt')) == "k-pm\n" }
+
+    fs(a, 'project_dag', gap_ms: 0)
+    g = a.ws.of('project_dag').last['payload']
+    assert_includes g['branches'].map { |x| x['name'] }, 'pm'
+    assert g['edges'].any? { |e| e['kind'] == 'second_parent' }, 'the merge is drawn'
+    assert g.key?('users')
   end
 
   def flat_paths(node)

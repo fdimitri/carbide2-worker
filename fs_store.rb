@@ -100,6 +100,8 @@ module FsStore
       handle_project_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'project_branch_delete'
       handle_project_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'project_dag'
+      handle_project_dag(session, payload, send_fn)
     when 'project_merge_preview'
       handle_project_merge(session, payload, sessions_by_project, send_fn, broadcast_fn, dry_run: true)
     when 'project_merge'
@@ -530,6 +532,17 @@ module FsStore
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_deleted', frame)
   rescue ActiveRecord::RecordNotFound
     send_fn.call(session.ws, 'fs', 'error', { error: "no project branch #{name}" })
+  end
+
+  # project_dag — { gap_ms? } the project's branches as a rail graph
+  # (ProjectGraph.build): fs/project_dag { gap_ms, heads, branches, nodes,
+  # edges, users }.
+  def self.handle_project_dag(session, payload, send_fn)
+    gap = payload.key?('gap_ms') ? payload['gap_ms'].to_i : DAG_DEFAULT_GAP_MS
+    g   = store_for(session).project_graph(gap_ms: gap)
+    ids = g[:nodes].map { |n| n[:user_id] }.compact.uniq
+    g[:users] = User.where(id: ids).to_h { |u| [u.id, u.display_name] }
+    send_fn.call(session.ws, 'fs', 'project_dag', g)
   end
 
   # project_merge_preview / project_merge — { source, target?, resolutions? }

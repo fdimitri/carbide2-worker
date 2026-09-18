@@ -195,6 +195,7 @@ PROBE_DEADLINE_SECONDS = 5
 # only. fs/project_merge_preview / fs/project_merge { source, target?,
 # resolutions? } merge a project branch with its parent (whole tree,
 # identity + content, atomic); fs/project_merged announces a commit.
+# fs/project_dag { gap_ms? } is the project's branch graph.
 # Additive; MIN_CLIENT stays 1.
 PROTOCOL   = 10
 MIN_CLIENT = 1
