@@ -562,6 +562,44 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     fs(a, 'branch_create', path: '/a.txt', name: 'from-history', at_revision: oldest['first'])
     assert_equal oldest['first'], a.ws.of('branch_created').last['payload']['head']
     assert_equal pinned['content'], store.read('/a.txt', branch: 'from-history')
+
+    # A conflict, and the human path through it: preview shows all three
+    # sides and a marked start text; a resolution pinned at the previewed
+    # heads commits as a merge; a stale pin is refused.
+    store.create_file('/c.txt', content: "one\ntwo\nthree\n", user_id: a.user_id)
+    store.branch('/c.txt', 'topic')
+    store.write('/c.txt', DbfsV2::Delta.new('setContents', { data: "one\nTHEIRS\nthree\n" }), branch: 'topic', user_id: b.user_id)
+    store.write('/c.txt', DbfsV2::Delta.new('setContents', { data: "one\nOURS\nthree\n" }), user_id: a.user_id)
+    fs(a, 'merge', path: '/c.txt', source: 'topic')
+    refused = a.ws.of('merged').last['payload']
+    assert_equal [false, 'conflict'], [refused['merged'], refused['reason']]
+
+    fs(a, 'merge_preview', path: '/c.txt', source: 'topic')
+    pv = a.ws.of('merge_preview').last['payload']
+    assert_equal false, pv['clean']
+    assert_equal ["one\ntwo\nthree\n", "one\nOURS\nthree\n", "one\nTHEIRS\nthree\n"], pv.values_at('base', 'ours', 'theirs')
+    assert_includes pv['merged'], "<<<<<<< main\nOURS\n=======\nTHEIRS\n>>>>>>> topic\n"
+    assert_equal 1, pv['conflict_count']
+    assert_equal ProjectFs.head_revision_id(store.find('/c.txt')), pv['target_head']
+
+    fs(a, 'merge_resolve', path: '/c.txt', source: 'topic', content: "one\nBOTH\nthree\n",
+                           expected_head: SecureRandom.uuid, expected_source_head: pv['source_head'])
+    stale = a.ws.of('merged').last['payload']
+    assert_equal [false, 'stale'], [stale['merged'], stale['reason']]
+    assert_equal "one\nOURS\nthree\n", store.read('/c.txt'), 'a stale pin commits nothing'
+
+    fs(b, 'open', path: '/c.txt')
+    b.ws.frames.clear
+    fs(a, 'merge_resolve', path: '/c.txt', source: 'topic', content: "one\nBOTH\nthree\n",
+                           expected_head: pv['target_head'], expected_source_head: pv['source_head'])
+    done = a.ws.of('merged').last['payload']
+    assert_equal true, done['merged'], done.inspect
+    assert_equal "one\nBOTH\nthree\n", store.read('/c.txt')
+    rev = Revision.find(done['head'])
+    assert_equal [pv['target_head'], pv['source_head']], [rev.parent_id, rev.second_parent_id]
+    sc = b.ws.of('set_contents').last['payload']
+    assert_equal ["one\nBOTH\nthree\n", pv['target_head'], done['head']], sc.values_at('content', 'parent', 'revision')
+    fs(b, 'close', path: '/c.txt')
   end
 
   def test_14_restart_does_not_rewrite_the_tree
