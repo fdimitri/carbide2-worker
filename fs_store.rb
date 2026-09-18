@@ -8,7 +8,8 @@
 #
 # Supported commands (cs: 'fs'):
 #   tree         — full file tree for the session's project
-#   read         — current text content (+ head `revision`) for a file on a branch
+#   read         — current text content (+ head `revision`) for a file on a
+#                  branch, or (`revision_id`) the content at one revision, pinned
 #   read_binary  — base64 chunk of a file's live bytes on disk
 #   stat         — stat-style metadata for a single node
 #   open/close   — register/unregister as a viewer of a file on a branch
@@ -153,6 +154,18 @@ module FsStore
     branch = branch_of(payload)
     unless target.branches.exists?(name: branch)
       return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch, error: "no branch #{branch} on #{node.path}" })
+    end
+
+    # A pinned read: the content AT one revision (history view). Not a branch
+    # head, so the reply says `pinned` and a client must not base edits on it.
+    if (rev = payload['revision_id'].presence)
+      unless Revision.exists?(id: rev, file_node_id: target.id)
+        return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch, error: "no revision #{rev} of #{node.path}" })
+      end
+      return send_fn.call(session.ws, 'fs', 'content', {
+        path: node.path, branch: branch, pinned: true, revision: rev,
+        content: store_for(session).read(node.path, revision_id: rev)
+      })
     end
 
     send_fn.call(session.ws, 'fs', 'content', {
@@ -383,8 +396,10 @@ module FsStore
 
   BRANCH_NAME = %r{\A(?!auto/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\z}
 
-  # branch_create — { path, name, from? } forks `name` at `from`'s head (default
-  # main). Idempotent on an existing name (its head is returned, not moved).
+  # branch_create — { path, name, from?, at_revision? } forks `name` at `from`'s
+  # head (default main), or at `at_revision` (any revision of the file: the
+  # history rail's "branch from here"). Idempotent on an existing name (its
+  # head is returned, not moved).
   # Replies fs/branch_created to the caller and tells every other session of
   # the project, so open pickers for the file can refresh.
   def self.handle_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -397,7 +412,7 @@ module FsStore
       return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad branch name #{name.inspect}" })
     end
 
-    b = store_for(session).branch(node.path, name, from: from)
+    b = store_for(session).branch(node.path, name, from: from, at_revision: payload['at_revision'].presence)
     frame = { path: node.path, name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'branch_created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_created', frame)
