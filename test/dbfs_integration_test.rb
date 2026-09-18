@@ -547,6 +547,20 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert dag['users'].is_a?(Hash), 'authors resolved to names (101/102 are not real users here)'
     fs(a, 'dag', path: '/a.txt', gap_ms: 0, auto: true)
     assert_equal true, a.ws.of('dag').last['payload']['auto']
+
+    # "Load into editor": a pinned read is the content AT a revision, and a
+    # branch can be forked there.
+    oldest = dag['nodes'].first
+    fs(a, 'read', path: '/a.txt', revision_id: oldest['first'])
+    pinned = a.ws.of('content').last['payload']
+    assert_equal true, pinned['pinned']
+    assert_equal oldest['first'], pinned['revision']
+    assert_equal DbfsV2::Content.at(store.find('/a.txt'), oldest['first']), pinned['content']
+    fs(a, 'read', path: '/a.txt', revision_id: SecureRandom.uuid)
+    assert_match(/no revision/, a.ws.of('error').last['payload']['error'])
+    fs(a, 'branch_create', path: '/a.txt', name: 'from-history', at_revision: oldest['first'])
+    assert_equal oldest['first'], a.ws.of('branch_created').last['payload']['head']
+    assert_equal pinned['content'], store.read('/a.txt', branch: 'from-history')
   end
 
   def test_14_restart_does_not_rewrite_the_tree
