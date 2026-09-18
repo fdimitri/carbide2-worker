@@ -602,6 +602,74 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     fs(b, 'close', path: '/c.txt')
   end
 
+  # Project branches on the wire: a fork sees main's tree, edits its own copy,
+  # and main and disk are untouched by it.
+  def test_16_project_branches_on_the_wire
+    a, b = w[:a], w[:b]
+    a.ws.frames.clear
+    b.ws.frames.clear
+    store.create_file('/pb.txt', content: "pb1\n", user_id: a.user_id)
+    fs(a, 'project_branch_create', name: 'feature')
+    created = a.ws.of('project_branch_created').last['payload']['branch']
+    assert_equal ['feature', 'main'], created.values_at('name', 'forked_from')
+    assert_equal 'feature', b.ws.of('project_branch_created').last['payload']['branch']['name'], 'the project heard'
+    fs(a, 'project_branches')
+    assert_equal %w[main feature], a.ws.of('project_branches').last['payload']['branches'].map { |x| x['name'] }
+
+    fs(a, 'tree', branch: 'feature')
+    t = a.ws.of('tree').last['payload']
+    assert_equal 'feature', t['branch']
+    assert_includes flat_paths(t['tree']), '/pb.txt'
+
+    # A read on the branch before any write: the pin, with main's head as revision.
+    fs(a, 'read', path: '/pb.txt', branch: 'feature')
+    c = a.ws.of('content').last['payload']
+    assert_equal ["pb1\n", 'feature', ProjectFs.head_revision_id(store.find('/pb.txt'))], c.values_at('content', 'branch', 'revision')
+
+    # Write on the branch, anchored at that revision: main unchanged, disk unchanged.
+    fs(a, 'write', path: '/pb.txt', branch: 'feature', base_revision_id: c['revision'], batch_id: 'pb-1',
+                   changes: [{ change_type: 'insertDataSingleLine', change_data: { startLine: 0, startChar: 3, data: '-feature' }.to_json }])
+    w = a.ws.of('written').last['payload']
+    assert_equal ['feature', 'append'], w.values_at('branch', 'mode'), w.inspect
+    assert_equal "pb1-feature\n", store.read('/pb.txt', branch: 'feature')
+    assert_equal "pb1\n", store.read('/pb.txt')
+    sleep 1.0
+    assert_equal "pb1\n", File.read(disk('/pb.txt')), 'disk mirrors main only'
+
+    # Existence on the branch: create, rename, delete; main's tree does not move.
+    fs(a, 'create_file', path: '/only-feature.txt', content: "of\n", branch: 'feature')
+    assert_equal ['/only-feature.txt', 'feature'], a.ws.of('created').last['payload'].values_at('path', 'branch')
+    assert_equal 'feature', b.ws.of('created').last['payload']['branch']
+    fs(a, 'rename', path: '/pb.txt', new_name: 'pb-renamed.txt', branch: 'feature')
+    assert_equal ['/pb.txt', '/pb-renamed.txt', 'feature'], a.ws.of('renamed').last['payload'].values_at('old_path', 'new_path', 'branch')
+    fs(a, 'delete', path: '/run.sh', branch: 'feature')
+    assert_equal ['/run.sh', 'feature'], a.ws.of('deleted').last['payload'].values_at('path', 'branch')
+    fs(a, 'tree', branch: 'feature')
+    fp = flat_paths(a.ws.of('tree').last['payload']['tree'])
+    assert_includes fp, '/only-feature.txt'
+    assert_includes fp, '/pb-renamed.txt'
+    refute_includes fp, '/pb.txt'
+    refute_includes fp, '/run.sh'
+    fs(a, 'tree')
+    mp = flat_paths(a.ws.of('tree').last['payload']['tree'])
+    assert_includes mp, '/pb.txt'
+    assert_includes mp, '/run.sh'
+    refute_includes mp, '/only-feature.txt'
+    assert File.exist?(disk('/run.sh')), 'a branch delete does not touch disk'
+    assert_equal "pb1-feature\n", store.read('/pb-renamed.txt', branch: 'feature'), 'history followed the rename'
+
+    fs(a, 'project_branch_delete', name: 'feature')
+    assert_equal 'feature', a.ws.of('project_branch_deleted').last['payload']['name']
+    fs(a, 'project_branches')
+    assert_equal %w[main], a.ws.of('project_branches').last['payload']['branches'].map { |x| x['name'] }
+    fs(a, 'tree', branch: 'feature')
+    assert_equal 'main', a.ws.of('tree').last['payload']['branch'], 'a dead branch name falls back to main'
+  end
+
+  def flat_paths(node)
+    [node['path']] + (node['children'] || []).flat_map { |c| flat_paths(c) }
+  end
+
   def test_14_restart_does_not_rewrite_the_tree
     sleep 1.1
     mtimes = %w[/a.txt /run.sh].to_h { |p| [p, File.mtime(disk(p))] }
