@@ -166,7 +166,15 @@ PROBE_DEADLINE_SECONDS = 5
 # frames carry `parent`; a refused rebase's fs/error names the branch holding
 # the batch; a resent batch_id gets the original reply. Blind writes are
 # unchanged, so MIN_CLIENT stays 1.
-PROTOCOL   = 7
+# PROTOCOL 8: per-file branches on the wire. fs/open, fs/close, fs/cursor,
+# fs/read, fs/write and fs/set_contents take an optional `branch` (default
+# main); a viewer subscribes to one (path, branch), and content/change/
+# set_contents/written/opened/cursor frames carry `branch`. In fs/written and a
+# refused batch's fs/error the rebase's source is now auto_branch/
+# auto_branch_head (`branch` is the branch written to). New: fs/branches,
+# fs/branch_create, fs/merge. MIN_CLIENT stays 1: a client that never sends
+# `branch` is on main throughout.
+PROTOCOL   = 8
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
@@ -233,7 +241,7 @@ end
 # ---------------------------------------------------------------------------
 TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
-OPEN_DOCUMENTS      = {}        # "#{project_id}:#{path}" => OpenDocument
+OPEN_DOCUMENTS      = {}        # FsStore.doc_key(project_id, path, branch) => OpenDocument
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 SHELL_HANDLES       = {}        # terminal_id (int) => ShellClient::Handle
 SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]

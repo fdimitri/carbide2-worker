@@ -8,13 +8,16 @@
 #
 # Supported commands (cs: 'fs'):
 #   tree         — full file tree for the session's project
-#   read         — current text content (+ head `revision`) for a file
+#   read         — current text content (+ head `revision`) for a file on a branch
 #   read_binary  — base64 chunk of a file's live bytes on disk
 #   stat         — stat-style metadata for a single node
-#   open/close   — register/unregister as a viewer of a file
-#   cursor       — broadcast this session's cursor to co-viewers
-#   write        — apply one or more change operations to a file
+#   open/close   — register/unregister as a viewer of a file on a branch
+#   cursor       — broadcast this session's cursor to co-viewers of that branch
+#   write        — apply one or more change operations to a file on a branch
 #   set_contents — replace file content (diffed against the base, mergeable)
+#   branches     — the file's branches with their heads
+#   branch_create— fork a new branch of a file from another branch's head
+#   merge        — auto-merge one branch of a file into another
 #   create_file  — create a file
 #   create_dir   — create a directory (mkdir -p)
 #   rename       — rename a file or directory
@@ -22,6 +25,12 @@
 #   import_git   — clone a repo into an empty project and load it
 #
 # `revision` values on the wire are revision UUID strings (PROTOCOL 6).
+#
+# Branches are per file (DbfsV2: a Branch row per file_node). Every command
+# that names a file takes an optional `branch` (default main), and a viewer is
+# subscribed to one (path, branch): edits on a branch are only broadcast to
+# viewers of that branch. Only main is flushed to disk (VfsFlusher), so branch
+# edits live in the store until merged.
 
 require 'base64'
 require 'fileutils'
@@ -76,6 +85,12 @@ module FsStore
       handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'set_contents'
       handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'branches'
+      handle_branches(session, payload, send_fn)
+    when 'branch_create'
+      handle_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'merge'
+      handle_merge(session, payload, send_fn, broadcast_fn)
     when 'create_file'
       handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'create_dir'
@@ -90,10 +105,26 @@ module FsStore
       send_fn.call(session.ws, 'fs', 'error', { message: "unknown fs cmd: #{cmd}" })
     end
   rescue ActiveRecord::RecordNotFound => e
-    send_fn.call(session.ws, 'fs', 'error', { message: "not found: #{e.message}" })
+    send_fn.call(session.ws, 'fs', 'error', error_frame(cmd, payload, "not found: #{e.message}"))
   rescue => e
     puts "[FsStore] ERROR #{e.class}: #{e.message}\n#{e.backtrace.first(3).join("\n")}"
-    send_fn.call(session.ws, 'fs', 'error', { message: e.message })
+    send_fn.call(session.ws, 'fs', 'error', error_frame(cmd, payload, e.message))
+  end
+
+  WRITE_CMDS = %w[write set_contents].freeze
+
+  # An error the client can attribute: it echoes the path, branch and batch_id
+  # of the command that failed. For a write it also says resync — nothing was
+  # committed and the client's queue is based on a view it should re-read.
+  def self.error_frame(cmd, payload, message)
+    frame = { message: message, error: message }
+    if payload.is_a?(Hash)
+      frame[:path]     = payload['path'] if payload['path']
+      frame[:branch]   = branch_of(payload) if payload['path']
+      frame[:batch_id] = payload['batch_id'] if payload['batch_id']
+    end
+    frame[:resync] = true if WRITE_CMDS.include?(cmd)
+    frame
   end
 
   # -------------------------------------------------------------------------
@@ -113,10 +144,16 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'dangling symlink' }) unless target
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if target.binary?
 
+    branch = branch_of(payload)
+    unless target.branches.exists?(name: branch)
+      return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch, error: "no branch #{branch} on #{node.path}" })
+    end
+
     send_fn.call(session.ws, 'fs', 'content', {
       path:     node.path,
-      content:  store_for(session).read(node.path),
-      revision: ProjectFs.head_revision_id(target)
+      branch:   branch,
+      content:  store_for(session).read(node.path, branch: branch),
+      revision: ProjectFs.head_revision_id(target, branch)
     })
   end
 
@@ -167,38 +204,40 @@ module FsStore
     send_fn.call(session.ws, 'fs', 'stat', store_for(session).stat(path))
   end
 
-  # open — register this session as viewing a file; receive its peer viewer list
+  # open — register this session as viewing a file on a branch; receive that
+  # branch's peer viewer list
   def self.handle_open(session, payload, send_fn)
     path = payload['path'].to_s.strip
     node = find_node!(session.project_id, path)
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    norm = node.path
-    key  = "#{session.project_id}:#{norm}"
-    doc  = OPEN_DOCUMENTS[key] ||= OpenDocument.new(session.project_id, norm)
+    norm   = node.path
+    branch = branch_of(payload)
+    key    = doc_key(session.project_id, norm, branch)
+    doc    = OPEN_DOCUMENTS[key] ||= OpenDocument.new(session.project_id, norm, branch)
     doc.add_client(session.ws, user_id: session.user_id, name: session.name)
-    session.open_file(norm)
+    session.open_file(key)
 
-    send_fn.call(session.ws, 'fs', 'opened', { path: norm, viewers: doc.viewers })
+    send_fn.call(session.ws, 'fs', 'opened', { path: norm, branch: branch, viewers: doc.viewers })
   end
 
-  # close — unregister this session from a file
+  # close — unregister this session from a file on a branch
   def self.handle_close(session, payload)
-    norm = normalize(payload['path'])
-    key  = "#{session.project_id}:#{norm}"
-    doc  = OPEN_DOCUMENTS[key]
+    key = doc_key(session.project_id, normalize(payload['path']), branch_of(payload))
+    doc = OPEN_DOCUMENTS[key]
     return unless doc
 
     doc.remove_client(session.ws)
-    session.close_file(norm)
+    session.close_file(key)
     OPEN_DOCUMENTS.delete(key) if doc.empty?
   end
 
   # cursor — update this session's cursor position and broadcast to co-viewers
+  # of the same branch
   def self.handle_cursor(session, payload, broadcast_fn)
-    norm = normalize(payload['path'])
-    key  = "#{session.project_id}:#{norm}"
-    doc  = OPEN_DOCUMENTS[key]
+    norm   = normalize(payload['path'])
+    branch = branch_of(payload)
+    doc    = OPEN_DOCUMENTS[doc_key(session.project_id, norm, branch)]
     return unless doc&.member?(session.ws)
 
     line = payload['line'].to_i
@@ -207,6 +246,7 @@ module FsStore
 
     broadcast_fn.call(doc.others(session.ws), 'fs', 'cursor', {
       path:    norm,
+      branch:  branch,
       user_id: session.user_id,
       name:    session.name,
       line:    line,
@@ -237,10 +277,11 @@ module FsStore
           DbfsV2::Delta.parse(ch['change_type'].to_s, data.is_a?(Hash) ? data : data.to_s)
         end
       rescue JSON::ParserError => e
-        return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad change_data: #{e.message}", resync: true })
+        return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch_of(payload), batch_id: payload['batch_id'],
+                                                         error: "bad change_data: #{e.message}", resync: true })
       end
     commit_and_broadcast(session, node.path, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn,
-                         batch_id: payload['batch_id'].presence)
+                         batch_id: payload['batch_id'].presence, branch: branch_of(payload))
   end
 
   def self.handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -252,23 +293,25 @@ module FsStore
 
     delta = DbfsV2::Delta.new('setContents', { data: content })
     commit_and_broadcast(session, node.path, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn,
-                         batch_id: payload['batch_id'].presence)
+                         batch_id: payload['batch_id'].presence, branch: branch_of(payload))
   end
 
-  # Persist `deltas` (ProjectFs.write_batch!: blind, anchored append, or
-  # auto-branch + rebase), reply fs/written to the author, send the other
-  # viewers one frame per revision that landed on main, and nudge the flusher.
+  # Persist `deltas` on `branch` (ProjectFs.write_batch!: blind, anchored
+  # append, or auto-branch + rebase), reply fs/written to the author, send the
+  # other viewers of that branch one frame per revision that landed, and — on
+  # main only — nudge the flusher.
   #
-  # Failures commit nothing on main and come back as fs/error with resync set:
-  # conflict: true when an anchored batch overlapped a concurrent replace (its
-  # revisions are kept on `branch`), or when the base is unknown.
+  # Failures commit nothing on the branch and come back as fs/error with resync
+  # set: conflict: true when an anchored batch overlapped a concurrent replace
+  # (its revisions are kept on `auto_branch`), or when the base is unknown.
   #
   # `batch_id` (client-chosen, optional) makes a retried batch idempotent: a
   # client that lost its connection before the reply resends the same batch_id,
   # and gets the original reply instead of the batch being applied twice. The
   # memory is per worker process (RecentBatches), so it covers socket drops, not
   # a worker restart.
-  def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn, batch_id: nil)
+  def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn,
+                                batch_id: nil, branch: Branch::MAIN)
     key = batch_id && "#{session.project_id}:#{session.user_id}:#{batch_id}"
     if key && (replay = RecentBatches.get(key))
       return send_fn.call(session.ws, 'fs', replay[0], replay[1])
@@ -283,19 +326,20 @@ module FsStore
     node  = store.resolve(path)
     result =
       begin
-        ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id)
+        ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id,
+                               branch: branch)
       rescue ProjectFs::BranchConflict => e
-        return reply.call('error', { path: path, error: e.message, conflict: true, resync: true,
-                                     branch: e.branch, branch_head: e.branch_head })
+        return reply.call('error', { path: path, branch: branch, error: e.message, conflict: true, resync: true,
+                                     auto_branch: e.branch, auto_branch_head: e.branch_head })
       rescue DbfsV2::ConflictError => e
-        return reply.call('error', { path: path, error: e.message, conflict: true, resync: true })
+        return reply.call('error', { path: path, branch: branch, error: e.message, conflict: true, resync: true })
       rescue ArgumentError, JSON::ParserError, RegexpError, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotFound => e
-        return reply.call('error', { path: path, error: e.message, resync: true })
+        return reply.call('error', { path: path, branch: branch, error: e.message, resync: true })
       end
 
     reply.call('written', ProjectFs.batch_ack(path, result, node))
 
-    doc   = OPEN_DOCUMENTS["#{session.project_id}:#{path}"]
+    doc   = OPEN_DOCUMENTS[doc_key(session.project_id, path, branch)]
     peers = doc ? doc.others(session.ws) : []
     unless peers.empty?
       ProjectFs.batch_peer_frames(path, result, node, user_id: session.user_id).each do |cmd, frame|
@@ -303,7 +347,84 @@ module FsStore
       end
     end
 
+    return unless branch == Branch::MAIN
+
     VFS_FLUSHERS[session.project_id]&.record_write(node.id, result.revisions.sum { |r| r.change_data.to_s.bytesize })
+  end
+
+  # branches — { path } -> fs/branches { path, branches: [{ name, head }] }
+  def self.handle_branches(session, payload, send_fn)
+    path = payload['path'].to_s.strip
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+
+    send_fn.call(session.ws, 'fs', 'branches', { path: node.path, branches: store_for(session).branches(node.path) })
+  end
+
+  BRANCH_NAME = %r{\A(?!auto/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\z}
+
+  # branch_create — { path, name, from? } forks `name` at `from`'s head (default
+  # main). Idempotent on an existing name (its head is returned, not moved).
+  # Replies fs/branch_created to the caller and tells every other session of
+  # the project, so open pickers for the file can refresh.
+  def self.handle_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    path = payload['path'].to_s.strip
+    name = payload['name'].to_s.strip
+    from = payload['from'].presence || Branch::MAIN
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    unless BRANCH_NAME.match?(name)
+      return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad branch name #{name.inspect}" })
+    end
+
+    b = store_for(session).branch(node.path, name, from: from)
+    frame = { path: node.path, name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id }
+    send_fn.call(session.ws, 'fs', 'branch_created', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_created', frame)
+  end
+
+  # merge — { path, source, target? } auto-merges `source` into `target`
+  # (default main): fast-forward, replay of the source's edits as OT, or a
+  # three-way content merge; conflicts are refused. Replies fs/merged
+  # { path, source, target, merged, head?, reason?, conflicts? }. When something
+  # landed, viewers of the target get one set_contents frame chained to the head
+  # they held, and main's flusher is nudged.
+  def self.handle_merge(session, payload, send_fn, broadcast_fn)
+    path   = payload['path'].to_s.strip
+    source = payload['source'].to_s.strip
+    target = payload['target'].presence || Branch::MAIN
+    node   = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
+
+    store    = store_for(session)
+    resolved = node.resolve || node
+    old_head = ProjectFs.head_revision_id(resolved, target)
+    res      = store.merge(node.path, target: target, source: source, auto: true, user_id: session.user_id)
+
+    reply = { path: node.path, source: source, target: target, merged: res[:merged] == true }
+    unless reply[:merged]
+      reply[:reason]    = res[:reason]
+      reply[:error]     = res[:error] if res[:error]
+      reply[:conflicts] = res[:conflicts] if res[:conflicts]
+      return send_fn.call(session.ws, 'fs', 'merged', reply)
+    end
+
+    head = ProjectFs.head_revision_id(resolved, target)
+    reply[:head] = head
+    send_fn.call(session.ws, 'fs', 'merged', reply)
+
+    doc = OPEN_DOCUMENTS[doc_key(session.project_id, node.path, target)]
+    if doc && !doc.empty? && head != old_head
+      broadcast_fn.call(doc.clients.keys, 'fs', 'set_contents', {
+        path: node.path, branch: target, content: store.read(node.path, branch: target),
+        revision: head, parent: old_head, user_id: session.user_id, source: "merge #{source}"
+      })
+    end
+
+    return unless target == Branch::MAIN
+
+    VFS_FLUSHERS[session.project_id]&.record_write(resolved.id, 0)
   end
 
   def self.handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -528,6 +649,16 @@ module FsStore
     p = "/#{p}" unless p.start_with?('/')
     p = p.chomp('/')
     p.empty? ? '/' : p
+  end
+
+  # The branch a command names, main when it doesn't.
+  def self.branch_of(payload)
+    payload.is_a?(Hash) ? (payload['branch'].to_s.strip.presence || Branch::MAIN) : Branch::MAIN
+  end
+
+  # OPEN_DOCUMENTS key: one viewer set per (project, path, branch).
+  def self.doc_key(project_id, path, branch = Branch::MAIN)
+    "#{project_id}:#{path}@#{branch}"
   end
 
   def self.find_node!(project_id, path)

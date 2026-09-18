@@ -21,7 +21,7 @@ class Session
     @token_exp     = nil
     @terminals     = []  # terminal_ids joined
     @rooms         = []  # room_ids joined
-    @open_files    = []  # normalized paths currently open
+    @open_files    = []  # OPEN_DOCUMENTS keys (path + branch) currently open
     @session_subs  = []  # browser-session uuids this ws is subscribed to
     @agent_subs    = []  # agent conversation ids this ws is subscribed to (#85)
     pin_principal(payload) if payload
@@ -71,8 +71,8 @@ class Session
     @rooms.each do |rid|
       CHAT_ROOMS[rid]&.remove_client(@ws)
     end
-    @open_files.dup.each do |path|
-      key = "#{@project_id}:#{path}"
+    # @open_files holds OPEN_DOCUMENTS keys (FsStore.doc_key: project, path, branch).
+    @open_files.dup.each do |key|
       doc = OPEN_DOCUMENTS[key]
       next unless doc
       doc.remove_client(@ws)

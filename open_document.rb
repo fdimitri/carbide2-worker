@@ -1,12 +1,13 @@
-# OpenDocument — tracks which clients have a specific file open.
-# Only those clients receive fs:change broadcasts for that file.
-# Mirrors the ChatRoom subscriber pattern.
+# OpenDocument — tracks which clients have a specific file open on a specific
+# branch. Only those clients receive fs:change broadcasts for that (path,
+# branch). Mirrors the ChatRoom subscriber pattern.
 class OpenDocument
-  attr_reader :path, :project_id, :clients
+  attr_reader :path, :branch, :project_id, :clients
 
-  def initialize(project_id, path)
+  def initialize(project_id, path, branch = Branch::MAIN)
     @project_id = project_id
     @path       = path   # normalized with leading /
+    @branch     = branch
     @clients    = {}     # ws => { user_id:, name: }
   end
 
