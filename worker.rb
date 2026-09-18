@@ -184,7 +184,16 @@ PROBE_DEADLINE_SECONDS = 5
 # { path, source, target?, content, expected_head, expected_source_head }
 # commits a resolution pinned at both heads and replies fs/merged (reason
 # 'stale' when either head moved). Additive; MIN_CLIENT stays 1.
-PROTOCOL   = 9
+# PROTOCOL 10: project branches (ADR-042). fs/project_branches,
+# fs/project_branch_create { name, from? }, fs/project_branch_delete { name }
+# (+ _created/_deleted broadcasts). `branch` on fs/tree, stat, create_file,
+# create_dir, rename, delete, branches, branch_create, branch_delete, dag,
+# merge* selects the project branch whose tree the op acts on (a name that is
+# not a project branch means main's tree, as before); fs/tree, created,
+# renamed, deleted frames carry `branch`. fs/read on a project branch of a
+# file it has not written returns the pinned fork content. Disk mirrors main
+# only. Additive; MIN_CLIENT stays 1.
+PROTOCOL   = 10
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------

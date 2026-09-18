@@ -71,7 +71,7 @@ module FsStore
   def self.handle(session, cmd, payload, sessions_by_project, send_fn, broadcast_fn)
     case cmd
     when 'tree'
-      handle_tree(session, send_fn)
+      handle_tree(session, payload, send_fn)
     when 'read'
       handle_read(session, payload, send_fn)
     when 'read_binary'
@@ -94,6 +94,12 @@ module FsStore
       handle_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'branch_delete'
       handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'project_branches'
+      handle_project_branches(session, send_fn)
+    when 'project_branch_create'
+      handle_project_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'project_branch_delete'
+      handle_project_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'merge'
       handle_merge(session, payload, send_fn, broadcast_fn)
     when 'merge_preview'
@@ -142,13 +148,19 @@ module FsStore
   # Handlers
   # -------------------------------------------------------------------------
 
-  def self.handle_tree(session, send_fn)
-    send_fn.call(session.ws, 'fs', 'tree', { tree: ProjectFs.tree_json(session.project_id) })
+  # tree — { branch? } the whole tree as main (tree_json) or a project branch
+  # (its index) has it. The reply names the branch so an explorer can ignore a
+  # tree for a view it is not showing.
+  def self.handle_tree(session, payload, send_fn)
+    store  = store_for(session)
+    branch = view_branch(store, payload)
+    tree   = branch == Branch::MAIN ? ProjectFs.tree_json(session.project_id) : store.tree('/', branch: branch)
+    send_fn.call(session.ws, 'fs', 'tree', { tree: tree, branch: branch })
   end
 
   def self.handle_read(session, payload, send_fn)
     path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     target = node.resolve
@@ -156,7 +168,9 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if target.binary?
 
     branch = branch_of(payload)
-    unless target.branches.exists?(name: branch)
+    # A project branch reads a file it has not written from its pin: no
+    # per-file row yet is fine there.
+    unless store_for(session).project_branch(branch) || target.branches.exists?(name: branch)
       return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch, error: "no branch #{branch} on #{node.path}" })
     end
 
@@ -168,7 +182,7 @@ module FsStore
       end
       return send_fn.call(session.ws, 'fs', 'content', {
         path: node.path, branch: branch, pinned: true, revision: rev,
-        content: store_for(session).read(node.path, revision_id: rev)
+        content: store_for(session).read(node.path, revision_id: rev, branch: branch)
       })
     end
 
@@ -187,7 +201,7 @@ module FsStore
   # Reply:   { path:, offset:, length: (actual), size: (total), eof: bool, data: base64 }
   def self.handle_read_binary(session, payload, send_fn)
     path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     flusher = VFS_FLUSHERS[session.project_id]
@@ -223,15 +237,15 @@ module FsStore
   # stat — metadata snapshot for the explorer Properties panel (#5).
   def self.handle_stat(session, payload, send_fn)
     path = payload['path'].to_s.strip
-    find_node!(session.project_id, path)
-    send_fn.call(session.ws, 'fs', 'stat', store_for(session).stat(path))
+    find_node!(session.project_id, path, branch_of(payload))
+    send_fn.call(session.ws, 'fs', 'stat', store_for(session).stat(path, branch: branch_of(payload)))
   end
 
   # open — register this session as viewing a file on a branch; receive that
   # branch's peer viewer list
   def self.handle_open(session, payload, send_fn)
     path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     norm   = node.path
@@ -304,7 +318,7 @@ module FsStore
     changes = Array(payload['changes'])
     return send_fn.call(session.ws, 'fs', 'error', { path: path, message: 'no changes provided' }) if changes.empty?
 
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     deltas =
@@ -325,7 +339,7 @@ module FsStore
     path    = payload['path'].to_s.strip
     content = payload['content'].to_s.dup.force_encoding('UTF-8')
     content = content.scrub('') unless content.valid_encoding?
-    node    = find_node!(session.project_id, path)
+    node    = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     delta = DbfsV2::Delta.new('setContents', { data: content })
@@ -392,10 +406,10 @@ module FsStore
   # branches — { path } -> fs/branches { path, branches: [{ name, head }] }
   def self.handle_branches(session, payload, send_fn)
     path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    send_fn.call(session.ws, 'fs', 'branches', { path: node.path, branches: store_for(session).branches(node.path) })
+    send_fn.call(session.ws, 'fs', 'branches', { path: node.path, branches: store_for(session).branches(node.path, branch: branch_of(payload)) })
   end
 
   BRANCH_NAME = %r{\A(?!auto/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\z}
@@ -410,13 +424,14 @@ module FsStore
     path = payload['path'].to_s.strip
     name = payload['name'].to_s.strip
     from = payload['from'].presence || Branch::MAIN
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
     unless BRANCH_NAME.match?(name)
       return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad branch name #{name.inspect}" })
     end
 
-    b = store_for(session).branch(node.path, name, from: from, at_revision: payload['at_revision'].presence)
+    b = store_for(session).branch(node.path, name, from: from, at_revision: payload['at_revision'].presence,
+                                  branch: branch_of(payload))
     frame = { path: node.path, name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'branch_created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_created', frame)
@@ -431,7 +446,7 @@ module FsStore
   def self.handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path = payload['path'].to_s.strip
     name = payload['name'].to_s.strip
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "cannot delete #{Branch::MAIN}" }) if name == Branch::MAIN
 
@@ -443,7 +458,7 @@ module FsStore
       })
     end
 
-    store_for(session).delete_branch(node.path, name)
+    store_for(session).delete_branch(node.path, name, branch: branch_of(payload))
     frame = { path: node.path, name: name, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'branch_deleted', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_deleted', frame)
@@ -458,15 +473,59 @@ module FsStore
 
   def self.handle_dag(session, payload, send_fn)
     path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path)
+    node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
     gap  = payload.key?('gap_ms') ? payload['gap_ms'].to_i : DAG_DEFAULT_GAP_MS
     auto = payload['auto'] == true
-    g    = store_for(session).dag_condensed(node.path, gap_ms: gap, auto: auto)
+    g    = store_for(session).dag_condensed(node.path, gap_ms: gap, auto: auto, branch: branch_of(payload))
     ids  = g[:nodes].map { |n| n[:user_id] }.compact.uniq
     g[:users] = User.where(id: ids).to_h { |u| [u.id, u.display_name] }
     send_fn.call(session.ws, 'fs', 'dag', g)
+  end
+
+  # --- project branches (ADR-042) ---------------------------------------------
+  #
+  # project_branches -> fs/project_branches { branches: [{ id, name,
+  # forked_from, fork_seq, seq, deleted, materialized }] }, main first.
+  def self.handle_project_branches(session, send_fn)
+    send_fn.call(session.ws, 'fs', 'project_branches',
+                 { branches: store_for(session).project_branches.map(&:to_h) })
+  end
+
+  # project_branch_create — { name, from? } forks a project branch off `from`
+  # (default main): a full copy of its tree, content pinned at the fork.
+  # Replies fs/project_branch_created { branch } and tells the project.
+  def self.handle_project_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    name = payload['name'].to_s.strip
+    from = payload['from'].presence || Branch::MAIN
+    unless BRANCH_NAME.match?(name) && name != Branch::MAIN
+      return send_fn.call(session.ws, 'fs', 'error', { error: "bad branch name #{name.inspect}" })
+    end
+    store = store_for(session)
+    if store.project_branch(name)
+      return send_fn.call(session.ws, 'fs', 'error', { error: "project branch #{name} exists" })
+    end
+
+    pb = store.create_project_branch(name, from: from, user_id: session.user_id)
+    frame = { branch: pb.to_h, user_id: session.user_id }
+    send_fn.call(session.ws, 'fs', 'project_branch_created', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_created', frame)
+  rescue ActiveRecord::RecordNotFound
+    send_fn.call(session.ws, 'fs', 'error', { error: "no project branch #{from}" })
+  end
+
+  # project_branch_delete — { name } tombstones the branch (history kept, name
+  # free). Replies fs/project_branch_deleted { name, id } and tells the project.
+  def self.handle_project_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    name = payload['name'].to_s.strip
+    return send_fn.call(session.ws, 'fs', 'error', { error: "cannot delete #{Branch::MAIN}" }) if name == Branch::MAIN
+    pb = store_for(session).delete_project_branch(name)
+    frame = { name: name, id: pb.id, user_id: session.user_id }
+    send_fn.call(session.ws, 'fs', 'project_branch_deleted', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_deleted', frame)
+  rescue ActiveRecord::RecordNotFound
+    send_fn.call(session.ws, 'fs', 'error', { error: "no project branch #{name}" })
   end
 
   # merge — { path, source, target? } auto-merges `source` into `target`
@@ -479,14 +538,15 @@ module FsStore
     path   = payload['path'].to_s.strip
     source = payload['source'].to_s.strip
     target = payload['target'].presence || Branch::MAIN
-    node   = find_node!(session.project_id, path)
+    node   = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
 
     store    = store_for(session)
     resolved = node.resolve || node
     old_head = ProjectFs.head_revision_id(resolved, target)
-    res      = store.merge(node.path, target: target, source: source, auto: true, user_id: session.user_id)
+    res      = store.merge(node.path, target: target, source: source, auto: true, user_id: session.user_id,
+                           branch: branch_of(payload))
 
     reply = { path: node.path, source: source, target: target, merged: res[:merged] == true }
     unless reply[:merged]
@@ -508,11 +568,11 @@ module FsStore
     path   = payload['path'].to_s.strip
     source = payload['source'].to_s.strip
     target = payload['target'].presence || Branch::MAIN
-    node   = find_node!(session.project_id, path)
+    node   = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
 
-    p = store_for(session).merge_preview(node.path, target: target, source: source)
+    p = store_for(session).merge_preview(node.path, target: target, source: source, branch: branch_of(payload))
     send_fn.call(session.ws, 'fs', 'merge_preview', p.merge(path: node.path))
   end
 
@@ -527,7 +587,7 @@ module FsStore
     path   = payload['path'].to_s.strip
     source = payload['source'].to_s.strip
     target = payload['target'].presence || Branch::MAIN
-    node   = find_node!(session.project_id, path)
+    node   = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
     unless payload.key?('content') && payload['expected_head'].present?
@@ -541,7 +601,8 @@ module FsStore
     begin
       store.merge(node.path, target: target, source: source, resolved: payload['content'].to_s,
                              user_id: session.user_id, expected_head: old_head,
-                             expected_source_head: payload['expected_source_head'].presence)
+                             expected_source_head: payload['expected_source_head'].presence,
+                             branch: branch_of(payload))
     rescue DbfsV2::ConflictError => e
       return send_fn.call(session.ws, 'fs', 'merged', reply.merge(merged: false, reason: 'stale', error: e.message))
     end
@@ -570,36 +631,40 @@ module FsStore
     VFS_FLUSHERS[session.project_id]&.record_write(resolved.id, 0)
   end
 
+  # Existence ops take `branch` (a project branch; default main). Disk is
+  # main's mirror only: a branch's tree lives in the DBFS until it is
+  # materialized (its own flusher/watcher pair — not yet).
   def self.handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path    = normalize(payload['path'])
     content = payload['content'].to_s
     store   = store_for(session)
+    branch  = view_branch(store, payload)
 
-    unless payload['mkdirp'] || store.find(File.dirname(path))
-      return send_fn.call(session.ws, 'fs', 'error', { path: path, error: "Parent directory #{File.dirname(path)} does not exist" })
+    unless payload['mkdirp'] || store.find(File.dirname(path), branch: branch)
+      return send_fn.call(session.ws, 'fs', 'error', { path: path, branch: branch, error: "Parent directory #{File.dirname(path)} does not exist" })
     end
 
-    node = ProjectFs.ensure_file!(store, path, content: content, user_id: session.user_id)
-    VFS_FLUSHERS[session.project_id]&.record_write(node.id, content.bytesize)
+    node = ProjectFs.ensure_file!(store, path, content: content, user_id: session.user_id, branch: branch)
+    VFS_FLUSHERS[session.project_id]&.record_write(node.id, content.bytesize) if branch == Branch::MAIN
 
-    send_fn.call(session.ws, 'fs', 'created', { path: node.path, type: 'file', id: node.id })
-    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', {
-      path: node.path, type: 'file', id: node.id, user_id: session.user_id
-    })
+    frame = { path: node.path, type: 'file', id: node.id, branch: branch }
+    send_fn.call(session.ws, 'fs', 'created', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', frame.merge(user_id: session.user_id))
   end
 
   def self.handle_create_dir(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    node = ProjectFs.ensure_folder!(store_for(session), normalize(payload['path']), user_id: session.user_id)
+    store  = store_for(session)
+    branch = view_branch(store, payload)
+    node   = ProjectFs.ensure_folder!(store, normalize(payload['path']), user_id: session.user_id, branch: branch)
     flusher = VFS_FLUSHERS[session.project_id]
-    if flusher
+    if flusher && branch == Branch::MAIN
       abs = ProjectFs.disk_path(flusher.root_path, node.path)
       flusher.suppress(abs) { FileUtils.mkdir_p(abs) }
     end
 
-    send_fn.call(session.ws, 'fs', 'created', { path: node.path, type: 'folder', id: node.id })
-    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', {
-      path: node.path, type: 'folder', id: node.id, user_id: session.user_id
-    })
+    frame = { path: node.path, type: 'folder', id: node.id, branch: branch }
+    send_fn.call(session.ws, 'fs', 'created', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', frame.merge(user_id: session.user_id))
   end
 
   # rename — { path:, new_name: } (a basename, same parent). Files and folders:
@@ -611,13 +676,15 @@ module FsStore
       return send_fn.call(session.ws, 'fs', 'error', { path: payload['path'], error: 'new_name must be a single path segment' })
     end
 
-    node     = find_node!(session.project_id, payload['path'].to_s.strip)
+    store    = store_for(session)
+    branch   = view_branch(store, payload)
+    node     = find_node!(session.project_id, payload['path'].to_s.strip, branch)
     old_path = node.path
     new_path = File.join(File.dirname(old_path), new_name)
-    moved    = store_for(session).move(old_path, new_path, user_id: session.user_id)
+    moved    = store.move(old_path, new_path, user_id: session.user_id, branch: branch)
 
     flusher = VFS_FLUSHERS[session.project_id]
-    if flusher
+    if flusher && branch == Branch::MAIN
       from = ProjectFs.disk_path(flusher.root_path, old_path)
       to   = ProjectFs.disk_path(flusher.root_path, new_path)
       if File.exist?(from) || File.symlink?(from)
@@ -625,10 +692,9 @@ module FsStore
       end
     end
 
-    send_fn.call(session.ws, 'fs', 'renamed', { old_path: old_path, new_path: moved.path, id: moved.id })
-    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'renamed', {
-      old_path: old_path, new_path: moved.path, id: moved.id, user_id: session.user_id
-    })
+    frame = { old_path: old_path, new_path: moved.path, id: moved.id, branch: branch }
+    send_fn.call(session.ws, 'fs', 'renamed', frame)
+    broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'renamed', frame.merge(user_id: session.user_id))
   rescue RuntimeError => e
     send_fn.call(session.ws, 'fs', 'error', { path: payload['path'], error: e.message })
   end
@@ -636,7 +702,9 @@ module FsStore
   # delete — tombstone the node and its subtree (history kept), then remove it
   # from disk with the watcher suppressed for every descendant path.
   def self.handle_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    node = find_node!(session.project_id, payload['path'].to_s.strip)
+    store  = store_for(session)
+    branch = view_branch(store, payload)
+    node   = find_node!(session.project_id, payload['path'].to_s.strip, branch)
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'cannot delete root' }) if node.root?
 
     entry_path = node.path
@@ -646,10 +714,10 @@ module FsStore
               .where('path = ? OR starts_with(path, ?)', entry_path, prefix)
               .pluck(:path)
 
-    store_for(session).delete(entry_path, user_id: session.user_id)
+    store.delete(entry_path, user_id: session.user_id, branch: branch)
 
     flusher = VFS_FLUSHERS[session.project_id]
-    if flusher
+    if flusher && branch == Branch::MAIN
       abs_paths = descendant_paths.map { |p| ProjectFs.disk_path(flusher.root_path, p) }
       flusher.suppress(*abs_paths) do
         FileUtils.rm_rf(ProjectFs.disk_path(flusher.root_path, entry_path))
@@ -658,9 +726,9 @@ module FsStore
       end
     end
 
-    send_fn.call(session.ws, 'fs', 'deleted', { path: entry_path })
+    send_fn.call(session.ws, 'fs', 'deleted', { path: entry_path, branch: branch })
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'deleted',
-                      { path: entry_path, user_id: session.user_id })
+                      { path: entry_path, branch: branch, user_id: session.user_id })
     DebugStream.emit(:fs, level: :info,
       message: "deleted #{entry_path}", project_id: session.project_id,
       meta: { path: entry_path, user_id: session.user_id, source: 'ws' }) if defined?(DebugStream)
@@ -804,10 +872,20 @@ module FsStore
     "#{project_id}:#{path}@#{branch}"
   end
 
-  def self.find_node!(project_id, path)
-    node = ProjectFs.store(project_id).find(path)
+  # The node `path` names as `branch` sees it: a project branch's index when
+  # `branch` is one, else main's (a detached per-file branch name lives on
+  # main's tree).
+  def self.find_node!(project_id, path, branch = Branch::MAIN)
+    node = ProjectFs.store(project_id).find(path, branch: branch)
     raise ActiveRecord::RecordNotFound, path unless node
     node
+  end
+
+  # The project branch an existence op (tree/create/rename/delete) acts on:
+  # `branch` when it names a live project branch, else main.
+  def self.view_branch(store, payload)
+    b = branch_of(payload)
+    store.project_branch(b) ? b : Branch::MAIN
   end
 
   def self.other_project_sessions(session, sessions_by_project)
