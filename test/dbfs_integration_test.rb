@@ -292,7 +292,8 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     ])
     ack = a.ws.of('written').last['payload']
     assert_equal 'rebased', ack['mode'], a.ws.frames.last.inspect
-    assert ack['branch'].start_with?('auto/')
+    assert_equal 'main', ack['branch']
+    assert ack['auto_branch'].start_with?('auto/')
     merged = store.read('/a.txt')
     assert merged.start_with?('b'), merged.inspect
     assert_equal '12', merged.lines[2][0, 2]
@@ -437,6 +438,78 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert_equal 1, search[:count]
     ls = invoke.('list_dir', allowed_slugs: ['list_dir'], session: a, project_id: pid, args: { 'path' => '/' })
     assert ls[:entries].any? { |e| e[:name] == 'a.txt' }
+  end
+
+  # A viewer on a branch: its edits land on the branch only, reach only that
+  # branch's viewers, never hit disk, and a merge brings them to main's viewers
+  # as one set_contents chained to the head they held.
+  def test_15_branches_on_the_wire
+    a, b = w[:a], w[:b]
+    a.ws.frames.clear
+    b.ws.frames.clear
+    main_before = store.read('/a.txt')
+    disk_before = File.read(disk('/a.txt'))
+
+    fs(a, 'branch_create', path: '/a.txt', name: 'topic')
+    created = a.ws.of('branch_created').last['payload']
+    assert_equal 'topic', created['name']
+    assert_equal ProjectFs.head_revision_id(store.find('/a.txt')), created['head']
+    assert_equal 'topic', b.ws.of('branch_created').last['payload']['name'], 'other sessions hear of the branch'
+
+    fs(a, 'branches', path: '/a.txt')
+    names = a.ws.of('branches').last['payload']['branches'].map { |x| x['name'] }
+    assert_includes names, 'main'
+    assert_includes names, 'topic'
+
+    fs(a, 'read', path: '/a.txt', branch: 'nope')
+    assert_match(/no branch nope/, a.ws.of('error').last['payload']['error'])
+
+    # a moves to topic; b stays on main.
+    fs(a, 'close', path: '/a.txt')
+    fs(a, 'open', path: '/a.txt', branch: 'topic')
+    assert_equal 'topic', a.ws.of('opened').last['payload']['branch']
+    fs(a, 'read', path: '/a.txt', branch: 'topic')
+    content = a.ws.of('content').last['payload']
+    assert_equal 'topic', content['branch']
+    assert_equal main_before, content['content']
+
+    b.ws.frames.clear
+    fs(a, 'write', path: '/a.txt', branch: 'topic', base_revision_id: content['revision'], batch_id: 'bt1',
+                   changes: [{ change_type: 'insertDataSingleLine', change_data: { startLine: 0, startChar: 0, data: 'T' }.to_json }])
+    ack = a.ws.of('written').last['payload']
+    assert_equal 'topic', ack['branch']
+    assert_equal 'append', ack['mode']
+    assert_equal "T#{main_before}", store.read('/a.txt', branch: 'topic')
+    assert_equal main_before, store.read('/a.txt'), 'main untouched'
+    assert_empty b.ws.of('change'), 'main viewers do not see branch edits'
+    sleep VfsFlusher::POLL_INTERVAL * 2
+    assert_equal disk_before, File.read(disk('/a.txt')), 'branch edits are not flushed'
+
+    main_head = ProjectFs.head_revision_id(store.find('/a.txt'))
+    fs(a, 'merge', path: '/a.txt', source: 'topic')
+    merged = a.ws.of('merged').last['payload']
+    assert_equal true, merged['merged'], merged.inspect
+    assert_equal "T#{main_before}", store.read('/a.txt')
+    sc = b.ws.of('set_contents').last['payload']
+    assert_equal 'main', sc['branch']
+    assert_equal main_head, sc['parent'], 'chained to the head main viewers held'
+    assert_equal merged['head'], sc['revision']
+    assert_equal "T#{main_before}", sc['content']
+    assert em_with_flusher { File.read(disk('/a.txt')) == "T#{main_before}" }, 'the merge is flushed'
+
+    fs(a, 'merge', path: '/a.txt', source: 'topic')
+    assert_equal false, a.ws.of('merged').last['payload']['merged'], 'nothing left to merge'
+
+    # A write to a missing branch is a resync error the client can attribute.
+    fs(a, 'write', path: '/a.txt', branch: 'nope', batch_id: 'bt2',
+                   changes: [{ change_type: 'insertDataSingleLine', change_data: { startLine: 0, startChar: 0, data: 'x' }.to_json }])
+    err = a.ws.of('error').last['payload']
+    assert_equal '/a.txt', err['path']
+    assert_equal 'bt2', err['batch_id']
+    assert err['resync']
+
+    fs(a, 'close', path: '/a.txt', branch: 'topic')
+    fs(a, 'open', path: '/a.txt')
   end
 
   def test_14_restart_does_not_rewrite_the_tree
