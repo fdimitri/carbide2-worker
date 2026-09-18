@@ -19,6 +19,7 @@
 #   branch_create— fork a new branch of a file from another branch's head
 #   branch_delete— drop a branch of a file (not main; not while others view it)
 #   merge        — auto-merge one branch of a file into another
+#   dag          — the file's revision DAG condensed for display (history rail)
 #   create_file  — create a file
 #   create_dir   — create a directory (mkdir -p)
 #   rename       — rename a file or directory
@@ -94,6 +95,8 @@ module FsStore
       handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'merge'
       handle_merge(session, payload, send_fn, broadcast_fn)
+    when 'dag'
+      handle_dag(session, payload, send_fn)
     when 'create_file'
       handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'create_dir'
@@ -425,6 +428,26 @@ module FsStore
     frame = { path: node.path, name: name, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'branch_deleted', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_deleted', frame)
+  end
+
+  # dag — { path, gap_ms?, auto? } -> fs/dag: DbfsV2::Graph.condense's
+  # { path, gap_ms, auto, heads, nodes, edges } plus `users` { id => display
+  # name } for the user_ids that appear. gap_ms (default 3000; 0 = topology
+  # only) splits one user's run at a pause; auto: true shows the auto-branches
+  # a rebase leaves behind instead of folding them (debugging the rebase path).
+  DAG_DEFAULT_GAP_MS = 3000
+
+  def self.handle_dag(session, payload, send_fn)
+    path = payload['path'].to_s.strip
+    node = find_node!(session.project_id, path)
+    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+
+    gap  = payload.key?('gap_ms') ? payload['gap_ms'].to_i : DAG_DEFAULT_GAP_MS
+    auto = payload['auto'] == true
+    g    = store_for(session).dag_condensed(node.path, gap_ms: gap, auto: auto)
+    ids  = g[:nodes].map { |n| n[:user_id] }.compact.uniq
+    g[:users] = User.where(id: ids).to_h { |u| [u.id, u.display_name] }
+    send_fn.call(session.ws, 'fs', 'dag', g)
   end
 
   # merge — { path, source, target? } auto-merges `source` into `target`

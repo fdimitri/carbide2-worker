@@ -532,6 +532,21 @@ class WorkerDbfsIntegrationTest < Minitest::Test
 
     fs(a, 'close', path: '/a.txt', branch: 'topic')
     fs(a, 'open', path: '/a.txt')
+
+    # The history rail's data: keystrokes collapsed into runs, heads named,
+    # every edge between present nodes, authors resolved.
+    fs(a, 'dag', path: '/a.txt')
+    dag = a.ws.of('dag').last['payload']
+    assert_equal 3000, dag['gap_ms']
+    assert_equal false, dag['auto']
+    assert_equal ['main'], dag['heads'].map { |h| h['branch'] }
+    ids = dag['nodes'].map { |n| n['id'] }
+    assert_includes ids, dag['heads'][0]['revision']
+    assert(dag['edges'].all? { |e| ids.include?(e['from']) && ids.include?(e['to']) })
+    assert(dag['nodes'].all? { |n| n['count'] >= 1 && n['branch'] })
+    assert dag['users'].is_a?(Hash), 'authors resolved to names (101/102 are not real users here)'
+    fs(a, 'dag', path: '/a.txt', gap_ms: 0, auto: true)
+    assert_equal true, a.ws.of('dag').last['payload']['auto']
   end
 
   def test_14_restart_does_not_rewrite_the_tree
