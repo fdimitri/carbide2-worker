@@ -100,6 +100,8 @@ module FsStore
       handle_project_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'project_branch_delete'
       handle_project_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    when 'project_branch_materialize'
+      handle_project_branch_materialize(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'project_dag'
       handle_project_dag(session, payload, send_fn)
     when 'project_merge_preview'
@@ -210,7 +212,7 @@ module FsStore
     node = find_node!(session.project_id, path, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
 
-    flusher = VFS_FLUSHERS[session.project_id]
+    flusher = flusher_for(session.project_id, branch_of(payload))
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'no disk root configured' }) unless flusher
     disk_path = ProjectFs.disk_path(flusher.root_path, node.path)
     return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'not present on disk' }) unless File.file?(disk_path)
@@ -404,9 +406,7 @@ module FsStore
       end
     end
 
-    return unless branch == Branch::MAIN
-
-    VFS_FLUSHERS[session.project_id]&.record_write(node.id, result.revisions.sum { |r| r.change_data.to_s.bytesize })
+    flusher_for(session.project_id, branch)&.record_write(node.id, result.revisions.sum { |r| r.change_data.to_s.bytesize })
   end
 
   # branches — { path } -> fs/branches { path, branches: [{ name, head }] }
@@ -496,7 +496,13 @@ module FsStore
   # forked_from, fork_seq, seq, deleted, materialized }] }, main first.
   def self.handle_project_branches(session, send_fn)
     send_fn.call(session.ws, 'fs', 'project_branches',
-                 { branches: store_for(session).project_branches.map(&:to_h) })
+                 { branches: store_for(session).project_branches.map { |b| branch_h(b) } })
+  end
+
+  # A branch on the wire: ProjectBranch#to_h plus `disk`, its directory
+  # relative to the project root when materialized (nil otherwise).
+  def self.branch_h(pb)
+    pb.to_h.merge(disk: BranchMirrors.relative_dir(pb))
   end
 
   # project_branch_create — { name, from? } forks a project branch off `from`
@@ -514,7 +520,7 @@ module FsStore
     end
 
     pb = store.create_project_branch(name, from: from, user_id: session.user_id)
-    frame = { branch: pb.to_h, user_id: session.user_id }
+    frame = { branch: branch_h(pb), user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'project_branch_created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_created', frame)
   rescue ActiveRecord::RecordNotFound
@@ -526,12 +532,54 @@ module FsStore
   def self.handle_project_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
     name = payload['name'].to_s.strip
     return send_fn.call(session.ws, 'fs', 'error', { error: "cannot delete #{Branch::MAIN}" }) if name == Branch::MAIN
+    BranchMirrors.stop!(session.project_id, name)
     pb = store_for(session).delete_project_branch(name)
     frame = { name: name, id: pb.id, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'project_branch_deleted', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_deleted', frame)
   rescue ActiveRecord::RecordNotFound
     send_fn.call(session.ws, 'fs', 'error', { error: "no project branch #{name}" })
+  end
+
+  # project_branch_materialize — { name, on: true|false } puts a branch's tree
+  # on disk at <project root>/.branches/<branch uuid> with its own
+  # flusher/watcher pair (BranchMirrors), or takes it off again (the directory
+  # is removed; the DBFS keeps everything). Replies — once the pair is live —
+  # fs/project_branch_materialized { branch, on, user_id } and tells the
+  # project. Main is always on disk.
+  def self.handle_project_branch_materialize(session, payload, sessions_by_project, send_fn, broadcast_fn)
+    name = payload['name'].to_s.strip
+    on   = payload['on'] != false
+    return send_fn.call(session.ws, 'fs', 'error', { error: "#{Branch::MAIN} is always on disk" }) if name == Branch::MAIN
+    store = store_for(session)
+    pb    = store.project_branch(name)
+    return send_fn.call(session.ws, 'fs', 'error', { error: "no project branch #{name}" }) unless pb
+
+    announce = lambda do
+      pb.reload
+      frame = { branch: branch_h(pb), on: pb.materialized?, user_id: session.user_id }
+      send_fn.call(session.ws, 'fs', 'project_branch_materialized', frame)
+      broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'project_branch_materialized', frame)
+    end
+
+    if on
+      project = Project.find(session.project_id)
+      BranchMirrors.start!(project, pb,
+                           sessions_by_project: sessions_by_project, broadcast_fn: broadcast_fn,
+                           suppress_set: defined?(VFS_FLUSH_SUPPRESS) ? VFS_FLUSH_SUPPRESS : nil,
+                           on_ready: lambda do |_mirror, err|
+                             if err
+                               send_fn.call(session.ws, 'fs', 'error', { error: "materialize #{name}: #{err.message}" })
+                             else
+                               announce.call
+                             end
+                           end)
+    else
+      BranchMirrors.stop!(session.project_id, name)
+      announce.call
+    end
+  rescue Project::WorkspaceUuidMissing => e
+    send_fn.call(session.ws, 'fs', 'error', { error: e.message })
   end
 
   # project_dag — { gap_ms? } the project's branches as a rail graph
@@ -578,11 +626,11 @@ module FsStore
   end
 
   # After a committed project merge: viewers of files whose content moved on
-  # the target hear the new text; when the target is main, disk follows the
-  # applied actions in order (a branch's tree is not on disk).
+  # the target hear the new text; when the target is on disk (main, or a
+  # materialized branch) disk follows the applied actions in order.
   def self.announce_project_merge(session, store, res, broadcast_fn)
     target  = res[:target]
-    flusher = target == Branch::MAIN ? VFS_FLUSHERS[session.project_id] : nil
+    flusher = flusher_for(session.project_id, target)
     state   = store.state(branch: target)
 
     res[:actions].each do |a|
@@ -718,14 +766,12 @@ module FsStore
       })
     end
 
-    return unless target == Branch::MAIN
-
-    VFS_FLUSHERS[session.project_id]&.record_write(resolved.id, 0)
+    flusher_for(session.project_id, target)&.record_write(resolved.id, 0)
   end
 
-  # Existence ops take `branch` (a project branch; default main). Disk is
-  # main's mirror only: a branch's tree lives in the DBFS until it is
-  # materialized (its own flusher/watcher pair — not yet).
+  # Existence ops take `branch` (a project branch; default main). Disk follows
+  # for main and for any branch the user has materialized (BranchMirrors);
+  # otherwise a branch's tree lives in the DBFS alone.
   def self.handle_create_file(session, payload, sessions_by_project, send_fn, broadcast_fn)
     path    = normalize(payload['path'])
     content = payload['content'].to_s
@@ -737,7 +783,7 @@ module FsStore
     end
 
     node = ProjectFs.ensure_file!(store, path, content: content, user_id: session.user_id, branch: branch)
-    VFS_FLUSHERS[session.project_id]&.record_write(node.id, content.bytesize) if branch == Branch::MAIN
+    flusher_for(session.project_id, branch)&.record_write(node.id, content.bytesize)
 
     frame = { path: node.path, type: 'file', id: node.id, branch: branch }
     send_fn.call(session.ws, 'fs', 'created', frame)
@@ -748,8 +794,8 @@ module FsStore
     store  = store_for(session)
     branch = view_branch(store, payload)
     node   = ProjectFs.ensure_folder!(store, normalize(payload['path']), user_id: session.user_id, branch: branch)
-    flusher = VFS_FLUSHERS[session.project_id]
-    if flusher && branch == Branch::MAIN
+    flusher = flusher_for(session.project_id, branch)
+    if flusher
       abs = ProjectFs.disk_path(flusher.root_path, node.path)
       flusher.suppress(abs) { FileUtils.mkdir_p(abs) }
     end
@@ -775,8 +821,8 @@ module FsStore
     new_path = File.join(File.dirname(old_path), new_name)
     moved    = store.move(old_path, new_path, user_id: session.user_id, branch: branch)
 
-    flusher = VFS_FLUSHERS[session.project_id]
-    if flusher && branch == Branch::MAIN
+    flusher = flusher_for(session.project_id, branch)
+    if flusher
       from = ProjectFs.disk_path(flusher.root_path, old_path)
       to   = ProjectFs.disk_path(flusher.root_path, new_path)
       if File.exist?(from) || File.symlink?(from)
@@ -800,16 +846,12 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'cannot delete root' }) if node.root?
 
     entry_path = node.path
-    prefix     = "#{entry_path.chomp('/')}/"
-    descendant_paths =
-      FileNode.live.where(project_id: session.project_id)
-              .where('path = ? OR starts_with(path, ?)', entry_path, prefix)
-              .pluck(:path)
+    descendant_paths = flatten_tree(store.tree(entry_path, branch: branch))
 
     store.delete(entry_path, user_id: session.user_id, branch: branch)
 
-    flusher = VFS_FLUSHERS[session.project_id]
-    if flusher && branch == Branch::MAIN
+    flusher = flusher_for(session.project_id, branch)
+    if flusher
       abs_paths = descendant_paths.map { |p| ProjectFs.disk_path(flusher.root_path, p) }
       flusher.suppress(*abs_paths) do
         FileUtils.rm_rf(ProjectFs.disk_path(flusher.root_path, entry_path))
@@ -945,6 +987,21 @@ module FsStore
 
   def self.store_for(session)
     ProjectFs.store(session.project_id)
+  end
+
+  # The flusher mirroring (project, branch) to disk: main's, a materialized
+  # branch's, or nil when that branch's tree is not on disk. `branch` may
+  # also be a per-file content branch name (merge targets) — those are only
+  # on disk when they are a materialized project branch of the same name.
+  def self.flusher_for(project_id, branch)
+    b = branch.to_s.presence || Branch::MAIN
+    return VFS_FLUSHERS[project_id] if b == Branch::MAIN
+    BranchMirrors.flusher_for(project_id, b)
+  end
+
+  def self.flatten_tree(t)
+    return [] unless t
+    [t[:path]] + (t[:children] || []).flat_map { |c| flatten_tree(c) }
   end
 
   def self.normalize(path)

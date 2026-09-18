@@ -101,6 +101,7 @@ require_relative 'ar_boot'
 require_relative 'fs_store'
 require_relative 'vfs_flusher'
 require_relative 'vfs_watcher'
+require_relative 'branch_mirrors'
 require_relative 'agent_tools'
 require_relative 'resolver'
 require_relative 'agent_session'
@@ -197,7 +198,7 @@ PROBE_DEADLINE_SECONDS = 5
 # identity + content, atomic); fs/project_merged announces a commit.
 # fs/project_dag { gap_ms? } is the project's branch graph.
 # Additive; MIN_CLIENT stays 1.
-PROTOCOL   = 10
+PROTOCOL   = 11
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
@@ -565,6 +566,7 @@ EM.run do
   # Stop VFS watchers cleanly when the worker shuts down.
   EM.add_shutdown_hook do
     VFS_WATCHERS.each_value(&:stop!)
+    BranchMirrors.stop_all!
     puts '[worker] VFS watchers stopped'
   end
 
@@ -606,6 +608,10 @@ EM.run do
                 project_id: project_id,
                 meta: { source: 'startup' }) if defined?(DebugStream)
             end
+
+            # Branches the user left on disk come back with their own pairs.
+            BranchMirrors.start_all!(proj, sessions_by_project: SESSIONS_BY_PROJECT,
+                                     broadcast_fn: method(:broadcast), suppress_set: VFS_FLUSH_SUPPRESS)
           end
         end
       rescue => e

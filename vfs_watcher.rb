@@ -44,6 +44,7 @@
 #   watcher.stop!
 require 'rb-inotify'
 require 'digest'
+require_relative 'branch_mirrors'
 
 class VfsWatcher
   # Debounced reconcile: coalesce a burst of inotify events (e.g. a shell
@@ -88,11 +89,14 @@ class VfsWatcher
     end
   end
 
-  def initialize(project_id:, root_path:, suppress_set: nil)
+  # `branch:` — the project branch whose tree root_path mirrors (default
+  # main). Everything absorbed lands on that branch and every frame names it.
+  def initialize(project_id:, root_path:, suppress_set: nil, branch: Branch::MAIN)
     @project_id   = project_id
+    @branch       = branch.to_s
     @root_path    = root_path.to_s.chomp('/')
     @suppress_set = suppress_set
-    @store        = ProjectFs.store(project_id)
+    @store        = ProjectFs.store(project_id, branch: @branch)
     @system_user_id = User.system.id
     @absorber     = DbfsV2::Watcher.new(@store, @root_path, cache: ProjectFs.blob_cache(project_id),
                                         user_id: @system_user_id)
@@ -127,12 +131,12 @@ class VfsWatcher
     @em_conn = EM.watch(@notifier.to_io, handler)
     @em_conn.notify_readable = true
 
-    puts "[VfsWatcher:#{@project_id}] watching #{@root_path}"
+    puts "[VfsWatcher:#{tag}] watching #{@root_path}"
     true
   rescue => e
-    puts "[VfsWatcher:#{@project_id}] start! failed: #{e.class}: #{e.message}"
+    puts "[VfsWatcher:#{tag}] start! failed: #{e.class}: #{e.message}"
     if e.is_a?(Errno::ENOSPC)
-      puts "[VfsWatcher:#{@project_id}] inotify watch limit reached — raise " \
+      puts "[VfsWatcher:#{tag}] inotify watch limit reached — raise " \
            "fs.inotify.max_user_watches on the NODE (node sysctl, not pod-tunable) and restart the worker"
     end
     stop!
@@ -145,7 +149,7 @@ class VfsWatcher
     @guard&.close
     @em_conn&.detach rescue nil
     @notifier&.close rescue nil
-    puts "[VfsWatcher:#{@project_id}] stopped"
+    puts "[VfsWatcher:#{tag}] stopped"
   end
 
   private
@@ -194,12 +198,16 @@ class VfsWatcher
 
   def handle_event(event)
     if event.flags.include?(:q_overflow)
-      puts "[VfsWatcher:#{@project_id}] inotify queue overflow — scheduling full reconcile"
+      puts "[VfsWatcher:#{tag}] inotify queue overflow — scheduling full reconcile"
       mark_dirty(@root_path)
       return
     end
 
     abs_path = event.absolute_name
+
+    # <root>/.branches is where materialized project branches live, each with
+    # its own pair; it is not part of this tree at all (not even as a folder).
+    return if File.dirname(abs_path) == @root_path && File.basename(abs_path) == BranchMirrors::DIR
 
     # Deletions / moves-out — tombstone the node (and subtree) and notify.
     if event.flags.include?(:delete) || event.flags.include?(:moved_from)
@@ -210,7 +218,7 @@ class VfsWatcher
 
       @store.delete(srcpath, user_id: @system_user_id)
       broadcast('deleted', { path: srcpath, source: 'inotify' })
-      puts "[VfsWatcher:#{@project_id}] external delete: #{srcpath}"
+      puts "[VfsWatcher:#{tag}] external delete: #{srcpath}"
       DebugStream.emit(:watcher, level: :info,
         message: "deleted #{srcpath}", project_id: @project_id,
         meta: { path: srcpath, source: 'inotify' }) if defined?(DebugStream)
@@ -248,7 +256,7 @@ class VfsWatcher
 
     absorb_path(abs_path)
   rescue => e
-    puts "[VfsWatcher:#{@project_id}] handle_event error: #{e.class}: #{e.message}"
+    puts "[VfsWatcher:#{tag}] handle_event error: #{e.class}: #{e.message}"
   end
 
   # Decide how a changed file on disk enters DBFS. Re-entered after a binary
@@ -271,7 +279,7 @@ class VfsWatcher
       ProjectFs.track_oversized!(@store, srcpath, abs_path, user_id: @system_user_id)
       broadcast(existed ? 'changed' : 'created',
                 { path: srcpath, type: 'file', size: size, binary: true, source: 'inotify' })
-      puts "[VfsWatcher:#{@project_id}] tracked without content (#{size}B > cap): #{srcpath}"
+      puts "[VfsWatcher:#{tag}] tracked without content (#{size}B > cap): #{srcpath}"
       return
     end
 
@@ -290,7 +298,7 @@ class VfsWatcher
     # Our own flush coming back: the bytes on disk are exactly what the flusher
     # last wrote here. Ignore it — even if DBFS has moved on since, because
     # folding it in would diff those newer writes away.
-    flushed = VFS_FLUSHERS[@project_id]&.flushed_state(abs_path) if defined?(VFS_FLUSHERS)
+    flushed = flusher&.flushed_state(abs_path)
     return if flushed && Digest::SHA256.file(abs_path).hexdigest == flushed.digest
 
     # A genuine external edit, anchored to the revision the file was last
@@ -305,10 +313,10 @@ class VfsWatcher
     case res[:status]
     when :created
       node = res[:node]
-      adopt_if_identical(node, abs_path, ProjectFs.head_revision_id(node), @store.read(srcpath).to_s)
+      adopt_if_identical(node, abs_path, ProjectFs.head_revision_id(node, @branch), @store.read(srcpath).to_s)
       size = File.size(abs_path) rescue 0
       broadcast('created', { path: srcpath, type: 'file', binary: false, size: size, source: 'inotify' })
-      puts "[VfsWatcher:#{@project_id}] external create (text): #{srcpath} (#{size}B)"
+      puts "[VfsWatcher:#{tag}] external create (text): #{srcpath} (#{size}B)"
       DebugStream.emit(:watcher, level: :info,
         message: "new text file #{srcpath} (#{size}B)", project_id: @project_id,
         meta: { path: srcpath, type: 'file', binary: false, size: size, source: 'inotify' }) if defined?(DebugStream)
@@ -316,11 +324,11 @@ class VfsWatcher
       rev  = res[:revisions].last
       head = @store.read(srcpath).to_s
       broadcast('set_contents', {
-        path: srcpath, branch: Branch::MAIN, content: head, revision: rev&.id, parent: res[:revisions].first&.parent_id,
+        path: srcpath, content: head, revision: rev&.id, parent: res[:revisions].first&.parent_id,
         user_id: @system_user_id, source: 'inotify'
       })
       adopt_if_identical(res[:node], abs_path, rev, head)
-      puts "[VfsWatcher:#{@project_id}] external change: #{srcpath} (rev #{rev&.id})"
+      puts "[VfsWatcher:#{tag}] external change: #{srcpath} (rev #{rev&.id})"
       DebugStream.emit(:watcher, level: :info,
         message: "changed #{srcpath} (rev #{rev&.id})", project_id: @project_id,
         meta: { path: srcpath, rev: rev&.id, source: 'inotify' }) if defined?(DebugStream)
@@ -331,7 +339,7 @@ class VfsWatcher
     retry_once = !retried
     absorb_text(abs_path, srcpath, retried: true) if retry_once
   rescue DbfsV2::ConflictError => e
-    puts "[VfsWatcher:#{@project_id}] external change to #{srcpath} conflicts with a concurrent edit: #{e.message}"
+    puts "[VfsWatcher:#{tag}] external change to #{srcpath} conflicts with a concurrent edit: #{e.message}"
     DebugStream.emit(:watcher, level: :warn,
       message: "external change conflicted: #{srcpath}", project_id: @project_id,
       meta: { path: srcpath, error: e.message, source: 'inotify' }) if defined?(DebugStream)
@@ -341,7 +349,7 @@ class VfsWatcher
   # the disk is already current. (After an OT merge with concurrent editor
   # writes it isn't, and the next sweep writes the merge out.)
   def adopt_if_identical(node, abs_path, rev_or_id, head_content)
-    flusher = defined?(VFS_FLUSHERS) && VFS_FLUSHERS[@project_id]
+    flusher = self.flusher
     return unless flusher && node && rev_or_id
 
     disk = File.binread(abs_path)
@@ -406,7 +414,7 @@ class VfsWatcher
       broadcast(existed ? 'changed' : 'created', {
         path: srcpath, type: 'file', binary: true, size: res[:size], revision: rev&.id, source: 'inotify'
       })
-      puts "[VfsWatcher:#{@project_id}] external #{existed ? 'change' : 'create'} (binary): #{srcpath} (#{res[:size]}B)"
+      puts "[VfsWatcher:#{tag}] external #{existed ? 'change' : 'create'} (binary): #{srcpath} (#{res[:size]}B)"
       DebugStream.emit(:watcher, level: :info,
         message: "#{existed ? 'changed' : 'new'} binary file #{srcpath} (#{res[:size]}B)",
         project_id: @project_id,
@@ -415,9 +423,9 @@ class VfsWatcher
       broadcast('created', { path: srcpath, type: 'file', binary: true, source: 'inotify' }) unless existed
     when :discarded
       # Still being written after every attempt; its next close_write reruns it.
-      puts "[VfsWatcher:#{@project_id}] binary ingest discarded (file kept changing): #{srcpath}"
+      puts "[VfsWatcher:#{tag}] binary ingest discarded (file kept changing): #{srcpath}"
     when :error
-      puts "[VfsWatcher:#{@project_id}] binary ingest error for #{srcpath}: #{res[:error]}"
+      puts "[VfsWatcher:#{tag}] binary ingest error for #{srcpath}: #{res[:error]}"
       DebugStream.emit(:watcher, level: :error,
         message: "binary ingest failed: #{srcpath}", project_id: @project_id,
         meta: { path: srcpath, error: res[:error], source: 'inotify' }) if defined?(DebugStream)
@@ -426,10 +434,20 @@ class VfsWatcher
 
   # --- helpers -------------------------------------------------------------
 
+  # Every frame names the branch: the explorer and editors filter on it.
   def broadcast(cmd, payload)
     sessions = (@sessions_by_project[@project_id] || []).map(&:ws)
-    @broadcast_fn.call(sessions, 'fs', cmd, payload)
+    @broadcast_fn.call(sessions, 'fs', cmd, { branch: @branch }.merge(payload))
   end
+
+  # The flusher mirroring the same (project, branch) — our own writes echo
+  # through it, and it is told when disk already matches a head.
+  def flusher
+    return nil unless defined?(FsStore)
+    FsStore.flusher_for(@project_id, @branch)
+  end
+
+  def tag = @branch == Branch::MAIN ? @project_id.to_s : "#{@project_id}@#{@branch}"
 
   # Convert an absolute path under @root_path to a leading-slash srcpath.
   def path_to_srcpath(abs_path)
@@ -450,13 +468,13 @@ class VfsWatcher
     node = ProjectFs.ensure_folder!(@store, srcpath, user_id: @system_user_id)
     ProjectFs.record_disk_stat!(node, abs_path)
     broadcast('created', { path: srcpath, type: 'folder', source: 'inotify' })
-    puts "[VfsWatcher:#{@project_id}] external mkdir: #{srcpath}"
+    puts "[VfsWatcher:#{tag}] external mkdir: #{srcpath}"
     DebugStream.emit(:watcher, level: :info,
       message: "mkdir #{srcpath}", project_id: @project_id,
       meta: { path: srcpath, type: 'folder', source: 'inotify' }) if defined?(DebugStream)
     node
   rescue => e
-    puts "[VfsWatcher:#{@project_id}] ensure_dir_entry error: #{e.class}: #{e.message}"
+    puts "[VfsWatcher:#{tag}] ensure_dir_entry error: #{e.class}: #{e.message}"
     nil
   end
 
@@ -511,6 +529,7 @@ class VfsWatcher
 
     project_id = @project_id
     root_path  = @root_path
+    branch     = @branch
 
     work = proc do
       imported = 0
@@ -519,7 +538,7 @@ class VfsWatcher
           roots.each do |disk_dir|
             next unless Dir.exist?(disk_dir)
             stats = FsLoader.new(project_id: project_id, root_path: root_path,
-                                 verbose: false).load_dir!(disk_dir)
+                                 verbose: false, branch: branch).load_dir!(disk_dir)
             imported += stats[:dirs].to_i + stats[:files].to_i
           end
         end
@@ -534,7 +553,7 @@ class VfsWatcher
       if imported.to_i.positive?
         # Client refetches the whole tree on any fs/created (ExplorerPane).
         broadcast('created', { path: '/', type: 'folder', source: 'inotify-reconcile' })
-        puts "[VfsWatcher:#{@project_id}] reconcile imported #{imported} entries"
+        puts "[VfsWatcher:#{tag}] reconcile imported #{imported} entries"
         DebugStream.emit(:watcher, level: :info,
           message: "reconciled #{imported} entries", project_id: @project_id,
           meta: { imported: imported, source: 'inotify-reconcile' }) if defined?(DebugStream)
