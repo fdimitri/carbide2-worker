@@ -172,8 +172,9 @@ PROBE_DEADLINE_SECONDS = 5
 # set_contents/written/opened/cursor frames carry `branch`. In fs/written and a
 # refused batch's fs/error the rebase's source is now auto_branch/
 # auto_branch_head (`branch` is the branch written to). New: fs/branches,
-# fs/branch_create, fs/branch_delete, fs/merge, and fs/viewer_left to the
-# remaining viewers of a (path, branch) when one closes it or disconnects.
+# fs/branch_create, fs/branch_delete, fs/merge, fs/dag (the revision DAG
+# condensed for the history rail), and fs/viewer_left to the remaining viewers
+# of a (path, branch) when one closes it or disconnects.
 # MIN_CLIENT stays 1: a client that never sends `branch` is on main throughout.
 PROTOCOL   = 8
 MIN_CLIENT = 1
