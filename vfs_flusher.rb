@@ -37,7 +37,7 @@ class VfsFlusher
   # real head value (a text file created empty has no revisions yet).
   NEVER = Object.new.freeze
 
-  attr_reader :root_path, :project_id, :suppress_set
+  attr_reader :root_path, :project_id, :suppress_set, :branch
 
   # What this flusher last put on disk at a path: the head it wrote and the
   # SHA-256 of the bytes. The watcher uses it to recognise its own echo by
@@ -46,11 +46,15 @@ class VfsFlusher
   # external writer saw.
   Flushed = Struct.new(:head, :digest)
 
-  def initialize(project_id:, root_path:, suppress_set: nil)
+  # `branch:` — the project branch this flusher mirrors (default main). A
+  # branch's store view (DbfsV2::BranchView) makes every read and head query
+  # below branch-scoped without further plumbing.
+  def initialize(project_id:, root_path:, suppress_set: nil, branch: Branch::MAIN)
     @project_id      = project_id
+    @branch          = branch.to_s
     @root_path       = root_path.to_s.chomp('/')
     @suppress_set    = suppress_set
-    @store           = ProjectFs.store(project_id)
+    @store           = ProjectFs.store(project_id, branch: @branch)
     @writer          = DbfsV2::Flusher.new(@store, @root_path)
     @last_head       = Hash.new(NEVER)  # file_node_id => head revision id at last flush
     @on_disk         = {}               # abs path => Flushed
@@ -117,20 +121,20 @@ class VfsFlusher
       flush_single(id, path, head) && flushed += 1
     end
 
-    puts "[VfsFlusher:#{@project_id}] sweep: flushed #{flushed} file(s)" if flushed > 0
+    puts "[VfsFlusher:#{tag}] sweep: flushed #{flushed} file(s)" if flushed > 0
   rescue => e
-    puts "[VfsFlusher:#{@project_id}] flush! error: #{e.class}: #{e.message}"
+    puts "[VfsFlusher:#{tag}] flush! error: #{e.class}: #{e.message}"
   end
 
   private
 
-  # [file_node_id, path, main head] for every live, non-symlink text file.
-  def text_heads(scope = FileNode.all)
-    scope.live
-         .where(project_id: @project_id, ftype: 'file', binary: false, symlink_target: nil)
-         .joins(:branches).where(branches: { name: Branch::MAIN })
-         .pluck('file_nodes.id', 'file_nodes.path', 'branches.head_revision_id')
+  # [file_node_id, path, head] for every live, non-symlink text file on the
+  # branch (Store#text_heads: main's heads, or a branch's heads/pins).
+  def text_heads(node_ids = nil)
+    @store.text_heads(node_ids: node_ids)
   end
+
+  def tag = @branch == Branch::MAIN ? @project_id.to_s : "#{@project_id}@#{@branch}"
 
   def refresh_settings_cache!
     now = EM.current_time
@@ -140,17 +144,17 @@ class VfsFlusher
     @cached_interval_s     = setting&.flush_interval_s || DEFAULT_INTERVAL_S
     @cached_byte_threshold = setting&.flush_bytes      || DEFAULT_BYTE_THRESHOLD
   rescue => e
-    puts "[VfsFlusher:#{@project_id}] settings refresh error: #{e.message}"
+    puts "[VfsFlusher:#{tag}] settings refresh error: #{e.message}"
   end
 
   def flush_node_by_id!(file_node_id)
-    row = text_heads(FileNode.where(id: file_node_id)).first
+    row = text_heads([file_node_id]).first
     return unless row
     _id, path, head = row
     return if @last_head[file_node_id] == head
     flush_single(file_node_id, path, head)
   rescue => e
-    puts "[VfsFlusher:#{@project_id}] flush_node_by_id! error: #{e.class}: #{e.message}"
+    puts "[VfsFlusher:#{tag}] flush_node_by_id! error: #{e.class}: #{e.message}"
   end
 
   def flush_single(id, path, head)
@@ -176,13 +180,13 @@ class VfsFlusher
     @on_disk[abs] = Flushed.new(head, Digest::SHA256.hexdigest(written))
     @last_head[id] = head
     @unflushed_bytes[id] = 0
-    puts "[VfsFlusher:#{@project_id}] flushed #{path}"
+    puts "[VfsFlusher:#{tag}] flushed #{path}"
     DebugStream.emit(:flusher, level: :info,
       message: "flushed #{path}", project_id: @project_id,
       meta: { path: path, bytes: bytes, rev: head }) if defined?(DebugStream)
     true
   rescue => e
-    puts "[VfsFlusher:#{@project_id}] write error #{abs}: #{e.class}: #{e.message}"
+    puts "[VfsFlusher:#{tag}] write error #{abs}: #{e.class}: #{e.message}"
     DebugStream.emit(:flusher, level: :error,
       message: "write error #{path}: #{e.message}", project_id: @project_id,
       meta: { path: path, error: e.class.to_s }) if defined?(DebugStream)

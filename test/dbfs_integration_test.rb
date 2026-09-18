@@ -29,6 +29,7 @@ require File.join(worker_dir, 'open_document')
 require File.join(worker_dir, 'fs_store')
 require File.join(worker_dir, 'vfs_flusher')
 require File.join(worker_dir, 'vfs_watcher')
+require File.join(worker_dir, 'branch_mirrors')
 require File.join(worker_dir, 'agent_tools')
 
 class FakeWS
@@ -711,6 +712,82 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert g.key?('users')
   end
 
+  # A materialized branch: its tree on disk under .branches/<uuid> with its own
+  # flusher/watcher pair; main's mirror and watcher never see the directory.
+  def test_18_materialize_a_branch_on_the_wire
+    a, b = w[:a], w[:b]
+    a.ws.frames.clear
+    b.ws.frames.clear
+    store.create_file('/mat.txt', content: "m1\n")
+    fs(a, 'project_branch_create', name: 'disk')
+    store.write('/mat.txt', DbfsV2::Delta.new('setContents', { data: "m1 on disk\n" }), branch: 'disk')
+    store.create_file('/only-disk.txt', content: "od\n", branch: 'disk')
+
+    fs(a, 'project_branch_materialize', name: 'disk', on: true)
+    assert wait_until { a.ws.of('project_branch_materialized').any? }, 'reply once the pair is live'
+    fr = a.ws.of('project_branch_materialized').last['payload']
+    assert fr['on']
+    pb = store.project_branch('disk')
+    assert pb.reload.materialized?
+    assert_equal File.join('.branches', pb.id), fr['branch']['disk']
+    assert_equal fr['branch']['disk'], b.ws.of('project_branch_materialized').last['payload']['branch']['disk'], 'the project heard'
+    broot = File.join(w[:root], fr['branch']['disk'])
+    w[:branch_root] = broot
+    assert_equal "m1 on disk\n", File.read(File.join(broot, 'mat.txt'))
+    assert_equal "od\n", File.read(File.join(broot, 'only-disk.txt'))
+    assert em_with_flusher { File.exist?(disk('/mat.txt')) && File.read(disk('/mat.txt')) == "m1\n" }, "main's mirror is untouched"
+    refute File.exist?(disk('/only-disk.txt'))
+    fs(a, 'project_branches')
+    listed = a.ws.of('project_branches').last['payload']['branches'].find { |x| x['name'] == 'disk' }
+    assert_equal fr['branch']['disk'], listed['disk']
+
+    # DB -> disk: a write on the branch reaches the branch directory only.
+    fs(a, 'write', path: '/mat.txt', branch: 'disk',
+                   changes: [{ change_type: 'setContents', change_data: { data: "m2 on disk\n" } }])
+    assert em_with_flusher { File.read(File.join(broot, 'mat.txt')) == "m2 on disk\n" }
+    assert_equal "m1\n", File.read(disk('/mat.txt'))
+
+    # Existence ops on the branch follow on disk.
+    fs(a, 'create_file', path: '/from-ws.txt', content: "ws\n", branch: 'disk')
+    assert em_with_flusher { File.exist?(File.join(broot, 'from-ws.txt')) }
+    refute File.exist?(disk('/from-ws.txt'))
+    fs(a, 'rename', path: '/from-ws.txt', new_name: 'renamed.txt', branch: 'disk')
+    assert wait_until { File.exist?(File.join(broot, 'renamed.txt')) && !File.exist?(File.join(broot, 'from-ws.txt')) }
+
+    # disk -> DB: an external edit in the branch directory lands on the branch
+    # and is announced with the branch name; main is not touched.
+    b.ws.frames.clear
+    sleep 1.1 # past the flusher's suppress hold on the paths above
+    File.write(File.join(broot, 'mat.txt'), "m3 from disk\n")
+    assert wait_until { store.read('/mat.txt', branch: 'disk') == "m3 from disk\n" }, 'watcher absorbed onto the branch'
+    assert_equal "m1\n", store.read('/mat.txt')
+    File.write(File.join(broot, 'external.txt'), "ext\n")
+    assert wait_until { store.find('/external.txt', branch: 'disk') }, 'external create on the branch'
+    assert_nil store.find('/external.txt')
+    assert wait_until { b.ws.of('created').any? { |f| f['payload']['path'] == '/external.txt' } }
+    assert_equal 'disk', b.ws.of('created').find { |f| f['payload']['path'] == '/external.txt' }['payload']['branch']
+    assert_nil store.find('/.branches'), "main never sees .branches"
+
+    # Off: pair stops, flag clears, directory goes; the DBFS keeps the branch.
+    a.ws.frames.clear
+    fs(a, 'project_branch_materialize', name: 'disk', on: false)
+    off = a.ws.of('project_branch_materialized').last['payload']
+    refute off['on']
+    assert_nil off['branch']['disk']
+    refute pb.reload.materialized?
+    refute File.exist?(broot)
+    assert_nil BranchMirrors.for(w[:project].id, 'disk')
+    assert_equal "m3 from disk\n", store.read('/mat.txt', branch: 'disk')
+
+    # Deleting a materialized branch takes it off disk too.
+    fs(a, 'project_branch_materialize', name: 'disk', on: true)
+    assert wait_until { BranchMirrors.for(w[:project].id, 'disk')&.state == :live }
+    assert File.exist?(broot)
+    fs(a, 'project_branch_delete', name: 'disk')
+    refute File.exist?(broot)
+    assert_nil BranchMirrors.for(w[:project].id, 'disk')
+  end
+
   def flat_paths(node)
     [node['path']] + (node['children'] || []).flat_map { |c| flat_paths(c) }
   end
@@ -725,5 +802,6 @@ class WorkerDbfsIntegrationTest < Minitest::Test
 
   def test_99_stop
     w[:watcher]&.stop!
+    BranchMirrors.stop_all!
   end
 end
