@@ -527,7 +527,8 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     fs(a, 'branch_delete', path: '/a.txt', name: 'topic')
     assert_equal 'topic', a.ws.of('branch_deleted').last['payload']['name']
     assert_equal 'topic', b.ws.of('branch_deleted').last['payload']['name']
-    assert_equal %w[main], store.branches('/a.txt').map { |x| x[:name] }
+    # Earlier tests left server-made auto/… branches on this file; they are not what is under test here.
+    assert_equal %w[main], store.branches('/a.txt').map { |x| x[:name] }.reject { |n| n.start_with?('auto/') }
     assert_equal "T#{main_before}", store.read('/a.txt'), 'main survives deleting the branch it fast-forwarded to'
 
     fs(a, 'close', path: '/a.txt', branch: 'topic')
