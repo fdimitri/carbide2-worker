@@ -34,6 +34,9 @@ function makeClient(id, path, seed) {
   c.sync = createFileSync({
     path,
     editor,
+    // The scheduler delivers, delays and loses every frame itself; a wall-clock
+    // resend/abandon firing between steps would make a run non-reproducible.
+    ackTimeoutMs: 0,
     send: (cmd, payload) => {
       if (cmd === 'write') c.batches.set(payload.batch_id, tokensOf(payload.changes))
       out({ op: 'send', id, cmd, payload })
