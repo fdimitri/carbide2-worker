@@ -47,6 +47,9 @@ module Command
   rescue => e
     warn "[#{cs}/#{cmd}] ERROR: #{e.class} #{e.message}\n  " \
          "#{e.backtrace.first(5).join("\n  ")}"
+    if e.is_a?(ActiveRecord::ConnectionTimeoutError) && defined?(WorkerDbPool)
+      WorkerDbPool.emit!(reason: "#{cs}/#{cmd} #{e.class}")
+    end
     error(session, "#{cs}/#{cmd} failed: #{e.message}") if session&.ws
   end
 

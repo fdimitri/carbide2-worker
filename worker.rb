@@ -402,6 +402,9 @@ module DebugHandlers
     when 'unsubscribe'
       DebugStream.unsubscribe(session)
       send_msg(session.ws, 'debug', 'unsubscribed', {})
+    when 'db_pool'
+      snap = defined?(WorkerDbPool) ? WorkerDbPool.emit!(reason: 'debug/db_pool') : { error: 'WorkerDbPool not loaded' }
+      send_msg(session.ws, 'debug', 'db_pool', snap)
     else
       send_msg(session.ws, 'system', 'error', { message: "unknown debug cmd: #{cmd}" })
     end
@@ -526,10 +529,11 @@ end
 # Main
 # ---------------------------------------------------------------------------
 EM.run do
+  REACTOR_THREAD = Thread.current
   host = ENV.fetch('WORKER_HOST', '0.0.0.0')
   port = ENV.fetch('WORKER_PORT', '8080').to_i
 
-  puts "Carbide2 worker starting on #{host}:#{port}"
+  puts "Carbide2 worker starting on #{host}:#{port} (SIGUSR1 dumps the AR pool)"
 
   # Liveness heartbeat. With timestamped persistent logs, the heartbeat's last
   # line pins the time-of-death even when the worker was otherwise idle (an
