@@ -862,16 +862,16 @@ module AgentTools
 
     scope = args['path'].to_s
     store = ProjectFs.store(project_id)
-    nodes = FileNode.live.where(project_id: project_id, ftype: 'file', binary: false, symlink_target: nil)
+    rows = store.text_heads
     if !scope.empty? && scope != '/'
-      base  = scope.chomp('/')
-      nodes = nodes.where('path = ? OR starts_with(path, ?)', base, "#{base}/")
+      base = scope.chomp('/')
+      rows = rows.select { |_id, npath, _head| npath == base || npath.start_with?("#{base}/") }
     end
 
     matches       = []
     files_scanned = 0
     truncated     = false
-    nodes.order(:path).pluck(:path).each do |npath|
+    rows.sort_by { |_id, npath, _head| npath }.each do |_id, npath, _head|
       break if matches.size >= max_results
       files_scanned += 1
       store.read(npath).to_s.each_line.with_index do |line, ln|
