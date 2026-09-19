@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+# Attach to the live worker (same process). Run from inside the pod:
+#   ruby /app/worker/console
+#   WORKER_CONSOLE_SOCK=/other.sock ruby console
+require 'socket'
+
+path = ARGV[0] || ENV['WORKER_CONSOLE_SOCK'] || '/tmp/carbide-worker.console.sock'
+abort "worker console socket missing: #{path}\nIs the worker up? WORKER_CONSOLE=0 disables it." unless File.socket?(path)
+
+s = UNIXSocket.new(path)
+begin
+  s.sync = true
+  $stdout.sync = true
+  t = Thread.new do
+    while (chunk = s.readpartial(4096))
+      $stdout.write(chunk)
+    end
+  rescue EOFError, Errno::EPIPE, IOError
+    nil
+  end
+  while (line = $stdin.gets)
+    s.write(line)
+  end
+ensure
+  s.close rescue nil
+  t&.join
+end
