@@ -29,11 +29,11 @@
 #
 # `revision` values on the wire are revision UUID strings (PROTOCOL 6).
 #
-# Branches are per file (DbfsV2: a Branch row per file_node). Every command
-# that names a file takes an optional `branch` (default main), and a viewer is
-# subscribed to one (path, branch): edits on a branch are only broadcast to
-# viewers of that branch. Only main is flushed to disk (VfsFlusher), so branch
-# edits live in the store until merged.
+# Document identity is (FileNode UUID, branch). Path is location (tree,
+# create/rename/delete, labels). Every document command takes `id` (the node)
+# and optional `branch` (default main); a viewer is subscribed to one
+# (id, branch). Path still locates a node when the caller has no id (agents,
+# tests). Only main is flushed to disk unless a project branch is materialized.
 
 require 'base64'
 require 'fileutils'
@@ -138,18 +138,24 @@ module FsStore
 
   WRITE_CMDS = %w[write set_contents].freeze
 
-  # An error the client can attribute: it echoes the path, branch and batch_id
-  # of the command that failed. For a write it also says resync — nothing was
-  # committed and the client's queue is based on a view it should re-read.
+  # An error the client can attribute: it echoes the id, path, branch and
+  # batch_id of the command that failed. For a write it also says resync —
+  # nothing was committed and the client's queue is based on a view it should
+  # re-read.
   def self.error_frame(cmd, payload, message)
     frame = { message: message, error: message }
     if payload.is_a?(Hash)
+      frame[:id]       = payload['id'] if payload['id']
       frame[:path]     = payload['path'] if payload['path']
-      frame[:branch]   = branch_of(payload) if payload['path']
+      frame[:branch]   = branch_of(payload) if payload['id'] || payload['path']
       frame[:batch_id] = payload['batch_id'] if payload['batch_id']
     end
     frame[:resync] = true if WRITE_CMDS.include?(cmd)
     frame
+  end
+
+  def self.doc_fields(node, branch)
+    { id: node.id, path: node.path, branch: branch }
   end
 
   # -------------------------------------------------------------------------
@@ -167,55 +173,51 @@ module FsStore
   end
 
   def self.handle_read(session, payload, send_fn)
-    path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     target = node.resolve
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'dangling symlink' }) unless target
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is binary — use read_binary' }) if target.binary?
-
     branch = branch_of(payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: 'dangling symlink')) unless target
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: 'is binary — use read_binary')) if target.binary?
+
     # A project branch reads a file it has not written from its pin: no
     # per-file row yet is fine there.
     unless store_for(session).project_branch(branch) || target.branches.exists?(name: branch)
-      return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch, error: "no branch #{branch} on #{node.path}" })
+      return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: "no branch #{branch} on #{node.path}"))
     end
 
     # A pinned read: the content AT one revision (history view). Not a branch
     # head, so the reply says `pinned` and a client must not base edits on it.
     if (rev = payload['revision_id'].presence)
       unless Revision.exists?(id: rev, file_node_id: target.id)
-        return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch, error: "no revision #{rev} of #{node.path}" })
+        return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: "no revision #{rev} of #{node.path}"))
       end
-      return send_fn.call(session.ws, 'fs', 'content', {
-        path: node.path, branch: branch, pinned: true, revision: rev,
+      return send_fn.call(session.ws, 'fs', 'content', doc_fields(node, branch).merge(
+        pinned: true, revision: rev,
         content: store_for(session).read(node.path, revision_id: rev, branch: branch)
-      })
+      ))
     end
 
-    send_fn.call(session.ws, 'fs', 'content', {
-      path:     node.path,
-      branch:   branch,
+    send_fn.call(session.ws, 'fs', 'content', doc_fields(node, branch).merge(
       content:  store_for(session).read(node.path, branch: branch),
       revision: ProjectFs.head_revision_id(target, branch)
-    })
+    ))
   end
 
   # read_binary — stream a chunk of a file's live bytes from the working tree.
   # (The PVC is authoritative for binaries; archived revisions are served by the
   # REST blob endpoint with ?revision=.)
-  # Payload: { path:, offset: 0, length: 65536 }
-  # Reply:   { path:, offset:, length: (actual), size: (total), eof: bool, data: base64 }
+  # Payload: { id: or path:, offset: 0, length: 65536 }
+  # Reply:   { id:, path:, offset:, length: (actual), size: (total), eof: bool, data: base64 }
   def self.handle_read_binary(session, payload, send_fn)
-    path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     flusher = flusher_for(session.project_id, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'no disk root configured' }) unless flusher
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'no disk root configured')) unless flusher
     disk_path = ProjectFs.disk_path(flusher.root_path, node.path)
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'not present on disk' }) unless File.file?(disk_path)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'not present on disk')) unless File.file?(disk_path)
 
     offset = [payload['offset'].to_i, 0].max
     # Cap a single chunk at 1 MB to keep WS frames sane. The client should
@@ -232,14 +234,13 @@ module FsStore
         bytes = f.read(length).to_s
       end
     end
-    send_fn.call(session.ws, 'fs', 'binary_chunk', {
-      path:   node.path,
+    send_fn.call(session.ws, 'fs', 'binary_chunk', doc_fields(node, branch_of(payload)).merge(
       offset: offset,
       length: bytes.bytesize,
       size:   total,
       eof:    offset + bytes.bytesize >= total,
       data:   Base64.strict_encode64(bytes)
-    })
+    ))
   end
 
   # stat — metadata snapshot for the explorer Properties panel (#5).
@@ -252,24 +253,24 @@ module FsStore
   # open — register this session as viewing a file on a branch; receive that
   # branch's peer viewer list
   def self.handle_open(session, payload, send_fn)
-    path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
-    norm   = node.path
     branch = branch_of(payload)
-    key    = doc_key(session.project_id, norm, branch)
-    doc    = OPEN_DOCUMENTS[key] ||= OpenDocument.new(session.project_id, norm, branch)
+    key    = doc_key(session.project_id, node.id, branch)
+    doc    = OPEN_DOCUMENTS[key] ||= OpenDocument.new(session.project_id, node.id, branch, path: node.path)
+    doc.path = node.path
     doc.add_client(session.ws, user_id: session.user_id, name: session.name)
     session.open_file(key)
 
-    send_fn.call(session.ws, 'fs', 'opened', { path: norm, branch: branch, viewers: doc.viewers })
+    send_fn.call(session.ws, 'fs', 'opened', doc_fields(node, branch).merge(viewers: doc.viewers))
   end
 
   # close — unregister this session from a file on a branch. The remaining
   # viewers are told (fs/viewer_left) so they drop this session's cursor.
   def self.handle_close(session, payload, broadcast_fn)
-    key = doc_key(session.project_id, normalize(payload['path']), branch_of(payload))
+    id = node_id_of(session, payload) or return
+    key = doc_key(session.project_id, id, branch_of(payload))
     doc = OPEN_DOCUMENTS[key]
     return unless doc
 
@@ -286,7 +287,7 @@ module FsStore
       OPEN_DOCUMENTS.delete(key)
     elsif broadcast_fn
       broadcast_fn.call(doc.clients.keys, 'fs', 'viewer_left', {
-        path: doc.path, branch: doc.branch, user_id: session.user_id, name: session.name
+        id: doc.node_id, path: doc.path, branch: doc.branch, user_id: session.user_id, name: session.name
       })
     end
   end
@@ -294,9 +295,9 @@ module FsStore
   # cursor — update this session's cursor position and broadcast to co-viewers
   # of the same branch
   def self.handle_cursor(session, payload, broadcast_fn)
-    norm   = normalize(payload['path'])
+    id     = node_id_of(session, payload) or return
     branch = branch_of(payload)
-    doc    = OPEN_DOCUMENTS[doc_key(session.project_id, norm, branch)]
+    doc    = OPEN_DOCUMENTS[doc_key(session.project_id, id, branch)]
     return unless doc&.member?(session.ws)
 
     line = payload['line'].to_i
@@ -304,7 +305,8 @@ module FsStore
     doc.update_cursor(session.ws, line: line, char: char)
 
     broadcast_fn.call(doc.others(session.ws), 'fs', 'cursor', {
-      path:    norm,
+      id:      doc.node_id,
+      path:    doc.path,
       branch:  branch,
       user_id: session.user_id,
       name:    session.name,
@@ -313,7 +315,7 @@ module FsStore
     })
   end
 
-  # write — { path:, changes: [...], base_revision_id: (optional) }
+  # write — { id:, changes: [...], base_revision_id: (optional) }
   # Each change: { change_type:, change_data:, start_line:, start_char:, end_line:, end_char: }
   # change_data is the JSON payload DbfsV2::Delta parses ({startLine, startChar, ...}).
   #
@@ -322,12 +324,10 @@ module FsStore
   # still the head, otherwise auto-branched there and rebased onto main; see
   # ProjectFs.write_batch!.
   def self.handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path    = payload['path'].to_s.strip
     changes = Array(payload['changes'])
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, message: 'no changes provided' }) if changes.empty?
-
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node    = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(message: 'no changes provided')) if changes.empty?
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     deltas =
       begin
@@ -336,22 +336,21 @@ module FsStore
           DbfsV2::Delta.parse(ch['change_type'].to_s, data.is_a?(Hash) ? data : data.to_s)
         end
       rescue JSON::ParserError => e
-        return send_fn.call(session.ws, 'fs', 'error', { path: node.path, branch: branch_of(payload), batch_id: payload['batch_id'],
-                                                         error: "bad change_data: #{e.message}", resync: true })
+        return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(
+          batch_id: payload['batch_id'], error: "bad change_data: #{e.message}", resync: true))
       end
-    commit_and_broadcast(session, node.path, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn,
+    commit_and_broadcast(session, node, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn,
                          batch_id: payload['batch_id'].presence, branch: branch_of(payload))
   end
 
   def self.handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path    = payload['path'].to_s.strip
     content = payload['content'].to_s.dup.force_encoding('UTF-8')
     content = content.scrub('') unless content.valid_encoding?
-    node    = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node    = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     delta = DbfsV2::Delta.new('setContents', { data: content })
-    commit_and_broadcast(session, node.path, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn,
+    commit_and_broadcast(session, node, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn,
                          batch_id: payload['batch_id'].presence, branch: branch_of(payload))
   end
 
@@ -369,9 +368,10 @@ module FsStore
   # and gets the original reply instead of the batch being applied twice. The
   # memory is per worker process (RecentBatches), so it covers socket drops, not
   # a worker restart.
-  def self.commit_and_broadcast(session, path, deltas, base_revision_id, send_fn, broadcast_fn,
+  def self.commit_and_broadcast(session, node, deltas, base_revision_id, send_fn, broadcast_fn,
                                 batch_id: nil, branch: Branch::MAIN)
-    key = batch_id && "#{session.project_id}:#{session.user_id}:#{batch_id}"
+    path = node.path
+    key  = batch_id && "#{session.project_id}:#{session.user_id}:#{batch_id}"
     if key && (replay = RecentBatches.get(key))
       return send_fn.call(session.ws, 'fs', replay[0], replay[1])
     end
@@ -382,23 +382,22 @@ module FsStore
     end
 
     store = store_for(session)
-    node  = store.resolve(path)
     result =
       begin
         ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id,
                                branch: branch)
       rescue ProjectFs::BranchConflict => e
-        return reply.call('error', { path: path, branch: branch, error: e.message, conflict: true, resync: true,
-                                     auto_branch: e.branch, auto_branch_head: e.branch_head })
+        return reply.call('error', doc_fields(node, branch).merge(error: e.message, conflict: true, resync: true,
+                                     auto_branch: e.branch, auto_branch_head: e.branch_head))
       rescue DbfsV2::ConflictError => e
-        return reply.call('error', { path: path, branch: branch, error: e.message, conflict: true, resync: true })
+        return reply.call('error', doc_fields(node, branch).merge(error: e.message, conflict: true, resync: true))
       rescue ArgumentError, JSON::ParserError, RegexpError, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotFound => e
-        return reply.call('error', { path: path, branch: branch, error: e.message, resync: true })
+        return reply.call('error', doc_fields(node, branch).merge(error: e.message, resync: true))
       end
 
     reply.call('written', ProjectFs.batch_ack(path, result, node))
 
-    doc   = OPEN_DOCUMENTS[doc_key(session.project_id, path, branch)]
+    doc   = OPEN_DOCUMENTS[doc_key(session.project_id, node.id, branch)]
     peers = doc ? doc.others(session.ws) : []
     unless peers.empty?
       ProjectFs.batch_peer_frames(path, result, node, user_id: session.user_id).each do |cmd, frame|
@@ -409,13 +408,13 @@ module FsStore
     flusher_for(session.project_id, branch)&.record_write(node.id, result.revisions.sum { |r| r.change_data.to_s.bytesize })
   end
 
-  # branches — { path } -> fs/branches { path, branches: [{ name, head }] }
+  # branches — { id } -> fs/branches { id, path, branches: [{ name, head }] }
   def self.handle_branches(session, payload, send_fn)
-    path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
-    send_fn.call(session.ws, 'fs', 'branches', { path: node.path, branches: store_for(session).branches(node.path, branch: branch_of(payload)) })
+    send_fn.call(session.ws, 'fs', 'branches', doc_fields(node, branch_of(payload)).merge(
+      branches: store_for(session).branches(node.path, branch: branch_of(payload))))
   end
 
   BRANCH_NAME = %r{\A(?!auto/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\z}
@@ -427,18 +426,17 @@ module FsStore
   # Replies fs/branch_created to the caller and tells every other session of
   # the project, so open pickers for the file can refresh.
   def self.handle_branch_create(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path = payload['path'].to_s.strip
     name = payload['name'].to_s.strip
     from = payload['from'].presence || Branch::MAIN
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
     unless BRANCH_NAME.match?(name)
-      return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "bad branch name #{name.inspect}" })
+      return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: "bad branch name #{name.inspect}"))
     end
 
     b = store_for(session).branch(node.path, name, from: from, at_revision: payload['at_revision'].presence,
                                   branch: branch_of(payload))
-    frame = { path: node.path, name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id }
+    frame = doc_fields(node, branch_of(payload)).merge(name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id)
     send_fn.call(session.ws, 'fs', 'branch_created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_created', frame)
   end
@@ -450,22 +448,21 @@ module FsStore
   # re-homes the branch's revisions to main). Replies fs/branch_deleted to the
   # caller and every other session of the project.
   def self.handle_branch_delete(session, payload, sessions_by_project, send_fn, broadcast_fn)
-    path = payload['path'].to_s.strip
     name = payload['name'].to_s.strip
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
-    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: "cannot delete #{Branch::MAIN}" }) if name == Branch::MAIN
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: "cannot delete #{Branch::MAIN}")) if name == Branch::MAIN
 
-    doc    = OPEN_DOCUMENTS[doc_key(session.project_id, node.path, name)]
+    doc    = OPEN_DOCUMENTS[doc_key(session.project_id, node.id, name)]
     others = doc ? doc.others(session.ws) : []
     unless others.empty?
-      return send_fn.call(session.ws, 'fs', 'error', {
-        path: node.path, error: "branch #{name} is open by #{others.size} other viewer#{'s' if others.size != 1}"
-      })
+      return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(
+        error: "branch #{name} is open by #{others.size} other viewer#{'s' if others.size != 1}"
+      ))
     end
 
     store_for(session).delete_branch(node.path, name, branch: branch_of(payload))
-    frame = { path: node.path, name: name, user_id: session.user_id }
+    frame = doc_fields(node, branch_of(payload)).merge(name: name, user_id: session.user_id)
     send_fn.call(session.ws, 'fs', 'branch_deleted', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_deleted', frame)
   end
@@ -478,16 +475,15 @@ module FsStore
   DAG_DEFAULT_GAP_MS = 3000
 
   def self.handle_dag(session, payload, send_fn)
-    path = payload['path'].to_s.strip
-    node = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
+    node = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     gap  = payload.key?('gap_ms') ? payload['gap_ms'].to_i : DAG_DEFAULT_GAP_MS
     auto = payload['auto'] == true
     g    = store_for(session).dag_condensed(node.path, gap_ms: gap, auto: auto, branch: branch_of(payload))
     ids  = g[:nodes].map { |n| n[:user_id] }.compact.uniq
     g[:users] = User.where(id: ids).to_h { |u| [u.id, u.display_name] }
-    send_fn.call(session.ws, 'fs', 'dag', g)
+    send_fn.call(session.ws, 'fs', 'dag', g.merge(doc_fields(node, branch_of(payload))))
   end
 
   # --- project branches (ADR-042) ---------------------------------------------
@@ -657,10 +653,10 @@ module FsStore
         entry = state.entries[a[:id]]
         next unless entry
         flusher&.record_write(a[:id], 0)
-        doc = OPEN_DOCUMENTS[doc_key(session.project_id, entry.path, target)]
+        doc = OPEN_DOCUMENTS[doc_key(session.project_id, a[:id], target)]
         next unless doc && !doc.empty?
         broadcast_fn.call(doc.clients.keys, 'fs', 'set_contents', {
-          path: entry.path, branch: target, content: store.read(entry.path, branch: target),
+          id: a[:id], path: entry.path, branch: target, content: store.read(entry.path, branch: target),
           revision: a[:head], parent: a[:ours_revision], user_id: session.user_id,
           source: "merge #{res[:source]}"
         })
@@ -675,12 +671,11 @@ module FsStore
   # landed, viewers of the target get one set_contents frame chained to the head
   # they held, and main's flusher is nudged.
   def self.handle_merge(session, payload, send_fn, broadcast_fn)
-    path   = payload['path'].to_s.strip
     source = payload['source'].to_s.strip
     target = payload['target'].presence || Branch::MAIN
-    node   = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
-    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
+    node   = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'source and target are the same branch')) if source == target
 
     store    = store_for(session)
     resolved = node.resolve || node
@@ -688,7 +683,7 @@ module FsStore
     res      = store.merge(node.path, target: target, source: source, auto: true, user_id: session.user_id,
                            branch: branch_of(payload))
 
-    reply = { path: node.path, source: source, target: target, merged: res[:merged] == true }
+    reply = doc_fields(node, branch_of(payload)).merge(source: source, target: target, merged: res[:merged] == true)
     unless reply[:merged]
       reply[:reason]    = res[:reason]
       reply[:error]     = res[:error] if res[:error]
@@ -705,15 +700,14 @@ module FsStore
   # refused on, `clean`, and `merged` — the exact auto-merge result when clean,
   # else a diff3 text with markers plus `conflict_blocks` locating them.
   def self.handle_merge_preview(session, payload, send_fn)
-    path   = payload['path'].to_s.strip
     source = payload['source'].to_s.strip
     target = payload['target'].presence || Branch::MAIN
-    node   = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
-    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
+    node   = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'source and target are the same branch')) if source == target
 
     p = store_for(session).merge_preview(node.path, target: target, source: source, branch: branch_of(payload))
-    send_fn.call(session.ws, 'fs', 'merge_preview', p.merge(path: node.path))
+    send_fn.call(session.ws, 'fs', 'merge_preview', p.merge(id: node.id, path: node.path))
   end
 
   # merge_resolve — { path, source, target?, content, expected_head,
@@ -724,20 +718,19 @@ module FsStore
   # error } so the client re-previews. On success the reply and viewer
   # broadcast are the same as fs/merge.
   def self.handle_merge_resolve(session, payload, send_fn, broadcast_fn)
-    path   = payload['path'].to_s.strip
     source = payload['source'].to_s.strip
     target = payload['target'].presence || Branch::MAIN
-    node   = find_node!(session.project_id, path, branch_of(payload))
-    return send_fn.call(session.ws, 'fs', 'error', { path: path, error: 'is a directory' }) if node.ftype == 'folder'
-    return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'source and target are the same branch' }) if source == target
+    node   = file_of!(session, payload)
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'source and target are the same branch')) if source == target
     unless payload.key?('content') && payload['expected_head'].present?
-      return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'content and expected_head are required' })
+      return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'content and expected_head are required'))
     end
 
     store    = store_for(session)
     resolved = node.resolve || node
     old_head = payload['expected_head']
-    reply    = { path: node.path, source: source, target: target }
+    reply    = doc_fields(node, branch_of(payload)).merge(source: source, target: target)
     begin
       store.merge(node.path, target: target, source: source, resolved: payload['content'].to_s,
                              user_id: session.user_id, expected_head: old_head,
@@ -758,12 +751,12 @@ module FsStore
     reply[:head] = head
     send_fn.call(session.ws, 'fs', 'merged', reply)
 
-    doc = OPEN_DOCUMENTS[doc_key(session.project_id, node.path, target)]
+    doc = OPEN_DOCUMENTS[doc_key(session.project_id, node.id, target)]
     if doc && !doc.empty? && head != old_head
-      broadcast_fn.call(doc.clients.keys, 'fs', 'set_contents', {
-        path: node.path, branch: target, content: store.read(node.path, branch: target),
+      broadcast_fn.call(doc.clients.keys, 'fs', 'set_contents', doc_fields(node, target).merge(
+        content: store.read(node.path, branch: target),
         revision: head, parent: old_head, user_id: session.user_id, source: "merge #{source}"
-      })
+      ))
     end
 
     flusher_for(session.project_id, target)&.record_write(resolved.id, 0)
@@ -820,7 +813,10 @@ module FsStore
     old_path = node.path
     new_path = File.join(File.dirname(old_path), new_name)
     moved    = store.move(old_path, new_path, user_id: session.user_id, branch: branch)
-    rekey_open_documents!(session.project_id, old_path, moved.path, branch, sessions_by_project)
+    # Location only: the OPEN_DOCUMENTS key stays (project, id, branch). A
+    # folder move also rewrites descendant docs so later frames name the
+    # new path (the tab label does not depend on fs/renamed).
+    relocate_open_documents!(session.project_id, branch, old_path, moved.path)
 
     flusher = flusher_for(session.project_id, branch)
     if flusher
@@ -1021,35 +1017,41 @@ module FsStore
     payload.is_a?(Hash) ? (payload['branch'].to_s.strip.presence || Branch::MAIN) : Branch::MAIN
   end
 
-  # OPEN_DOCUMENTS key: one viewer set per (project, path, branch). Path is the
-  # location; identity of the file is FileNode UUID (stable across rename).
-  def self.doc_key(project_id, path, branch = Branch::MAIN)
-    "#{project_id}:#{path}@#{branch}"
+  # OPEN_DOCUMENTS key: one viewer set per (project, FileNode UUID, branch).
+  # Path is location; a rename does not rekey.
+  def self.doc_key(project_id, node_id, branch = Branch::MAIN)
+    "#{project_id}:#{node_id}@#{branch}"
   end
 
-  # A rename keeps the FileNode id and the viewer set; only the path in the
-  # key (and on the OpenDocument) moves, including descendants of a folder.
-  def self.rekey_open_documents!(project_id, old_path, new_path, branch, sessions_by_project)
-    old_path = normalize(old_path)
-    new_path = normalize(new_path)
-    return if old_path == new_path
-    mapping = {}
-    OPEN_DOCUMENTS.keys.each do |key|
-      doc = OPEN_DOCUMENTS[key]
-      next unless doc && doc.project_id == project_id && doc.branch == branch
-      next unless doc.path == old_path || doc.path.start_with?("#{old_path}/")
-      newp = doc.path == old_path ? new_path : "#{new_path}#{doc.path.delete_prefix(old_path)}"
-      new_key = doc_key(project_id, newp, branch)
-      next if new_key == key
-      mapping[key] = new_key
-      doc.relocate(newp)
-      OPEN_DOCUMENTS.delete(key)
-      OPEN_DOCUMENTS[new_key] = doc
+  def self.relocate_open_documents!(project_id, branch, from_path, to_path)
+    OPEN_DOCUMENTS.each_value do |doc|
+      next unless doc.project_id.to_s == project_id.to_s && doc.branch.to_s == branch.to_s
+      doc.relocate_under(from_path, to_path)
     end
-    return if mapping.empty?
-    (sessions_by_project[project_id] || []).each do |s|
-      s.open_files.map! { |k| mapping[k] || k }
+  end
+
+  # The document a command names: FileNode UUID (`id`) is identity. Path
+  # locates a node when the caller has no id (agent tools, tests).
+  def self.file_of!(session, payload)
+    store  = store_for(session)
+    branch = branch_of(payload)
+    id     = payload['id'].to_s.strip.presence
+    if id
+      node = store.find_id(id, branch: branch)
+      raise ActiveRecord::RecordNotFound, id unless node
+      return node
     end
+    find_node!(session.project_id, payload['path'].to_s.strip, branch)
+  end
+
+  def self.node_id_of(session, payload)
+    id = payload['id'].to_s.strip.presence
+    return id if id
+    path = payload['path'].to_s.strip
+    return nil if path.empty?
+    file_of!(session, payload).id
+  rescue ActiveRecord::RecordNotFound
+    nil
   end
 
   # The node `path` names as `branch` sees it: a project branch's index when

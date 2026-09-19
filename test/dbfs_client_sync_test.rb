@@ -116,7 +116,7 @@ class DbfsClientSyncTest < Minitest::Test
     rnd = Random.new(seed)
     project = Project.create!(name: "sync-#{seed}-#{mode}", uuid: SecureRandom.uuid)
     store = ProjectFs.store(project.id)
-    store.create_file(PATH, content: "start\nline two\n")
+    node = store.create_file(PATH, content: "start\nline two\n")
     driver = SyncDriver.new
     nets = {}
     SESSIONS_BY_PROJECT[project.id] = []
@@ -125,8 +125,8 @@ class DbfsClientSyncTest < Minitest::Test
       net = ClientNet.new(i, project.id)
       nets[i] = net
       SESSIONS_BY_PROJECT[project.id] << net.session
-      fs(net, 'open', path: PATH)
-      route(nets, driver.call(op: 'create', id: i, path: PATH, seed: seed * 100 + i).first)
+      fs(net, 'open', id: node.id)
+      route(nets, driver.call(op: 'create', id: i, file_id: node.id, seed: seed * 100 + i).first)
     end
 
     deliver_to_server = lambda do |net|
@@ -154,7 +154,7 @@ class DbfsClientSyncTest < Minitest::Test
           driver.call(op: 'disconnect', id: net.id)
         else
           net.connected = true
-          fs(net, 'open', path: PATH)
+          fs(net, 'open', id: node.id)
           route(nets, driver.call(op: 'connect', id: net.id).first)
         end
       end
@@ -163,7 +163,7 @@ class DbfsClientSyncTest < Minitest::Test
     nets.each_value do |net|
       next if net.connected
       net.connected = true
-      fs(net, 'open', path: PATH)
+      fs(net, 'open', id: node.id)
       route(nets, driver.call(op: 'connect', id: net.id).first)
     end
     200.times do

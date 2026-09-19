@@ -1,7 +1,7 @@
 // Hosts N carbide2-client fileSync instances for test/dbfs_client_sync_test.rb.
 // Line protocol on stdin/stdout, one JSON object per line.
 //
-// in:  { op: 'create', id, path, seed }
+// in:  { op: 'create', id, file_id, seed }
 //      { op: 'frame', id, cmd, payload }      a worker frame delivered to client id
 //      { op: 'type', id, mode }               client id makes one random local edit
 //      { op: 'disconnect' | 'connect', id }
@@ -24,7 +24,7 @@ function rng(seed) {
   return () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x / 4294967296 }
 }
 
-function makeClient(id, path, seed) {
+function makeClient(id, fileId, seed) {
   const view = { text: '' }
   const editor = {
     applyChanges: (cs) => { view.text = applyChanges(view.text, cs) },
@@ -32,7 +32,7 @@ function makeClient(id, path, seed) {
   }
   const c = { id, view, random: rng(seed), counter: 0, lost: [], batches: new Map() }
   c.sync = createFileSync({
-    path,
+    id: fileId,
     editor,
     // The scheduler delivers, delays and loses every frame itself; a wall-clock
     // resend/abandon firing between steps would make a run non-reproducible.
@@ -90,7 +90,7 @@ for await (const line of rl) {
   const c = clients[msg.id]
   switch (msg.op) {
     case 'create': {
-      const nc = makeClient(msg.id, msg.path, msg.seed)
+      const nc = makeClient(msg.id, msg.file_id, msg.seed)
       clients[msg.id] = nc
       nc.sync.load()
       break

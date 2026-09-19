@@ -73,7 +73,7 @@ class Session
     @rooms.each do |rid|
       CHAT_ROOMS[rid]&.remove_client(@ws)
     end
-    # @open_files holds OPEN_DOCUMENTS keys (FsStore.doc_key: project, path, branch).
+    # @open_files holds OPEN_DOCUMENTS keys (FsStore.doc_key: project, FileNode id, branch).
     @open_files.dup.each do |key|
       doc = OPEN_DOCUMENTS[key]
       next unless doc

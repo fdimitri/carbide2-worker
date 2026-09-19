@@ -227,7 +227,7 @@ module AgentTools
     result = ProjectFs.write_batch!(ProjectFs.store(project_id), node.path, deltas,
                                     base_revision_id: base_revision_id, user_id: user_id)
 
-    doc   = defined?(OPEN_DOCUMENTS) ? OPEN_DOCUMENTS[FsStore.doc_key(project_id, node.path)] : nil
+    doc   = defined?(OPEN_DOCUMENTS) ? OPEN_DOCUMENTS[FsStore.doc_key(project_id, node.id)] : nil
     peers = doc ? doc.clients.keys : []
     unless peers.empty?
       ProjectFs.batch_peer_frames(node.path, result, node, user_id: user_id).each do |cmd, frame|
