@@ -4,11 +4,15 @@
 class OpenDocument
   attr_reader :path, :branch, :project_id, :clients
 
-  def initialize(project_id, path, branch = Branch::MAIN)
+  def initialize(project_id, path, branch = 'main')
     @project_id = project_id
     @path       = path   # normalized with leading /
     @branch     = branch
     @clients    = {}     # ws => { user_id:, name: }
+  end
+
+  def relocate(new_path)
+    @path = new_path
   end
 
   def add_client(ws, user_id:, name:)

@@ -8,10 +8,15 @@ require_relative '../open_document'
 # The key is the socket OBJECT (`@clients` is keyed by `s`, and `others(ws)`
 # rejects by identity). That is what makes one entry per connection, however
 # many panes that connection is rendering — the property the client-side
-# one-tab-per-file rule exists to be compatible with.
+# one-tab-per-(node, branch) rule exists to be compatible with.
 class OpenDocumentTest < Minitest::Test
   def setup
     @doc = OpenDocument.new(1, '/README.md')
+  end
+
+  def test_relocate_updates_the_path
+    @doc.relocate('/moved.md')
+    assert_equal '/moved.md', @doc.path
   end
 
   def test_a_new_document_has_no_clients
