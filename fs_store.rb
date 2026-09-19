@@ -779,6 +779,7 @@ module FsStore
     flusher_for(session.project_id, branch)&.record_write(node.id, content.bytesize)
 
     frame = { path: node.path, type: 'file', id: node.id, branch: branch }
+    # Explorer applies this frame locally; it does not refetch fs/tree.
     send_fn.call(session.ws, 'fs', 'created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'created', frame.merge(user_id: session.user_id))
   end
