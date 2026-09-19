@@ -162,13 +162,13 @@ module FsStore
   # Handlers
   # -------------------------------------------------------------------------
 
-  # tree — { branch? } the whole tree as main (tree_json) or a project branch
-  # (its index) has it. The reply names the branch so an explorer can ignore a
-  # tree for a view it is not showing.
+  # tree — { branch? } the whole tree as this project branch currently has it.
+  # The reply names the branch so an explorer can ignore a tree for a view it
+  # is not showing.
   def self.handle_tree(session, payload, send_fn)
     store  = store_for(session)
     branch = view_branch(store, payload)
-    tree   = branch == Branch::MAIN ? ProjectFs.tree_json(session.project_id) : store.tree('/', branch: branch)
+    tree   = store.tree('/', branch: branch) || []
     send_fn.call(session.ws, 'fs', 'tree', { tree: tree, branch: branch })
   end
 
