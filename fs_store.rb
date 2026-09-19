@@ -911,8 +911,12 @@ module FsStore
 
     EM.defer(
       proc do
-        ActiveRecord::Base.connection_pool.with_connection do
-          do_import_git(project_id, user_id, root, git_url, git_ref)
+        begin
+          ActiveRecord::Base.connection_pool.with_connection do
+            do_import_git(project_id, user_id, root, git_url, git_ref)
+          end
+        ensure
+          worker_release_db! if defined?(worker_release_db!)
         end
       end,
       proc do |result|

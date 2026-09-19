@@ -291,6 +291,10 @@ class AgentSession
     max_turns = agent_max_turns
     max_turns.times do |turn|
       return emit_stopped(turn) if cancelled?
+      # push_history! / AGENTS.md already leased a connection on this defer
+      # thread. The model HTTP can sit for TIMEOUT_S; keep that lease and
+      # the pool of 5 (or 25) dies on the next ask / FsLoader / tool write.
+      worker_release_db! if defined?(worker_release_db!)
       response = post_chat_completion
       msg      = response.dig('choices', 0, 'message') || {}
       content  = msg['content']
@@ -343,6 +347,7 @@ class AgentSession
       calls.each do |call|
         return emit_stopped(turn) if cancelled?
         run_tool_call(call)
+        worker_release_db! if defined?(worker_release_db!)
       end
     end
     close_turn!(status: 'error')

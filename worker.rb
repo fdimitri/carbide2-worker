@@ -616,6 +616,8 @@ EM.run do
         end
       rescue => e
         puts "[startup] FS load failed: #{e.class}: #{e.message}"
+      ensure
+        worker_release_db! if defined?(worker_release_db!)
       end
     end
   end

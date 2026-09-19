@@ -393,6 +393,8 @@ class VfsWatcher
       end
     rescue => e
       [{ status: :error, error: "#{e.class}: #{e.message}" }, true]
+    ensure
+      worker_release_db! if defined?(worker_release_db!)
     end
 
     done = proc do |(res, existed)|
@@ -544,6 +546,8 @@ class VfsWatcher
         end
       rescue => e
         puts "[VfsWatcher:#{project_id}] reconcile error: #{e.class}: #{e.message}"
+      ensure
+        worker_release_db! if defined?(worker_release_db!)
       end
       imported
     end

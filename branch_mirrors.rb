@@ -49,11 +49,15 @@ module BranchMirrors
       pb.update!(materialized: true) unless pb.materialized?
 
       work = proc do
-        ActiveRecord::Base.connection_pool.with_connection do
-          FileUtils.mkdir_p(root)
-          n = DbfsV2::Flusher.new(ProjectFs.store(project.id, branch: pb.name), root).flush_all
-          puts "[BranchMirrors:#{project.id}@#{pb.name}] materialized #{n} entr#{n == 1 ? 'y' : 'ies'} at #{root}"
-          n
+        begin
+          ActiveRecord::Base.connection_pool.with_connection do
+            FileUtils.mkdir_p(root)
+            n = DbfsV2::Flusher.new(ProjectFs.store(project.id, branch: pb.name), root).flush_all
+            puts "[BranchMirrors:#{project.id}@#{pb.name}] materialized #{n} entr#{n == 1 ? 'y' : 'ies'} at #{root}"
+            n
+          end
+        ensure
+          worker_release_db! if defined?(worker_release_db!)
         end
       end
 
