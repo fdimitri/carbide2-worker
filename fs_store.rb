@@ -820,6 +820,7 @@ module FsStore
     old_path = node.path
     new_path = File.join(File.dirname(old_path), new_name)
     moved    = store.move(old_path, new_path, user_id: session.user_id, branch: branch)
+    rekey_open_documents!(session.project_id, old_path, moved.path, branch, sessions_by_project)
 
     flusher = flusher_for(session.project_id, branch)
     if flusher
@@ -1020,9 +1021,35 @@ module FsStore
     payload.is_a?(Hash) ? (payload['branch'].to_s.strip.presence || Branch::MAIN) : Branch::MAIN
   end
 
-  # OPEN_DOCUMENTS key: one viewer set per (project, path, branch).
+  # OPEN_DOCUMENTS key: one viewer set per (project, path, branch). Path is the
+  # location; identity of the file is FileNode UUID (stable across rename).
   def self.doc_key(project_id, path, branch = Branch::MAIN)
     "#{project_id}:#{path}@#{branch}"
+  end
+
+  # A rename keeps the FileNode id and the viewer set; only the path in the
+  # key (and on the OpenDocument) moves, including descendants of a folder.
+  def self.rekey_open_documents!(project_id, old_path, new_path, branch, sessions_by_project)
+    old_path = normalize(old_path)
+    new_path = normalize(new_path)
+    return if old_path == new_path
+    mapping = {}
+    OPEN_DOCUMENTS.keys.each do |key|
+      doc = OPEN_DOCUMENTS[key]
+      next unless doc && doc.project_id == project_id && doc.branch == branch
+      next unless doc.path == old_path || doc.path.start_with?("#{old_path}/")
+      newp = doc.path == old_path ? new_path : "#{new_path}#{doc.path.delete_prefix(old_path)}"
+      new_key = doc_key(project_id, newp, branch)
+      next if new_key == key
+      mapping[key] = new_key
+      doc.relocate(newp)
+      OPEN_DOCUMENTS.delete(key)
+      OPEN_DOCUMENTS[new_key] = doc
+    end
+    return if mapping.empty?
+    (sessions_by_project[project_id] || []).each do |s|
+      s.open_files.map! { |k| mapping[k] || k }
+    end
   end
 
   # The node `path` names as `branch` sees it: a project branch's index when
