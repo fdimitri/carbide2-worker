@@ -199,7 +199,14 @@ PROBE_DEADLINE_SECONDS = 5
 # identity + content, atomic); fs/project_merged announces a commit.
 # fs/project_dag { gap_ms? } is the project's branch graph.
 # Additive; MIN_CLIENT stays 1.
-PROTOCOL   = 11
+# PROTOCOL 11: fs/project_branch_materialize { name, on } ->
+# fs/project_branch_materialized { branch, on }; branches carry `disk`.
+# PROTOCOL 12: document identity is FileNode UUID. fs/open, close, read,
+# write, cursor, set_contents, branches, branch_*, merge*, dag take `id`
+# (path still locates when id is absent). Frames carry `id`. OPEN_DOCUMENTS
+# is keyed by (project, id, branch); a rename does not rekey. The client
+# below 12 still names documents by path, so MIN_CLIENT stays 1.
+PROTOCOL   = 12
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
@@ -266,7 +273,7 @@ end
 # ---------------------------------------------------------------------------
 TERMINALS           = {}        # terminal_id (int) => TerminalInstance
 CHAT_ROOMS          = {}        # room_id (string)  => ChatRoom
-OPEN_DOCUMENTS      = {}        # FsStore.doc_key(project_id, path, branch) => OpenDocument
+OPEN_DOCUMENTS      = {}        # FsStore.doc_key(project_id, file_node_id, branch) => OpenDocument
 SESSION_SUBSCRIBERS = {}        # browser_session uuid => { ws => {user_id:,name:,role:} }
 SHELL_HANDLES       = {}        # terminal_id (int) => ShellClient::Handle
 SESSIONS_BY_PROJECT = {}        # project_id => [Session, ...]

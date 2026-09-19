@@ -11,12 +11,36 @@ require_relative '../open_document'
 # one-tab-per-(node, branch) rule exists to be compatible with.
 class OpenDocumentTest < Minitest::Test
   def setup
-    @doc = OpenDocument.new(1, '/README.md')
+    @doc = OpenDocument.new(1, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', 'main', path: '/README.md')
   end
 
-  def test_relocate_updates_the_path
-    @doc.relocate('/moved.md')
+  def test_identity_is_the_node_id_path_is_location
+    assert_equal 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', @doc.node_id
+    assert_equal '/README.md', @doc.path
+    @doc.path = '/moved.md'
     assert_equal '/moved.md', @doc.path
+    assert_equal 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', @doc.node_id
+  end
+
+  def test_relocate_under_moves_the_path_not_identity
+    @doc.relocate_under('/README.md', '/docs/README.md')
+    assert_equal '/docs/README.md', @doc.path
+    assert_equal 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', @doc.node_id
+    assert_equal 'main', @doc.branch
+  end
+
+  def test_relocate_under_rewrites_a_descendant_path
+    child = OpenDocument.new(1, 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', 'main', path: '/lib/a.rb')
+    child.relocate_under('/lib', '/src')
+    assert_equal '/src/a.rb', child.path
+    child.relocate_under('/other', '/nope')
+    assert_equal '/src/a.rb', child.path
+  end
+
+  def test_relocate_under_does_not_match_a_path_prefix_sibling
+    sib = OpenDocument.new(1, 'cccccccc-dddd-4eee-8fff-000000000000', 'main', path: '/lib2/a.rb')
+    sib.relocate_under('/lib', '/src')
+    assert_equal '/lib2/a.rb', sib.path
   end
 
   def test_a_new_document_has_no_clients
