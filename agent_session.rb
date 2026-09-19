@@ -354,6 +354,9 @@ class AgentSession
     emit('error', { message: "agent exceeded max_turns=#{max_turns}" })
     nil
   rescue => e
+    if e.is_a?(ActiveRecord::ConnectionTimeoutError) && defined?(WorkerDbPool)
+      WorkerDbPool.emit!(reason: "agent/ask #{e.class}")
+    end
     if cancelled?
       emit_stopped(nil)
     else

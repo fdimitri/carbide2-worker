@@ -60,5 +60,7 @@ end
 require_relative '../lib/dbfs_v2'
 require_relative '../app/services/project_fs'
 require_relative '../app/services/fs_loader'
+require_relative 'db_pool'
+WorkerDbPool.install!
 
 puts "[ar_boot] connected to Postgres at #{ENV.fetch('POSTGRES_HOST', '?')}:#{ENV.fetch('POSTGRES_PORT', '?')} pool=#{WORKER_DB_POOL}"
