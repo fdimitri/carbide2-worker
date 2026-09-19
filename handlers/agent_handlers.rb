@@ -563,6 +563,7 @@ module AgentHandlers
           sess.ask(msg, images: images, author_user_id: session.user_id)
         ensure
           sess.finish_turn!
+          worker_release_db! if defined?(worker_release_db!)
         end
       end
     rescue StandardError
