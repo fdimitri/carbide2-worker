@@ -277,8 +277,9 @@ class VfsWatcher
     if size > ProjectFs::MAX_FILE_SIZE
       existed = !@store.find(srcpath).nil?
       ProjectFs.track_oversized!(@store, srcpath, abs_path, user_id: @system_user_id)
+      node = @store.find(srcpath)
       broadcast(existed ? 'changed' : 'created',
-                { path: srcpath, type: 'file', size: size, binary: true, source: 'inotify' })
+                { path: srcpath, type: 'file', id: node&.id, size: size, binary: true, source: 'inotify' })
       puts "[VfsWatcher:#{tag}] tracked without content (#{size}B > cap): #{srcpath}"
       return
     end
@@ -315,7 +316,7 @@ class VfsWatcher
       node = res[:node]
       adopt_if_identical(node, abs_path, ProjectFs.head_revision_id(node, @branch), @store.read(srcpath).to_s)
       size = File.size(abs_path) rescue 0
-      broadcast('created', { path: srcpath, type: 'file', binary: false, size: size, source: 'inotify' })
+      broadcast('created', { path: srcpath, type: 'file', id: node.id, binary: false, size: size, source: 'inotify' })
       puts "[VfsWatcher:#{tag}] external create (text): #{srcpath} (#{size}B)"
       DebugStream.emit(:watcher, level: :info,
         message: "new text file #{srcpath} (#{size}B)", project_id: @project_id,
@@ -410,11 +411,12 @@ class VfsWatcher
   end
 
   def report_binary(srcpath, res, existed)
+    node = @store.find(srcpath)
     case res && res[:status]
     when :committed
       rev = res[:revision]
       broadcast(existed ? 'changed' : 'created', {
-        path: srcpath, type: 'file', binary: true, size: res[:size], revision: rev&.id, source: 'inotify'
+        path: srcpath, type: 'file', id: node&.id, binary: true, size: res[:size], revision: rev&.id, source: 'inotify'
       })
       puts "[VfsWatcher:#{tag}] external #{existed ? 'change' : 'create'} (binary): #{srcpath} (#{res[:size]}B)"
       DebugStream.emit(:watcher, level: :info,
@@ -422,7 +424,7 @@ class VfsWatcher
         project_id: @project_id,
         meta: { path: srcpath, binary: true, size: res[:size], rev: rev&.id, source: 'inotify' }) if defined?(DebugStream)
     when :noop
-      broadcast('created', { path: srcpath, type: 'file', binary: true, source: 'inotify' }) unless existed
+      broadcast('created', { path: srcpath, type: 'file', id: node&.id, binary: true, source: 'inotify' }) unless existed
     when :discarded
       # Still being written after every attempt; its next close_write reruns it.
       puts "[VfsWatcher:#{tag}] binary ingest discarded (file kept changing): #{srcpath}"
@@ -469,7 +471,7 @@ class VfsWatcher
     end
     node = ProjectFs.ensure_folder!(@store, srcpath, user_id: @system_user_id)
     ProjectFs.record_disk_stat!(node, abs_path)
-    broadcast('created', { path: srcpath, type: 'folder', source: 'inotify' })
+    broadcast('created', { path: srcpath, type: 'folder', id: node.id, source: 'inotify' })
     puts "[VfsWatcher:#{tag}] external mkdir: #{srcpath}"
     DebugStream.emit(:watcher, level: :info,
       message: "mkdir #{srcpath}", project_id: @project_id,
@@ -555,7 +557,7 @@ class VfsWatcher
     done = proc do |imported|
       @reconciling = false
       if imported.to_i.positive?
-        # Client refetches the whole tree on any fs/created (ExplorerPane).
+        # Bulk: many nodes, not one created. Explorer asks for a snapshot.
         broadcast('created', { path: '/', type: 'folder', source: 'inotify-reconcile' })
         puts "[VfsWatcher:#{tag}] reconcile imported #{imported} entries"
         DebugStream.emit(:watcher, level: :info,
