@@ -107,6 +107,7 @@ require_relative 'resolver'
 require_relative 'agent_session'
 require_relative 'command'
 require_relative 'debug_stream'
+require_relative 'worker_console'
 require_relative 'handlers/term_handlers'
 require_relative 'handlers/chat_handlers'
 require_relative 'handlers/fs_handlers'
@@ -530,6 +531,7 @@ end
 # ---------------------------------------------------------------------------
 EM.run do
   REACTOR_THREAD = Thread.current
+  WorkerConsole.start!
   host = ENV.fetch('WORKER_HOST', '0.0.0.0')
   port = ENV.fetch('WORKER_PORT', '8080').to_i
 
