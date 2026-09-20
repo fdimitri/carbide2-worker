@@ -206,7 +206,13 @@ PROBE_DEADLINE_SECONDS = 5
 # (path still locates when id is absent). Frames carry `id`. OPEN_DOCUMENTS
 # is keyed by (project, id, branch); a rename does not rekey. The client
 # below 12 still names documents by path, so MIN_CLIENT stays 1.
-PROTOCOL   = 12
+# PROTOCOL 13: identity visualizer. fs/identity_axis { branch? } ->
+# fs/identity_axis { branch, ticks: [{ seq, node_id }], marks: [{ seq,
+# node_id, name }] }; fs/identity_at { seq, branch? } -> fs/identity_at
+# { branch, seq, node: { id, seq, kind } | nil, events: [{ kind, path,
+# from_path, file_node_id, ftype }], entries: [{ id, path, ftype,
+# revision_id }] }. Additive; MIN_CLIENT stays 1.
+PROTOCOL   = 13
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
