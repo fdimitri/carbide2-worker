@@ -104,6 +104,10 @@ module FsStore
       handle_project_branch_materialize(session, payload, sessions_by_project, send_fn, broadcast_fn)
     when 'project_dag'
       handle_project_dag(session, payload, send_fn)
+    when 'identity_axis'
+      handle_identity_axis(session, payload, send_fn)
+    when 'identity_at'
+      handle_identity_at(session, payload, send_fn)
     when 'project_merge_preview'
       handle_project_merge(session, payload, sessions_by_project, send_fn, broadcast_fn, dry_run: true)
     when 'project_merge'
@@ -587,6 +591,28 @@ module FsStore
     ids = g[:nodes].map { |n| n[:user_id] }.compact.uniq
     g[:users] = User.where(id: ids).to_h { |u| [u.id, u.display_name] }
     send_fn.call(session.ws, 'fs', 'project_dag', g)
+  end
+
+  # identity_axis — { branch? } the identity visualizer's slider domain
+  # (DbfsV2::Store#identity_axis): fs/identity_axis { branch, ticks:
+  # [{ seq, node_id }], marks: [{ seq, node_id, name }] }. Default branch
+  # is main.
+  def self.handle_identity_axis(session, payload, send_fn)
+    branch = payload['branch'].presence || Branch::MAIN
+    send_fn.call(session.ws, 'fs', 'identity_axis',
+                 store_for(session).identity_axis(branch: branch))
+  end
+
+  # identity_at — { seq, branch? } the tree and FileEvents at clock `seq`
+  # on `branch` (DbfsV2::Store#identity_at): fs/identity_at { branch, seq,
+  # node: { id, seq, kind } | nil, events: [{ kind, path, from_path,
+  # file_node_id, ftype }], entries: [{ id, path, ftype, revision_id }] }.
+  # seq is required; fs/error { error: 'seq required' } when missing.
+  def self.handle_identity_at(session, payload, send_fn)
+    return send_fn.call(session.ws, 'fs', 'error', { error: 'seq required' }) if payload['seq'].nil?
+    branch = payload['branch'].presence || Branch::MAIN
+    send_fn.call(session.ws, 'fs', 'identity_at',
+                 store_for(session).identity_at(seq: payload['seq'], branch: branch))
   end
 
   # project_merge_preview / project_merge — { source, target?, resolutions? }
