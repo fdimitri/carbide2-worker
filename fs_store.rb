@@ -593,10 +593,10 @@ module FsStore
     send_fn.call(session.ws, 'fs', 'project_dag', g)
   end
 
-  # identity_axis — { branch? } the identity visualizer's slider domain
-  # (DbfsV2::Store#identity_axis): fs/identity_axis { branch, ticks:
-  # [{ seq, node_id }], marks: [{ seq, node_id, name }] }. Default branch
-  # is main.
+  # identity_axis — { branch? } first-parent segments for the identity
+  # visualizer (DbfsV2::Store#identity_axis): fs/identity_axis { branch,
+  # segments: [{ branch, ticks: [{ seq, node_id }], marks: [{ seq, node_id,
+  # kind: snapshot|fork|merge, name?, from? }] }] }. Default branch is main.
   def self.handle_identity_axis(session, payload, send_fn)
     branch = payload['branch'].presence || Branch::MAIN
     send_fn.call(session.ws, 'fs', 'identity_axis',

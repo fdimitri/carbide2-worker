@@ -212,7 +212,12 @@ PROBE_DEADLINE_SECONDS = 5
 # { branch, seq, node: { id, seq, kind } | nil, events: [{ kind, path,
 # from_path, file_node_id, ftype }], entries: [{ id, path, ftype,
 # revision_id }] }. Additive; MIN_CLIENT stays 1.
-PROTOCOL   = 13
+# PROTOCOL 14: identity_axis returns first-parent `segments`:
+# [{ branch, ticks: [{ seq, node_id }], marks: [{ seq, node_id, kind,
+# name?, from? }] }]. kind is snapshot | fork | merge. "This branch only"
+# is the last segment; ancestry is all of them. identity_at still takes
+# the tick's own branch. Additive; MIN_CLIENT stays 1.
+PROTOCOL   = 14
 MIN_CLIENT = 1
 
 # ---------------------------------------------------------------------------
