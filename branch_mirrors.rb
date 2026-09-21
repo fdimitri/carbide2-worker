@@ -16,7 +16,7 @@ require 'fileutils'
 module BranchMirrors
   DIR = '.branches'
 
-  Mirror = Struct.new(:project_id, :branch_id, :branch, :root, :flusher, :watcher, :timer, :state)
+    Mirror = Struct.new(:project_id, :branch_id, :branch, :root, :flusher, :watcher, :timer, :state, :ready)
 
   @mirrors = {} # [project_id, branch_name] => Mirror
 
@@ -33,20 +33,25 @@ module BranchMirrors
     # it is not materialized — what fs/project_branches reports as `disk`.
     def relative_dir(pb) = pb.materialized? ? File.join(DIR, pb.id.to_s) : nil
 
-    # Turn on: flag, flush the whole tree, start the pair. `on_ready` runs on
-    # the reactor when the pair is live (or with an exception). Idempotent for
-    # a branch that is already mirrored.
+    # Turn on: flush the whole tree, start the pair, then set the DB flag.
+    # `on_ready` runs on the reactor when the pair is live (or with an
+    # exception). A second call while still flushing waits for that flush
+    # rather than claiming the mirror is already live.
     def start!(project, pb, sessions_by_project:, broadcast_fn:, suppress_set: nil, on_ready: nil)
       key = [project.id, pb.name]
       if (m = @mirrors[key])
-        on_ready&.call(m, nil)
+        if m.state == :live
+          on_ready&.call(m, nil)
+        else
+          (m.ready ||= []) << on_ready if on_ready
+        end
         return m
       end
 
       root = root_for(project, pb)
-      m = Mirror.new(project.id, pb.id, pb.name, root, nil, nil, nil, :flushing)
+      m = Mirror.new(project.id, pb.id, pb.name, root, nil, nil, nil, :flushing, [])
+      m.ready << on_ready if on_ready
       @mirrors[key] = m
-      pb.update!(materialized: true) unless pb.materialized?
 
       work = proc do
         begin
@@ -59,6 +64,12 @@ module BranchMirrors
         ensure
           worker_release_db! if defined?(worker_release_db!)
         end
+      end
+
+      fire = lambda do |mirror, err|
+        cbs = (mirror&.ready || [])
+        mirror.ready = [] if mirror
+        cbs.each { |cb| cb&.call(err ? nil : mirror, err) }
       end
 
       done = proc do |_n|
@@ -74,16 +85,22 @@ module BranchMirrors
             puts "[BranchMirrors:#{project.id}@#{pb.name}] live sync DISABLED — DB→disk flush still active"
           end
           m.state = :live
-          on_ready&.call(m, nil)
+          pb.update!(materialized: true) unless pb.materialized?
+          fire.call(m, nil)
         rescue => e
           puts "[BranchMirrors:#{project.id}@#{pb.name}] start failed: #{e.class}: #{e.message}"
           stop!(project.id, pb.name, remove: false, flag: false)
-          on_ready&.call(nil, e)
+          fire.call(m, e)
         end
       end
 
       if EM.reactor_running?
-        EM.defer(work, done, ->(e) { EM.schedule { stop!(project.id, pb.name, remove: false, flag: false); on_ready&.call(nil, e) } })
+        EM.defer(work, done, ->(e) {
+          EM.schedule {
+            stop!(project.id, pb.name, remove: false, flag: false)
+            fire.call(m, e)
+          }
+        })
       else
         done.call(work.call)
       end

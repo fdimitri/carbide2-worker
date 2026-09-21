@@ -644,7 +644,9 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     fs(a, 'rename', path: '/pb.txt', new_name: 'pb-renamed.txt', branch: 'feature')
     assert_equal ['/pb.txt', '/pb-renamed.txt', 'feature'], a.ws.of('renamed').last['payload'].values_at('old_path', 'new_path', 'branch')
     fs(a, 'delete', path: '/run.sh', branch: 'feature')
-    assert_equal ['/run.sh', 'feature'], a.ws.of('deleted').last['payload'].values_at('path', 'branch')
+    deleted = a.ws.of('deleted').last['payload']
+    assert_equal ['/run.sh', 'feature'], deleted.values_at('path', 'branch')
+    refute_nil deleted['id'], 'PROTOCOL 12: deleted frames carry FileNode id'
     fs(a, 'tree', branch: 'feature')
     fp = flat_paths(a.ws.of('tree').last['payload']['tree'])
     assert_includes fp, '/only-feature.txt'
@@ -665,6 +667,11 @@ class WorkerDbfsIntegrationTest < Minitest::Test
     assert_equal %w[main], a.ws.of('project_branches').last['payload']['branches'].map { |x| x['name'] }
     fs(a, 'tree', branch: 'feature')
     assert_equal 'main', a.ws.of('tree').last['payload']['branch'], 'a dead branch name falls back to main'
+    a.ws.frames.clear
+    fs(a, 'stat', path: '/pb.txt', branch: 'feature')
+    st = a.ws.of('stat').last
+    assert st, a.ws.frames.inspect
+    assert_equal 'main', st['payload']['branch']
   end
 
   # A project merge on the wire: preview reports the identity conflict and

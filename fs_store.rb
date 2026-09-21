@@ -147,12 +147,14 @@ module FsStore
   # nothing was committed and the client's queue is based on a view it should
   # re-read.
   def self.error_frame(cmd, payload, message)
-    frame = { message: message, error: message }
+    frame = { message: message, error: message, op: cmd }
     if payload.is_a?(Hash)
       frame[:id]       = payload['id'] if payload['id']
       frame[:path]     = payload['path'] if payload['path']
-      frame[:branch]   = branch_of(payload) if payload['id'] || payload['path']
+      frame[:branch]   = branch_of(payload) if payload['id'] || payload['path'] || payload['branch']
       frame[:batch_id] = payload['batch_id'] if payload['batch_id']
+      frame[:source]   = payload['source'] if payload['source']
+      frame[:target]   = payload['target'] if payload['target']
     end
     frame[:resync] = true if WRITE_CMDS.include?(cmd)
     frame
@@ -185,26 +187,33 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: 'dangling symlink')) unless target
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: 'is binary — use read_binary')) if target.binary?
 
+    store = store_for(session)
     # A project branch reads a file it has not written from its pin: no
     # per-file row yet is fine there.
-    unless store_for(session).project_branch(branch) || target.branches.exists?(name: branch)
+    unless store.project_branch(branch) || target.branches.exists?(name: branch)
       return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: "no branch #{branch} on #{node.path}"))
     end
 
     # A pinned read: the content AT one revision (history view). Not a branch
     # head, so the reply says `pinned` and a client must not base edits on it.
+    # Read from the node in hand: a detached content line is not a project
+    # tree, so store.read(path, branch:) would look the path up on main.
     if (rev = payload['revision_id'].presence)
       unless Revision.exists?(id: rev, file_node_id: target.id)
         return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch).merge(error: "no revision #{rev} of #{node.path}"))
       end
       return send_fn.call(session.ws, 'fs', 'content', doc_fields(node, branch).merge(
         pinned: true, revision: rev,
-        content: store_for(session).read(node.path, revision_id: rev, branch: branch)
+        content: store.read_at(target, branch: branch, revision_id: rev)
       ))
     end
 
+    content = if store.project_branch(branch)
+                store.read(node.path, branch: branch)
+              end
+    content = store.read_at(target, branch: branch) if content.nil?
     send_fn.call(session.ws, 'fs', 'content', doc_fields(node, branch).merge(
-      content:  store_for(session).read(node.path, branch: branch),
+      content:  content,
       revision: ProjectFs.head_revision_id(target, branch)
     ))
   end
@@ -249,9 +258,13 @@ module FsStore
 
   # stat — metadata snapshot for the explorer Properties panel (#5).
   def self.handle_stat(session, payload, send_fn)
+    store  = store_for(session)
+    branch = view_branch(store, payload)
     path = payload['path'].to_s.strip
-    find_node!(session.project_id, path, branch_of(payload))
-    send_fn.call(session.ws, 'fs', 'stat', store_for(session).stat(path, branch: branch_of(payload)))
+    find_node!(session.project_id, path, branch)
+    stat = store.stat(path, branch: branch)
+    raise ActiveRecord::RecordNotFound, path unless stat
+    send_fn.call(session.ws, 'fs', 'stat', stat.merge(branch: branch))
   end
 
   # open — register this session as viewing a file on a branch; receive that
@@ -330,7 +343,7 @@ module FsStore
   def self.handle_write(session, payload, sessions_by_project, send_fn, broadcast_fn)
     changes = Array(payload['changes'])
     node    = file_of!(session, payload)
-    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(message: 'no changes provided')) if changes.empty?
+    return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'no changes provided')) if changes.empty?
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     deltas =
@@ -344,7 +357,8 @@ module FsStore
           batch_id: payload['batch_id'], error: "bad change_data: #{e.message}", resync: true))
       end
     commit_and_broadcast(session, node, deltas, payload['base_revision_id'].presence, send_fn, broadcast_fn,
-                         batch_id: payload['batch_id'].presence, branch: branch_of(payload))
+                         batch_id: payload['batch_id'].presence, branch: branch_of(payload),
+                         tree: tree_of(store_for(session), payload))
   end
 
   def self.handle_set_contents(session, payload, sessions_by_project, send_fn, broadcast_fn)
@@ -355,7 +369,8 @@ module FsStore
 
     delta = DbfsV2::Delta.new('setContents', { data: content })
     commit_and_broadcast(session, node, [delta], payload['base_revision_id'].presence, send_fn, broadcast_fn,
-                         batch_id: payload['batch_id'].presence, branch: branch_of(payload))
+                         batch_id: payload['batch_id'].presence, branch: branch_of(payload),
+                         tree: tree_of(store_for(session), payload))
   end
 
   # Persist `deltas` on `branch` (ProjectFs.write_batch!: blind, anchored
@@ -373,7 +388,7 @@ module FsStore
   # memory is per worker process (RecentBatches), so it covers socket drops, not
   # a worker restart.
   def self.commit_and_broadcast(session, node, deltas, base_revision_id, send_fn, broadcast_fn,
-                                batch_id: nil, branch: Branch::MAIN)
+                                batch_id: nil, branch: Branch::MAIN, tree: nil)
     path = node.path
     key  = batch_id && "#{session.project_id}:#{session.user_id}:#{batch_id}"
     if key && (replay = RecentBatches.get(key))
@@ -389,7 +404,7 @@ module FsStore
     result =
       begin
         ProjectFs.write_batch!(store, path, deltas, base_revision_id: base_revision_id, user_id: session.user_id,
-                               branch: branch)
+                               branch: branch, tree: tree)
       rescue ProjectFs::BranchConflict => e
         return reply.call('error', doc_fields(node, branch).merge(error: e.message, conflict: true, resync: true,
                                      auto_branch: e.branch, auto_branch_head: e.branch_head))
@@ -418,7 +433,7 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
 
     send_fn.call(session.ws, 'fs', 'branches', doc_fields(node, branch_of(payload)).merge(
-      branches: store_for(session).branches(node.path, branch: branch_of(payload))))
+      branches: store_for(session).branches(node.path, branch: tree_of(store_for(session), payload))))
   end
 
   BRANCH_NAME = %r{\A(?!auto/)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\z}
@@ -438,8 +453,9 @@ module FsStore
       return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: "bad branch name #{name.inspect}"))
     end
 
-    b = store_for(session).branch(node.path, name, from: from, at_revision: payload['at_revision'].presence,
-                                  branch: branch_of(payload))
+    store = store_for(session)
+    b = store.branch_at(node, name, from: from, at_revision: payload['at_revision'].presence,
+                                     project_branch_id: store.project_branch(tree_of(store, payload))&.id)
     frame = doc_fields(node, branch_of(payload)).merge(name: b.name, head: b.head_revision_id, from: from, user_id: session.user_id)
     send_fn.call(session.ws, 'fs', 'branch_created', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_created', frame)
@@ -465,7 +481,7 @@ module FsStore
       ))
     end
 
-    store_for(session).delete_branch(node.path, name, branch: branch_of(payload))
+    store_for(session).delete_branch(node.path, name, branch: tree_of(store_for(session), payload))
     frame = doc_fields(node, branch_of(payload)).merge(name: name, user_id: session.user_id)
     send_fn.call(session.ws, 'fs', 'branch_deleted', frame)
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'branch_deleted', frame)
@@ -484,7 +500,7 @@ module FsStore
 
     gap  = payload.key?('gap_ms') ? payload['gap_ms'].to_i : DAG_DEFAULT_GAP_MS
     auto = payload['auto'] == true
-    g    = store_for(session).dag_condensed(node.path, gap_ms: gap, auto: auto, branch: branch_of(payload))
+    g    = store_for(session).dag_condensed(node.path, gap_ms: gap, auto: auto, branch: tree_of(store_for(session), payload))
     ids  = g[:nodes].map { |n| n[:user_id] }.compact.uniq
     g[:users] = User.where(id: ids).to_h { |u| [u.id, u.display_name] }
     send_fn.call(session.ws, 'fs', 'dag', g.merge(doc_fields(node, branch_of(payload))))
@@ -533,6 +549,7 @@ module FsStore
     name = payload['name'].to_s.strip
     return send_fn.call(session.ws, 'fs', 'error', { error: "cannot delete #{Branch::MAIN}" }) if name == Branch::MAIN
     BranchMirrors.stop!(session.project_id, name)
+    evict_open_documents!(session.project_id, nil, name, sessions_by_project, broadcast_fn)
     pb = store_for(session).delete_project_branch(name)
     frame = { name: name, id: pb.id, user_id: session.user_id }
     send_fn.call(session.ws, 'fs', 'project_branch_deleted', frame)
@@ -609,7 +626,8 @@ module FsStore
   # file_node_id, ftype }], entries: [{ id, path, ftype, revision_id }] }.
   # seq is required; fs/error { error: 'seq required' } when missing.
   def self.handle_identity_at(session, payload, send_fn)
-    return send_fn.call(session.ws, 'fs', 'error', { error: 'seq required' }) if payload['seq'].nil?
+    return send_fn.call(session.ws, 'fs', 'error', { error: 'seq required', op: 'identity_at',
+                                                     branch: payload['branch'] }) if payload['seq'].nil?
     branch = payload['branch'].presence || Branch::MAIN
     send_fn.call(session.ws, 'fs', 'identity_at',
                  store_for(session).identity_at(seq: payload['seq'], branch: branch))
@@ -704,10 +722,11 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'source and target are the same branch')) if source == target
 
     store    = store_for(session)
+    tree     = tree_of(store, payload)
     resolved = node.resolve || node
     old_head = ProjectFs.head_revision_id(resolved, target)
     res      = store.merge(node.path, target: target, source: source, auto: true, user_id: session.user_id,
-                           branch: branch_of(payload))
+                           branch: tree)
 
     reply = doc_fields(node, branch_of(payload)).merge(source: source, target: target, merged: res[:merged] == true)
     unless reply[:merged]
@@ -732,8 +751,8 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'is a directory')) if node.ftype == 'folder'
     return send_fn.call(session.ws, 'fs', 'error', doc_fields(node, branch_of(payload)).merge(error: 'source and target are the same branch')) if source == target
 
-    p = store_for(session).merge_preview(node.path, target: target, source: source, branch: branch_of(payload))
-    send_fn.call(session.ws, 'fs', 'merge_preview', p.merge(id: node.id, path: node.path))
+    p = store_for(session).merge_preview(node.path, target: target, source: source, branch: tree_of(store_for(session), payload))
+    send_fn.call(session.ws, 'fs', 'merge_preview', p.merge(id: node.id, path: node.path, branch: tree_of(store_for(session), payload)))
   end
 
   # merge_resolve — { path, source, target?, content, expected_head,
@@ -761,7 +780,7 @@ module FsStore
       store.merge(node.path, target: target, source: source, resolved: payload['content'].to_s,
                              user_id: session.user_id, expected_head: old_head,
                              expected_source_head: payload['expected_source_head'].presence,
-                             branch: branch_of(payload))
+                             branch: tree_of(store, payload))
     rescue DbfsV2::ConflictError => e
       return send_fn.call(session.ws, 'fs', 'merged', reply.merge(merged: false, reason: 'stale', error: e.message))
     end
@@ -870,7 +889,9 @@ module FsStore
     return send_fn.call(session.ws, 'fs', 'error', { path: node.path, error: 'cannot delete root' }) if node.root?
 
     entry_path = node.path
-    descendant_paths = flatten_tree(store.tree(entry_path, branch: branch))
+    tree = store.tree(entry_path, branch: branch)
+    descendant_paths = flatten_tree(tree)
+    node_ids = flatten_tree_ids(tree)
 
     store.delete(entry_path, user_id: session.user_id, branch: branch)
 
@@ -884,9 +905,10 @@ module FsStore
       end
     end
 
-    send_fn.call(session.ws, 'fs', 'deleted', { path: entry_path, branch: branch })
+    send_fn.call(session.ws, 'fs', 'deleted', { path: entry_path, id: node.id, branch: branch })
     broadcast_fn.call(other_project_sessions(session, sessions_by_project), 'fs', 'deleted',
-                      { path: entry_path, branch: branch, user_id: session.user_id })
+                      { path: entry_path, id: node.id, branch: branch, user_id: session.user_id })
+    evict_open_documents!(session.project_id, node_ids, branch, sessions_by_project, broadcast_fn)
     DebugStream.emit(:fs, level: :info,
       message: "deleted #{entry_path}", project_id: session.project_id,
       meta: { path: entry_path, user_id: session.user_id, source: 'ws' }) if defined?(DebugStream)
@@ -1032,6 +1054,32 @@ module FsStore
     [t[:path]] + (t[:children] || []).flat_map { |c| flatten_tree(c) }
   end
 
+  def self.flatten_tree_ids(t)
+    return [] unless t
+    [t[:id] || t['id']].compact + (t[:children] || t['children'] || []).flat_map { |c| flatten_tree_ids(c) }
+  end
+
+  # Drop OPEN_DOCUMENTS for a deleted node (or every doc on a deleted project
+  # branch). Remaining viewers get fs/viewer_left so cursors drop.
+  def self.evict_open_documents!(project_id, node_ids, branch, sessions_by_project, broadcast_fn)
+    keys =
+      if node_ids
+        Array(node_ids).compact.map { |id| doc_key(project_id, id, branch) }
+      else
+        OPEN_DOCUMENTS.each_key.select do |k|
+          doc = OPEN_DOCUMENTS[k]
+          doc && doc.project_id.to_s == project_id.to_s && doc.branch.to_s == branch.to_s
+        end
+      end
+    sessions = sessions_by_project && sessions_by_project[project_id]
+    keys.each do |key|
+      doc = OPEN_DOCUMENTS[key]
+      next unless doc
+      (sessions || []).each { |s| leave_document(s, key, doc, broadcast_fn) if doc.member?(s.ws) }
+      OPEN_DOCUMENTS.delete(key)
+    end
+  end
+
   def self.normalize(path)
     p = path.to_s.strip
     p = "/#{p}" unless p.start_with?('/')
@@ -1059,16 +1107,24 @@ module FsStore
 
   # The document a command names: FileNode UUID (`id`) is identity. Path
   # locates a node when the caller has no id (agent tools, tests).
+  # `project_branch` (else `branch` when it is a live project tree) is the
+  # tree we look in. A raw FileNode.path is `/.nodes/<id>` — never return
+  # that; search other live project trees so callers get a location.
   def self.file_of!(session, payload)
     store  = store_for(session)
-    branch = branch_of(payload)
+    tree   = tree_of(store, payload)
     id     = payload['id'].to_s.strip.presence
     if id
-      node = store.find_id(id, branch: branch)
-      raise ActiveRecord::RecordNotFound, id unless node
-      return node
+      node = store.find_id(id, branch: tree)
+      return node if node
+      store.project_branches.each do |pb|
+        next if pb.name == tree
+        node = store.find_id(id, branch: pb.name)
+        return node if node
+      end
+      raise ActiveRecord::RecordNotFound, id
     end
-    find_node!(session.project_id, payload['path'].to_s.strip, branch)
+    find_node!(session.project_id, payload['path'].to_s.strip, tree)
   end
 
   def self.node_id_of(session, payload)
@@ -1095,6 +1151,14 @@ module FsStore
   def self.view_branch(store, payload)
     b = branch_of(payload)
     store.project_branch(b) ? b : Branch::MAIN
+  end
+
+  # Project tree a document op locates on. `project_branch` when it names a
+  # live project branch, else the same rule as view_branch (`branch` or main).
+  def self.tree_of(store, payload)
+    pb = payload.is_a?(Hash) ? payload['project_branch'].to_s.strip.presence : nil
+    return pb if pb && store.project_branch(pb)
+    view_branch(store, payload)
   end
 
   def self.other_project_sessions(session, sessions_by_project)
