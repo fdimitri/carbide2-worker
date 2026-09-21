@@ -214,10 +214,13 @@ class VfsWatcher
       return unless abs_path.start_with?(@root_path + '/')
       return if @suppress_set&.include?(abs_path)
       srcpath = path_to_srcpath(abs_path)
-      return unless @store.find(srcpath)
-
+      node = @store.find(srcpath)
+      return unless node
+      tree = @store.tree(srcpath)
+      ids = defined?(FsStore) ? FsStore.flatten_tree_ids(tree) : [node.id]
       @store.delete(srcpath, user_id: @system_user_id)
-      broadcast('deleted', { path: srcpath, source: 'inotify' })
+      broadcast('deleted', { path: srcpath, id: node.id, branch: @branch, source: 'inotify' })
+      FsStore.evict_open_documents!(@project_id, ids, @branch, @sessions_by_project, @broadcast_fn) if defined?(FsStore)
       puts "[VfsWatcher:#{tag}] external delete: #{srcpath}"
       DebugStream.emit(:watcher, level: :info,
         message: "deleted #{srcpath}", project_id: @project_id,
@@ -316,7 +319,7 @@ class VfsWatcher
       node = res[:node]
       adopt_if_identical(node, abs_path, ProjectFs.head_revision_id(node, @branch), @store.read(srcpath).to_s)
       size = File.size(abs_path) rescue 0
-      broadcast('created', { path: srcpath, type: 'file', id: node.id, binary: false, size: size, source: 'inotify' })
+      broadcast('created', { path: srcpath, type: 'file', id: node.id, binary: false, size: size, branch: @branch, source: 'inotify' })
       puts "[VfsWatcher:#{tag}] external create (text): #{srcpath} (#{size}B)"
       DebugStream.emit(:watcher, level: :info,
         message: "new text file #{srcpath} (#{size}B)", project_id: @project_id,
@@ -325,7 +328,8 @@ class VfsWatcher
       rev  = res[:revisions].last
       head = @store.read(srcpath).to_s
       broadcast('set_contents', {
-        path: srcpath, content: head, revision: rev&.id, parent: res[:revisions].first&.parent_id,
+        id: (res[:node] || node)&.id, path: srcpath, branch: @branch,
+        content: head, revision: rev&.id, parent: res[:revisions].first&.parent_id,
         user_id: @system_user_id, source: 'inotify'
       })
       adopt_if_identical(res[:node], abs_path, rev, head)
